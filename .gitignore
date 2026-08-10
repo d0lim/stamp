@@ -8,6 +8,14 @@
 # spike branch cannot accidentally ship dead-end code.
 /spikes/
 
+# Console build output. `console/dist` is a build artifact, but the directory
+# itself is tracked through one placeholder file: `//go:embed all:dist` fails to
+# compile against a directory that does not exist, and requiring a Node
+# toolchain to build the Go server would be the wrong trade for that.
+console/node_modules/
+console/dist/*
+!console/dist/.gitkeep
+
 # Test and coverage artifacts
 *.out
 *.test

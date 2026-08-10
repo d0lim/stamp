@@ -11,9 +11,33 @@ help: ## List targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
+NPM          ?= npm
+CONSOLE_DIR  ?= console
+
 .PHONY: build
 build: ## Build the stamp binary
 	$(GO) build -ldflags "$(LDFLAGS)" -o stamp ./cmd/stamp
+
+# The console is a separate stack with a separate toolchain, and `build` does
+# not depend on it on purpose: `//go:embed all:dist` matches a tracked
+# placeholder, so a Go contributor with no Node installed still gets a working
+# binary whose console role explains what is missing. `make build-all` is the
+# one that produces the shipped artifact.
+.PHONY: console
+console: ## Build the console bundle into console/dist
+	cd $(CONSOLE_DIR) && $(NPM) ci && $(NPM) run build
+
+.PHONY: console-test
+console-test: ## Typecheck the console, run its contract boundary check and its tests
+	cd $(CONSOLE_DIR) && $(NPM) ci && $(NPM) test
+
+.PHONY: console-contract
+console-contract: ## Verify the exported public contract and the console's calls against it
+	$(GO) test ./internal/api/ -run TestConsoleContract -count=1
+	cd $(CONSOLE_DIR) && $(NPM) run check:contract
+
+.PHONY: build-all
+build-all: console build ## Build the console bundle and then the binary that embeds it
 
 .PHONY: fmt
 fmt: ## Rewrite files with gofmt

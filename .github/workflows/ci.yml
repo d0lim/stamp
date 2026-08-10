@@ -19,6 +19,7 @@ concurrency:
 
 env:
   GO_VERSION: "1.25"
+  NODE_VERSION: "22"
 
 jobs:
   lint:
@@ -66,9 +67,69 @@ jobs:
       - name: vulnerability scan
         run: make vulncheck
 
+  # The console is the repository's second stack. It runs as its own job rather
+  # than as a step of the Go jobs because it fails for its own reasons and a
+  # contributor touching only TypeScript should not have to read a Go job's log
+  # to find out.
+  console:
+    name: console
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: install
+        run: npm ci
+      # `npm test` is typecheck, then the boundary check, then vitest. The
+      # boundary check runs before the suite so a contract violation reports as
+      # a contract violation rather than as whichever test happened to notice.
+      - name: test
+        run: npm test
+      - name: build
+        run: npm run build
+
+  # D19's other half. The console consumes the public API and has no private
+  # endpoints, and the check is here because a principle alone does not hold —
+  # a BFF grows one convenient handler at a time. The Go step is the drift
+  # guard: the exported contract has to be what internal/api actually declares,
+  # or the Node check would be measuring against a stale copy.
+  console-contract:
+    name: console contract boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: the exported contract matches the Go declaration
+        run: go test ./internal/api/ -run TestConsoleContract -count=1
+      - name: the contract file is unmodified by the test
+        run: git diff --exit-code console/contract/public-endpoints.json
+      - name: install console dependencies
+        run: npm ci
+        working-directory: console
+      - name: the console calls nothing outside the contract
+        run: npm run check:contract
+        working-directory: console
+
   docker:
     name: docker build
-    needs: govulncheck
+    # The image build runs the console build inside its own stage, so a console
+    # failure would surface here as a confusing image failure. Gating on the
+    # console jobs means it surfaces as itself first.
+    needs: [govulncheck, console, console-contract]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -107,6 +168,77 @@ jobs:
           fi
           cat /tmp/stamp-nodsn.log
           grep -q STAMP_DSN /tmp/stamp-nodsn.log
+
+      # R51 over the real image: console serving and the API surface are
+      # separate roles, and the embedded bundle is only served by the role that
+      # owns it. Both directions are asserted here rather than only in Go tests
+      # because the embed is a build-time fact, and a build that dropped the
+      # bundle would still pass every test that does not go through the image.
+      - name: the console role serves the embedded bundle, the api role does not
+        run: |
+          docker run -d --name stamp-ci-console --network stamp-ci-net -p 19081:8081 \
+            -e STAMP_DSN='postgres://stamp:stamp@stamp-ci-db:5432/stamp?sslmode=disable' \
+            -e STAMP_OIDC_ISSUER='https://idp.ci.invalid' \
+            -e STAMP_OIDC_JWKS_URL='https://idp.ci.invalid/jwks' \
+            -e STAMP_OIDC_AUDIENCE='stamp' \
+            -e STAMP_CONSOLE_API_BASE_URL='https://engine.ci.invalid' \
+            -e STAMP_CONSOLE_OIDC_CLIENT_ID='stamp-console' \
+            -e STAMP_CONSOLE_OIDC_AUTHORIZATION_ENDPOINT='https://idp.ci.invalid/authorize' \
+            -e STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT='https://idp.ci.invalid/token' \
+            stamp:ci --roles=console
+          docker run -d --name stamp-ci-apionly --network stamp-ci-net -p 19082:8081 \
+            -e STAMP_DSN='postgres://stamp:stamp@stamp-ci-db:5432/stamp?sslmode=disable' \
+            -e STAMP_OIDC_ISSUER='https://idp.ci.invalid' \
+            -e STAMP_OIDC_JWKS_URL='https://idp.ci.invalid/jwks' \
+            -e STAMP_OIDC_AUDIENCE='stamp' \
+            stamp:ci --roles=api
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:19081/healthz >/dev/null 2>&1 \
+               && curl -fsS http://localhost:19082/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          status() { curl -s -o /dev/null -w '%{http_code}' "$1"; }
+          expect() {
+            got=$(status "$2")
+            if [ "$got" != "$1" ]; then
+              echo "$2 answered $got, want $1" >&2
+              docker logs stamp-ci-console >&2 || true
+              exit 1
+            fi
+          }
+
+          # The bundle really is in the binary: 200, and HTML.
+          expect 200 http://localhost:19081/console/
+          curl -fsS http://localhost:19081/console/ | grep -qi '<!doctype html>'
+          # A client side deep link resolves to the shell rather than to a 404.
+          expect 200 http://localhost:19081/console/inbox/decision-1
+          # The configured API base address is in the document, and the policy
+          # names it and the IdP and nothing else.
+          curl -fsS http://localhost:19081/console/config.json | grep -q 'https://engine.ci.invalid'
+          csp=$(curl -sS -D - -o /dev/null http://localhost:19081/console/ | tr -d '\r' \
+                 | grep -i '^content-security-policy:')
+          echo "$csp"
+          echo "$csp" | grep -q "default-src 'none'"
+          echo "$csp" | grep -q "connect-src 'self' https://engine.ci.invalid https://idp.ci.invalid"
+          echo "$csp" | grep -q "frame-ancestors 'none'"
+          if echo "$csp" | grep -q "unsafe-inline"; then
+            echo "the console policy allows inline script or style" >&2; exit 1
+          fi
+          # R50: no request input changes what the document says.
+          tampered=$(curl -fsS 'http://localhost:19081/console/config.json?apiBaseUrl=https://attacker.invalid')
+          echo "$tampered" | grep -q 'https://engine.ci.invalid'
+          if echo "$tampered" | grep -q 'attacker.invalid'; then
+            echo "a query string reached the configuration document" >&2; exit 1
+          fi
+
+          # And the API tier serves none of it.
+          expect 404 http://localhost:19082/console/
+          expect 404 http://localhost:19082/console/config.json
+          # while still being the API tier.
+          expect 401 http://localhost:19082/policies
+
+          docker rm -f stamp-ci-console stamp-ci-apionly >/dev/null 2>&1 || true
 
       - name: health check the built image
         run: |

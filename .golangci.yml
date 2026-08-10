@@ -27,6 +27,11 @@ linters:
           disabled: false
 
   exclusions:
+    paths:
+      # The console's npm tree. It holds no Go, and walking it costs more than
+      # the whole rest of the module.
+      - console/node_modules
+      - console/dist
     rules:
       # Tests deliberately construct invalid inputs and ignore writer errors.
       - path: _test\.go

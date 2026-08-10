@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "note": "Generated from internal/api/contract.go. Edit the Go declaration, not this file; internal/api's tests regenerate and verify it.",
+  "endpoints": [
+    {
+      "name": "console-config",
+      "method": "GET",
+      "path": "/console/config.json",
+      "auth": "static",
+      "group": "serving"
+    },
+    {
+      "name": "policy-dry-run",
+      "method": "POST",
+      "path": "/console/v1/policies/dry-run",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "approval-review",
+      "method": "GET",
+      "path": "/decisions/{id}/challenges/{ordinal}/approval",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "approval-submit",
+      "method": "POST",
+      "path": "/decisions/{id}/challenges/{ordinal}/approvals",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "delay-cancel",
+      "method": "POST",
+      "path": "/decisions/{id}/challenges/{ordinal}/cancellation",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "governance-read",
+      "method": "GET",
+      "path": "/governance",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "governance-lock",
+      "method": "POST",
+      "path": "/governance/lock",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "policy-list",
+      "method": "GET",
+      "path": "/policies",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "revision-submit",
+      "method": "POST",
+      "path": "/policies/revisions",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "revision-preview",
+      "method": "POST",
+      "path": "/policies/revisions/preview",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "revision-read",
+      "method": "GET",
+      "path": "/policies/revisions/{id}",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "revision-withdraw",
+      "method": "POST",
+      "path": "/policies/revisions/{id}/withdrawal",
+      "auth": "user",
+      "group": "api"
+    }
+  ]
+}
