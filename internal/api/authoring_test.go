@@ -59,6 +59,9 @@ func newAuthoringFixture(t *testing.T, files api.FileApplier) *policyFixture {
 		Policies: api.PolicyListerFunc(func(context.Context) ([]store.PolicyRecord, error) {
 			return nil, nil
 		}),
+		Schema: api.SchemaReaderFunc(func(context.Context) (store.SchemaRecord, error) {
+			return testSchemaRecord, nil
+		}),
 		Files: files,
 	})
 	if err != nil {

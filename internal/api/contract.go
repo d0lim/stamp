@@ -75,6 +75,7 @@ func (e ContractEndpoint) Pattern() string { return e.Method + " " + e.Path }
 // authoring, then approval, then the serving documents.
 var consoleContract = []ContractEndpoint{
 	{Name: "policy-list", Method: "GET", Path: "/policies", Auth: AuthUser, Group: GroupAPI},
+	{Name: "schema-read", Method: "GET", Path: SchemaReadPath, Auth: AuthUser, Group: GroupAPI},
 	{Name: "policy-dry-run", Method: "POST", Path: DryRunPath, Auth: AuthUser, Group: GroupAPI},
 	{Name: "revision-preview", Method: "POST", Path: "/policies/revisions/preview", Auth: AuthUser, Group: GroupAPI},
 	{Name: "revision-submit", Method: "POST", Path: "/policies/revisions", Auth: AuthUser, Group: GroupAPI},

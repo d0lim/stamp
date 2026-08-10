@@ -557,7 +557,12 @@ func (s *Service) Preview(ctx context.Context, req PreviewRequest) (Preview, err
 // assessment is everything the governance path concludes about a delta before
 // it decides whether to open a decision for it.
 type assessment struct {
-	mode        Mode
+	mode Mode
+	// delta is the submitted delta with its before face rebuilt from the state
+	// in force. Everything downstream — the classification, the requirement, the
+	// digest an approval is bound to and the delta an approver is shown — is a
+	// function of this one and never of what arrived in the request body.
+	delta       Delta
 	class       Classification
 	requirement Requirement
 	current     *policy.Quorum
@@ -576,6 +581,15 @@ func (s *Service) assess(ctx context.Context, d Delta, proposer string) (assessm
 	} else {
 		out.mode = ModeSolo
 	}
+
+	// The before face is rebuilt first, so that every check below — including
+	// the shape rules in Validate and the digest Propose takes afterwards —
+	// reads the state in force rather than the proposer's account of it.
+	d, err = s.reconstructed(ctx, d)
+	if err != nil {
+		return out, err
+	}
+	out.delta = d
 
 	if err := d.Validate(); err != nil {
 		out.violations = append(out.violations, err.Error())
@@ -766,7 +780,11 @@ func (s *Service) Propose(ctx context.Context, req ProposeRequest) (Proposal, er
 		}
 	}
 
-	digest, err := req.Delta.Digest()
+	// The digest is taken over the assessed delta and not the submitted one. The
+	// digest travels in the governance decision's request, which the approval
+	// binding hash covers, so an approval has to be bound to the change set the
+	// server concluded a revision is — the one the approver is shown (R31).
+	digest, err := assessed.delta.Digest()
 	if err != nil {
 		return Proposal{}, err
 	}
@@ -778,7 +796,7 @@ func (s *Service) Propose(ctx context.Context, req ProposeRequest) (Proposal, er
 		ID:          id,
 		ProposerID:  req.Proposer.ID,
 		Origin:      origin,
-		Delta:       req.Delta,
+		Delta:       assessed.delta,
 		DeltaDigest: hex.EncodeToString(digest[:]),
 		Mode:        req.Mode.OrDefault(),
 		State:       StatePending,
