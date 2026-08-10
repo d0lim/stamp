@@ -83,8 +83,25 @@ account number, a resource key — produces a challenge no person can complete.
 
 On its first start with the `api` role the process installs the reserved governance policy and prints a one-time bootstrap token. It is shown once and stored only as a digest; lock governance with it as soon as the approver set is known.
 
+### The console
+
+The console is a React + TypeScript bundle built by Vite and embedded in the binary with `go:embed`. It consumes the engine's public API and has no backend of its own — no BFF — and it is served by the `console` role alone, which is separate from `api` so that a deployment can run one without the other.
+
+Embedding is not a bet against ever separating them. The bundle's API base address is operator configuration served at `/console/config.json`, so the same bundle runs against another origin; and the console's calls are checked in CI against the public contract exported from `internal/api/contract.go`, so a private console endpoint cannot appear quietly. The base address comes from that document and nothing else — not a query string, not a fragment, not `localStorage` — because all three are writable by whoever can send an approver a link, and the console holds that approver's token. Every console response carries a CSP whose `connect-src` names only the configured API origin and the IdP.
+
+| Variable | Meaning |
+|---|---|
+| `STAMP_CONSOLE_API_BASE_URL` | Where the console sends its API calls. Empty means the same origin the bundle came from, which is the single-container install. |
+| `STAMP_CONSOLE_OIDC_CLIENT_ID`, `STAMP_CONSOLE_OIDC_AUTHORIZATION_ENDPOINT`, `STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT` | The console's relying party: an authorization code flow with PKCE, public client, tokens held in memory only. Without them the console starts and says it cannot log anyone in. |
+| `STAMP_CONSOLE_OIDC_ISSUER` | The issuer the console logs in through. Defaults to `STAMP_OIDC_ISSUER`. |
+| `STAMP_CONSOLE_ROLE_CLAIM` | The token claim navigation and default landing are derived from. Defaults to `roles`. |
+
+`go build` does not need Node: `console/dist` is tracked through a placeholder, and a binary built without running the console build starts, mounts the console role, and answers with the command that is missing. `make build-all` produces the shipped artifact, and the Docker build does it in its own stage.
+
 ```sh
-make build          # build ./stamp
+make build          # build ./stamp (no Node required)
+make console        # build the console bundle into console/dist
+make build-all      # both, in order
 make land           # every gate a PR must pass
 make hooks          # run those gates from a pre-push hook
 make help           # list targets
@@ -93,9 +110,11 @@ make help           # list targets
 ## Development
 
 ```sh
-make test           # go test -race ./...
-make lint           # golangci-lint
-make vulncheck      # govulncheck
+make test              # go test -race ./...
+make lint              # golangci-lint
+make vulncheck         # govulncheck
+make console-test      # typecheck, contract boundary check, vitest
+make console-contract  # the exported contract, and the console's calls against it
 ```
 
 Dependencies for the whole engine-core milestone are declared once in `internal/deps` behind the `m1deps` build tag, so sibling branches in the landing stack don't each edit `go.sum`.

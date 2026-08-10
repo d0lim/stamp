@@ -142,6 +142,47 @@ type Config struct {
 	// handler at all — which is fail-closed: a policy declaring one cannot be
 	// satisfied and therefore cannot be issued.
 	MFA MFAConfig
+
+	// Console is what the console-serving role hands the browser. It is
+	// optional: an all-in-one install serves the console from the same origin
+	// as its API and needs none of it set.
+	Console ConsoleConfig
+}
+
+// ConsoleConfig is the operator configuration the console bundle boots from.
+//
+// It exists as its own struct because of R50. The console's API base address
+// has to be configurable — D19's separability promise is empty if the bundle
+// can only ever call its own origin — and it has to come from here and nowhere
+// else. A query string, a fragment or a localStorage entry would all be
+// writable by whoever can send an approver a link, and a console that read its
+// base address from one of them would forward that approver's token to whatever
+// the link named.
+type ConsoleConfig struct {
+	// APIBaseURL is where the bundle sends its API calls. Empty means the same
+	// origin the bundle was served from, which is the single-container install.
+	APIBaseURL string
+
+	// Issuer, AuthorizationEndpoint, TokenEndpoint and ClientID are the
+	// browser-side relying party. They are separate from [OIDCConfig] because
+	// that one says which tokens this process accepts and this one says which
+	// IdP an operator is sent to; a deployment accepting two issuers still logs
+	// its operators in through one.
+	Issuer                string
+	AuthorizationEndpoint string
+	TokenEndpoint         string
+	EndSessionEndpoint    string
+	ClientID              string
+	// Scopes overrides what the console asks for. Empty asks for openid,
+	// profile and email.
+	Scopes []string
+	// RoleClaim names the claim the console derives navigation and default
+	// landing from. Empty selects "roles".
+	RoleClaim string
+
+	// AllowInsecureTransport permits plaintext console endpoints, for loopback
+	// development and tests.
+	AllowInsecureTransport bool
 }
 
 // MFAConfig is the delegated MFA trust boundary and transport.
@@ -307,6 +348,18 @@ const (
 	EnvCIBAClientID     = "STAMP_MFA_CIBA_CLIENT_ID"
 	EnvCIBAClientSecret = "STAMP_MFA_CIBA_CLIENT_SECRET" //nolint:gosec // a variable name, not a credential
 	EnvCIBAScope        = "STAMP_MFA_CIBA_SCOPE"
+
+	// The console's operator configuration. R50 makes this the only source for
+	// the API base address: there is deliberately no browser-side override.
+	EnvConsoleAPIBaseURL    = "STAMP_CONSOLE_API_BASE_URL"
+	EnvConsoleOIDCIssuer    = "STAMP_CONSOLE_OIDC_ISSUER"
+	EnvConsoleOIDCAuthz     = "STAMP_CONSOLE_OIDC_AUTHORIZATION_ENDPOINT"
+	EnvConsoleOIDCToken     = "STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT" //nolint:gosec // a variable name, not a credential
+	EnvConsoleOIDCEndSess   = "STAMP_CONSOLE_OIDC_END_SESSION_ENDPOINT"
+	EnvConsoleOIDCClientID  = "STAMP_CONSOLE_OIDC_CLIENT_ID"
+	EnvConsoleOIDCScopes    = "STAMP_CONSOLE_OIDC_SCOPES"
+	EnvConsoleRoleClaim     = "STAMP_CONSOLE_ROLE_CLAIM"
+	EnvConsoleAllowInsecure = "STAMP_CONSOLE_ALLOW_INSECURE_TRANSPORT"
 )
 
 // ConfigFromEnv reads the deployment configuration from the process
@@ -434,6 +487,18 @@ func ConfigFromEnv() (Config, error) {
 			ClientSecret:        os.Getenv(EnvCIBAClientSecret),
 			Scope:               strings.TrimSpace(os.Getenv(EnvCIBAScope)),
 		},
+	}
+
+	cfg.Console = ConsoleConfig{
+		APIBaseURL:             strings.TrimSpace(os.Getenv(EnvConsoleAPIBaseURL)),
+		Issuer:                 strings.TrimSpace(os.Getenv(EnvConsoleOIDCIssuer)),
+		AuthorizationEndpoint:  strings.TrimSpace(os.Getenv(EnvConsoleOIDCAuthz)),
+		TokenEndpoint:          strings.TrimSpace(os.Getenv(EnvConsoleOIDCToken)),
+		EndSessionEndpoint:     strings.TrimSpace(os.Getenv(EnvConsoleOIDCEndSess)),
+		ClientID:               strings.TrimSpace(os.Getenv(EnvConsoleOIDCClientID)),
+		Scopes:                 splitList(os.Getenv(EnvConsoleOIDCScopes)),
+		RoleClaim:              strings.TrimSpace(os.Getenv(EnvConsoleRoleClaim)),
+		AllowInsecureTransport: envBool(EnvConsoleAllowInsecure, false, fail),
 	}
 
 	if len(errs) > 0 {
