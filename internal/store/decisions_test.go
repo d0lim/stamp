@@ -271,8 +271,10 @@ func TestDecisionRollsBackWhenTheAuditAppendFails(t *testing.T) {
 		t.Fatalf("the decision row survived a failed audit append: %v", err)
 	}
 
-	// The writer refuses further work until its head is reconciled, rather than
-	// silently forking the chain.
+	// The writer refuses further work rather than silently forking the chain.
+	// The squatted row is not one this writer could have written — it does not
+	// hash to its own contents — so automatic reconciliation declines it and
+	// only an operator's ReloadHead moves the head onto it.
 	if _, err := w.Append(ctx, store.AuditEntry{Kind: "x", Payload: map[string]any{}}); !errors.Is(err, store.ErrChainConflict) {
 		t.Fatalf("a conflicted writer kept appending: %v", err)
 	}

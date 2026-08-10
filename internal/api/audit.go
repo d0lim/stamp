@@ -346,6 +346,14 @@ func (b *AuditBuffer) Flush(ctx context.Context) error {
 		if err != nil {
 			// A batch that could not be chained is lost exactly as a dropped
 			// event is, and is accounted for the same way.
+			//
+			// One case counts loss that did not happen: a commit that landed on
+			// the server while this process lost the connection returns an
+			// error here even though the row is in the chain, so the gap marker
+			// covers a window the batch root also covers. That is the direction
+			// to be wrong in — the chain over-reports what it may be missing
+			// and never under-reports it — and the writer's reconciliation
+			// marker is what tells a reader which window it happened in.
 			b.dropLocked(chunk[len(chunk)-1].Time, int64(len(chunk)))
 			b.lastErr = err.Error()
 			errs = append(errs, fmt.Errorf("api: append audit batch: %w", err))
