@@ -97,10 +97,15 @@ jobs:
 
       - name: refuse to start without a database
         run: |
-          if docker run --rm stamp:ci --roles=all 2>&1 | tee /tmp/stamp-nodsn.log; then
+          # Redirect rather than pipe: a pipeline's exit status is the last
+          # command's, so `docker run | tee` always reports tee's success and
+          # this assertion would fail no matter how the image behaved.
+          if docker run --rm stamp:ci --roles=all > /tmp/stamp-nodsn.log 2>&1; then
             echo "the image started with no DSN configured" >&2
+            cat /tmp/stamp-nodsn.log >&2
             exit 1
           fi
+          cat /tmp/stamp-nodsn.log
           grep -q STAMP_DSN /tmp/stamp-nodsn.log
 
       - name: health check the built image
