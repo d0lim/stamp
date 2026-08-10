@@ -28,6 +28,13 @@ console/.playwright/
 *.test
 /coverage/
 
+# Benchmark output. The results document and the report are per-run artifacts
+# uploaded by the bench workflow; the thresholds they are read against are the
+# tracked file next to them.
+/bench/out/
+/bench/baseline/
+/bench/bench-output.txt
+
 # Local environment
 .env
 .env.*

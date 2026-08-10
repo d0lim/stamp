@@ -1,0 +1,49 @@
+{
+  "note": "A threshold belongs to a runner, not to the product. Every number below was measured on the runner its profile names, with the basis string saying which measurement and how much headroom was added. Nothing here is derived from docs/spike-results.md S2 — that spike is an order-of-magnitude probe and says in its own text that it is not the basis for any absolute target. A profile with calibrated=false records and compares against the previous run and concludes nothing absolute, which is the honest state for a runner nobody has measured yet.",
+  "profiles": {
+    "local": {
+      "calibrated": true,
+      "runner": "Apple M1 Pro, 10 logical cores, macOS; Postgres 17-alpine in OrbStack (Docker 29.4.0, 4 vCPU, 8 GB); load generator in the same process as the server",
+      "measured_at": "2026-08-11",
+      "note": "Calibrated from two separate invocations of five repeats each on commit b03907e, with BENCH_CONCURRENCY=8, BENCH_WARMUP=1s, BENCH_DURATION=3s and no other heavy work on the machine. Across all ten repeats the p99 spread was under 10% for every scenario except check_cold_miss, whose tail spread was 87%; the median across five repeats moved at most 5.7% between the two invocations. The absolute bounds are the worst of the ten repeats plus half again for latency, and the worst minus 40% for throughput, so a bound sits well outside the measured noise and fires only on a change of that magnitude. Smaller moves are the regression column's job, and its 20% tolerance is roughly three and a half times the 5.7% drift measured between invocations.",
+      "regression_tolerance_pct": 20,
+      "scenarios": {
+        "check_warm_cache": {
+          "max_p99_ms": 1.1,
+          "min_qps": 20000,
+          "basis": "ten repeats: p99 median 0.71ms, worst 0.72ms; QPS median 34396, worst 33343. Bounds are worst x1.5 and worst x0.6."
+        },
+        "check_cold_miss": {
+          "max_p99_ms": 22,
+          "min_qps": 285,
+          "basis": "ten repeats at a paced 300 req/s: p99 median 11.58ms, worst 14.20ms (tail spread 87%). Latency bound is worst x1.5. The QPS bound is not a capacity: it asserts the paced rate was actually achieved, so that a system too slow to keep up with 300 req/s is visible."
+        },
+        "check_miss_ceiling_150ms": {
+          "max_p99_ms": 200,
+          "basis": "ten repeats: p99 median 161.73ms against a declared 150ms timeout, worst 171.79ms. The bound is the declaration x1.35, so it asserts the declared ceiling is honoured with bounded overhead rather than asserting anything about speed. No throughput bound: throughput here is concurrency divided by the declared timeout."
+        },
+        "check_miss_ceiling_400ms": {
+          "max_p99_ms": 540,
+          "basis": "ten repeats: p99 median 409.83ms against a declared 400ms timeout, worst 418.51ms. Same declaration x1.35 rule as the 150ms sibling; the pair is what shows the ceiling tracks the declaration."
+        },
+        "check_velocity": {
+          "max_p99_ms": 1.8,
+          "min_qps": 8600,
+          "basis": "ten repeats: p99 median 1.13ms, worst 1.18ms; QPS median 14588, worst 14375. Bounds are worst x1.5 and worst x0.6."
+        },
+        "audit_root_insert": {
+          "max_p99_ms": 1.1,
+          "min_qps": 1200,
+          "basis": "ten repeats, one writer: p99 median 0.69ms, worst 0.72ms; root inserts median 2072/s, worst 2023/s. Bounds are worst x1.5 and worst x0.6. The QPS here is root rows per second, which the artifact converts to a covered check rate."
+        }
+      }
+    },
+    "ci": {
+      "calibrated": false,
+      "runner": "GitHub-hosted ubuntu-latest, 2 vCPU",
+      "note": "Uncalibrated on purpose. Nobody has measured this runner yet, and copying the local profile's numbers onto a machine with a fifth of the cores would produce a gate that fires on the hardware rather than on the code. Until the workflow has run on main enough times to show what this runner's spread actually is, the job records the numbers, publishes the artifact and reports the change against the previous run, and issues no absolute verdict. Filling this profile in is the first thing to do with the first few runs, and it is a prerequisite for U18 promoting anything here from a warning to a release gate. The regression tolerance below is a placeholder chosen to be wider than the local runner's, not a measurement of this one.",
+      "regression_tolerance_pct": 50,
+      "scenarios": {}
+    }
+  }
+}

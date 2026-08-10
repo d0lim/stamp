@@ -76,6 +76,22 @@ test: ## Run the test suite with the race detector
 vulncheck: ## Scan dependencies for known vulnerabilities
 	$(GO) run $(GOVULNCHECK) ./...
 
+# The benchmark is not part of `land`. It needs a Docker daemon and minutes,
+# it reports rather than gates, and its thresholds are per-runner — a developer
+# machine's numbers say nothing about CI's and vice versa. Run it when you are
+# asking a performance question, and read bench/out/report.md.
+#
+# `-run '^$$'` keeps the package's own unit tests out of the measured run;
+# `-count` is how many times each scenario repeats, and the artifact's spread
+# column comes from those repeats.
+BENCH_REPEATS ?= 3
+BENCH_TIMEOUT ?= 30m
+
+.PHONY: bench
+bench: ## Run the check path benchmark, writing bench/out
+	cd bench && $(GO) test -run '^$$' -bench . -benchtime=1x \
+		-count=$(BENCH_REPEATS) -timeout=$(BENCH_TIMEOUT) .
+
 # `land` is the local stand-in for branch protection. This repository is a
 # private free-plan repo, where required status checks are unavailable, so the
 # merge gates in the plan's landing strategy are convention rather than
