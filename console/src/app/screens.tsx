@@ -11,47 +11,9 @@ import { Link } from 'react-router-dom'
 import { RouteAnnouncer } from '../a11y/RouteAnnouncer'
 import { useAuth } from '../auth/AuthProvider'
 
-function Placeholder({
-  title,
-  owner,
-  description,
-}: {
-  readonly title: string
-  readonly owner: string
-  readonly description: string
-}) {
-  return (
-    <div className="panel">
-      <RouteAnnouncer title={title} />
-      <h1>{title}</h1>
-      <p>{description}</p>
-      <p className="panel__meta">이 화면은 {owner}에서 채워집니다.</p>
-    </div>
-  )
-}
-
-// The policy seam is filled: `src/builder/` owns /policies/* now, and App.tsx
-// mounts it. The two placeholders below are still seams.
-
-export function InboxScreen() {
-  return (
-    <Placeholder
-      title="승인함"
-      owner="U16 (승인함 + 감사 콘솔)"
-      description="자신에게 걸린 pending 결정, 수집 현황, 만료 임박 순 정렬이 여기에 놓입니다."
-    />
-  )
-}
-
-export function AuditScreen() {
-  return (
-    <Placeholder
-      title="감사"
-      owner="U16 (승인함 + 감사 콘솔)"
-      description="감사 체인 조회와 검증 결과가 여기에 놓입니다."
-    />
-  )
-}
+// Every seam is filled: `src/builder/` owns /policies/*, `src/inbox/` owns
+// /inbox/* and `src/audit/` owns /audit/*, and App.tsx mounts all three. What
+// is left here is the shell's own two answers — no role, and no such screen.
 
 /** Where a signed-in person with no recognised role lands. */
 export function NoAccessScreen() {

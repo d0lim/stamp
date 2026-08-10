@@ -16,6 +16,13 @@ console/node_modules/
 console/dist/*
 !console/dist/.gitkeep
 
+# Playwright's own output. The suite is a gate, not an artifact: its report and
+# its traces are for the run that produced them.
+console/test-results/
+console/playwright-report/
+console/blob-report/
+console/.playwright/
+
 # Test and coverage artifacts
 *.out
 *.test

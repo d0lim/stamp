@@ -343,6 +343,23 @@ func (a *App) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The inbox's "waiting on me" filter is the quorum handler's own target
+	// test (R21). It is wired to the same handler the approval endpoints use,
+	// because a list produced by a second opinion about who may approve would
+	// show people decisions they cannot submit against.
+	inbox, err := api.NewInbox(api.InboxConfig{Quorums: quorum})
+	if err != nil {
+		return err
+	}
+	auditConsole, err := api.NewAuditConsole(api.AuditConsoleConfig{
+		History:  store.NewHistory(s.Pool()),
+		Access:   plane.Service(),
+		Auditors: api.AuditorRule{Claim: cfg.AuditorClaim, Values: cfg.AuditorValues},
+		Audit:    writer,
+	})
+	if err != nil {
+		return err
+	}
 	callbacks, err := api.NewCallbacks(api.CallbacksConfig{Decisions: submitter})
 	if err != nil {
 		return err
@@ -392,9 +409,25 @@ func (a *App) build(ctx context.Context) error {
 		return err
 	}
 	if err := registry.Add(Component{
-		Name:   "approval-api",
+		Name: "approval-api",
+		// The inbox rides with the approval endpoints rather than with the
+		// authoring tier: it reads the same challenge rows, refuses on the same
+		// rule, and a deployment that serves approvals without the list they
+		// come from would give an approver a submit button and no way to find
+		// what needs one.
 		Roles:  []Role{RoleDecide},
-		Routes: approvals.Routes(),
+		Routes: append(approvals.Routes(), inbox.Routes()...),
+	}); err != nil {
+		return err
+	}
+	if err := registry.Add(Component{
+		// The audit console is on the decide tier because that is where the
+		// decision record and the audit chain are. Auditor standing is enforced
+		// in the handler from operator configuration (R22) — the mount is not
+		// the control.
+		Name:   "audit-console-api",
+		Roles:  []Role{RoleDecide},
+		Routes: auditConsole.Routes(),
 	}); err != nil {
 		return err
 	}

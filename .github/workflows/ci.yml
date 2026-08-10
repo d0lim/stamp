@@ -124,6 +124,41 @@ jobs:
         run: npm run check:contract
         working-directory: console
 
+  # The Verification Contract's E2E row. It is its own job and not a step of
+  # `console` because it needs a browser download, and because a contrast
+  # failure is a different thing to read than a unit test failure.
+  #
+  # It runs a real browser on purpose: U15's axe pass had to disable
+  # `color-contrast` because jsdom computes no colours, so the ratios stated in
+  # the stylesheets were checked by nothing until this job existed.
+  e2e:
+    name: e2e smoke and axe
+    needs: console
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: install
+        run: npm ci
+      - name: install the browser
+        run: npm run e2e:install
+      - name: builder round trip, approval round trip, axe with contrast
+        run: npm run e2e
+      - name: upload the report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: console/playwright-report/
+          retention-days: 7
+
   docker:
     name: docker build
     # The image build runs the console build inside its own stage, so a console

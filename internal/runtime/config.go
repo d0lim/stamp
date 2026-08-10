@@ -207,6 +207,17 @@ type Config struct {
 	// highest-severity warning. Zero selects the governance default.
 	BootstrapWarnInterval time.Duration
 
+	// AuditorClaim and AuditorValues are R22's auditor standing rule, enforced
+	// server-side by the audit console.
+	//
+	// They default to the console's role claim and its auditor spellings, so a
+	// deployment that configured console navigation has configured enforcement
+	// too and the two cannot silently disagree. An operator whose auditors are
+	// an IdP group points AuditorClaim at the group claim and names the group
+	// in AuditorValues; nothing else changes.
+	AuditorClaim  string
+	AuditorValues []string
+
 	// CheckContextEntity is the entity type an AuthZEN request context binds
 	// to. Empty means requests carry no context entity.
 	CheckContextEntity string
@@ -480,6 +491,9 @@ const (
 	EnvReconcileInterval       = "STAMP_REVISION_RECONCILE_INTERVAL"
 	EnvBootstrapWarnInterval   = "STAMP_BOOTSTRAP_WARN_INTERVAL"
 
+	EnvAuditorClaim  = "STAMP_AUDITOR_CLAIM"
+	EnvAuditorValues = "STAMP_AUDITOR_VALUES"
+
 	EnvCheckContextEntity   = "STAMP_CHECK_CONTEXT_ENTITY"
 	EnvCheckPropertyAliases = "STAMP_CHECK_PROPERTY_ALIASES"
 
@@ -551,6 +565,8 @@ func ConfigFromEnv() (Config, error) {
 		RevisionTTL:             envDuration(EnvRevisionTTL, 0, fail),
 		ReconcileInterval:       envDuration(EnvReconcileInterval, DefaultReconcileInterval, fail),
 		BootstrapWarnInterval:   envDuration(EnvBootstrapWarnInterval, 0, fail),
+		AuditorClaim:            strings.TrimSpace(os.Getenv(EnvAuditorClaim)),
+		AuditorValues:           splitList(os.Getenv(EnvAuditorValues)),
 		CheckContextEntity:      strings.TrimSpace(os.Getenv(EnvCheckContextEntity)),
 		GovernanceFloor: revision.Floor{
 			MinApprovers:       envInt(EnvFloorMinApprovers, revision.DefaultFloor().MinApprovers, fail),

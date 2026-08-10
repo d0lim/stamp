@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>STAMP 콘솔 (E2E)</title>
+  </head>
+  <body>
+    <!--
+      The end-to-end page. It mounts the real shell, the real router and the
+      real stylesheets; the only substitutions are the configuration document
+      and `fetch`, exactly as the vitest harness substitutes them.
+
+      It is a separate Vite root so that nothing here can reach the shipped
+      bundle: `vite build` at the repository's console root never sees this
+      directory, and the embedded artifact is unchanged by its existence.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

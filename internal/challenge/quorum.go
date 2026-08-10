@@ -468,6 +468,20 @@ type QuorumReview struct {
 	// challenge has no list to show.
 	Approvers []string       `json:"approvers,omitempty"`
 	Mode      ResolutionMode `json:"mode"`
+	// Issuer, Claim and Source complete the approver set as the binding hash
+	// hashes it.
+	//
+	// They are here because R31 asks the approval screen to display every input
+	// of the hash, and until U16 tried to render that screen this type could
+	// not say what the hash had covered: the issuer is hashed with the set (a
+	// moved designation is a different set of people wearing the same
+	// spellings), and the claim and the source names are the whole of the set
+	// in the two modes that have no member list. An approver shown "mode:
+	// claim" and nothing else was being asked to sign for terms they could not
+	// read.
+	Issuer string `json:"issuer"`
+	Claim  string `json:"claim,omitempty"`
+	Source string `json:"source,omitempty"`
 	// BindingHash is the digest this approval will be recorded against. An
 	// approver echoes it back on submission to state which material they read.
 	BindingHash string               `json:"binding_hash"`
@@ -523,6 +537,9 @@ func (q *Quorum) Review(ctx context.Context, req QuorumReviewRequest) (QuorumRev
 		Need:        detail.Threshold,
 		Approvers:   detail.Members,
 		Mode:        detail.Mode,
+		Issuer:      detail.Issuer,
+		Claim:       detail.Claim,
+		Source:      detail.Source,
 		BindingHash: detail.BindingHash,
 		Decision: QuorumReviewDecision{
 			ID:           d.ID,

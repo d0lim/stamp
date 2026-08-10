@@ -31,6 +31,10 @@ console: ## Build the console bundle into console/dist
 console-test: ## Typecheck the console, run its contract boundary check and its tests
 	cd $(CONSOLE_DIR) && $(NPM) ci && $(NPM) test
 
+.PHONY: console-e2e
+console-e2e: ## Run the Playwright smoke suite (builder and approval round trips, axe with contrast)
+	cd $(CONSOLE_DIR) && $(NPM) ci && $(NPM) run e2e:install && $(NPM) run e2e
+
 .PHONY: console-contract
 console-contract: ## Verify the exported public contract and the console's calls against it
 	$(GO) test ./internal/api/ -run TestConsoleContract -count=1

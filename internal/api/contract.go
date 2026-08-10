@@ -85,9 +85,12 @@ var consoleContract = []ContractEndpoint{
 	{Name: "policy-export", Method: "GET", Path: PolicyExportPath, Auth: AuthUser, Group: GroupAPI},
 	{Name: "governance-read", Method: "GET", Path: "/governance", Auth: AuthUser, Group: GroupAPI},
 	{Name: "governance-lock", Method: "POST", Path: "/governance/lock", Auth: AuthUser, Group: GroupAPI},
+	{Name: "inbox-list", Method: "GET", Path: "/decisions/inbox", Auth: AuthUser, Group: GroupAPI},
 	{Name: "approval-review", Method: "GET", Path: "/decisions/{id}/challenges/{ordinal}/approval", Auth: AuthUser, Group: GroupAPI},
 	{Name: "approval-submit", Method: "POST", Path: "/decisions/{id}/challenges/{ordinal}/approvals", Auth: AuthUser, Group: GroupAPI},
 	{Name: "delay-cancel", Method: "POST", Path: "/decisions/{id}/challenges/{ordinal}/cancellation", Auth: AuthUser, Group: GroupAPI},
+	{Name: "audit-decision-list", Method: "GET", Path: "/audit/decisions", Auth: AuthUser, Group: GroupAPI},
+	{Name: "audit-decision-read", Method: "GET", Path: "/audit/decisions/{id}", Auth: AuthUser, Group: GroupAPI},
 	{Name: "console-config", Method: "GET", Path: ConsoleConfigPath, Auth: AuthStatic, Group: GroupServing},
 }
 
