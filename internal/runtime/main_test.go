@@ -35,6 +35,8 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/d0lim/stamp/internal/api"
+	"github.com/d0lim/stamp/internal/challenge"
+	"github.com/d0lim/stamp/internal/challenge/mfa"
 	"github.com/d0lim/stamp/internal/fact"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/store"
@@ -119,6 +121,9 @@ const (
 	testWorkload = "pep-1"
 	testConsole  = "console-1"
 	testKeyID    = "test-key"
+	// testStepUpACR is the class a step-up asks for and the only one the
+	// operator allowlist admits.
+	testStepUpACR = "urn:mace:incommon:iap:silver"
 )
 
 // testKey is generated once: RSA key generation otherwise dominates this
@@ -171,6 +176,11 @@ func (m *mockIdP) token(t *testing.T, subject, clientID string) string {
 		"iat": now.Add(-time.Minute).Unix(),
 		"exp": now.Add(time.Hour).Unix(),
 	}
+	return m.sign(t, claims)
+}
+
+func (m *mockIdP) sign(t *testing.T, claims map[string]any) string {
+	t.Helper()
 	header := map[string]string{"alg": "RS256", "kid": testKeyID, "typ": "JWT"}
 	encode := func(v any) string {
 		data, err := json.Marshal(v)
@@ -190,6 +200,29 @@ func (m *mockIdP) token(t *testing.T, subject, clientID string) string {
 
 func (m *mockIdP) workload(t *testing.T, id string) string { return m.token(t, id, testWorkload) }
 func (m *mockIdP) user(t *testing.T, id string) string     { return m.token(t, id, testConsole) }
+
+// stepUp mints the token a completed delegated authentication comes back with.
+//
+// It carries the three claims the mfa handler judges and nothing else is
+// different from an ordinary console token: the class the IdP says it
+// authenticated at, when it did so, and the nonce that names which
+// authorization request this answers.
+func (m *mockIdP) stepUp(t *testing.T, subject, acr string, authTime time.Time, nonce string) string {
+	t.Helper()
+	now := time.Now()
+	claims := map[string]any{
+		"iss":       m.server.URL,
+		"sub":       subject,
+		"aud":       testAudience,
+		"azp":       testConsole,
+		"iat":       now.Add(-time.Minute).Unix(),
+		"exp":       now.Add(time.Hour).Unix(),
+		"acr":       acr,
+		"auth_time": authTime.Unix(),
+		"nonce":     nonce,
+	}
+	return m.sign(t, claims)
+}
 
 // ---------------------------------------------------------------------------
 // the fact source
@@ -260,6 +293,9 @@ type harnessOptions struct {
 	dsn       string
 	writerID  string
 	noSources bool
+	// stepUp configures the delegated MFA handler against the mock IdP, which
+	// is what decides whether the mfa challenge kind has a handler at all.
+	stepUp bool
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -287,8 +323,9 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		InstanceID:  "e2e",
 		WriterID:    opts.writerID,
 		Addresses: map[api.Surface]string{
-			api.SurfacePEP:     "127.0.0.1:0",
-			api.SurfaceConsole: "127.0.0.1:0",
+			api.SurfacePEP:      "127.0.0.1:0",
+			api.SurfaceConsole:  "127.0.0.1:0",
+			api.SurfaceCallback: "127.0.0.1:0",
 		},
 		OIDC: OIDCConfig{
 			Issuers: []IssuerConfig{{
@@ -311,6 +348,18 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 	if !opts.noSources {
 		cfg.FactSources = []fact.Declaration{upstream.declaration()}
+	}
+	if opts.stepUp {
+		cfg.CallbackBaseURL = "http://127.0.0.1:1/callback"
+		cfg.MFA = MFAConfig{
+			AllowedACRValues:      []string{testStepUpACR},
+			AuthorizationEndpoint: idp.server.URL + "/authorize",
+			ClientID:              testConsole,
+			RedirectURI:           "http://127.0.0.1:1/callback",
+			// The mock IdP is plaintext loopback, which is the one place an
+			// authorization code over http is not a code handed to the network.
+			AllowInsecureTransport: true,
+		}
 	}
 
 	roles, err := ParseRoles(opts.roles)
@@ -514,6 +563,89 @@ func closurePolicy(id string, threshold int, approvers ...string) *policy.Policy
 			policy.Quorum{Threshold: threshold, Approvers: policy.ApproverSet{Members: approvers}},
 		},
 	}
+}
+
+// coolingOffPolicy is F3: closing a large account waits, and a named authority
+// may cut the wait short. It is the gated policy whose challenge a revision can
+// silently restart, which is why it is demonstrated end to end rather than only
+// in the revision package.
+func coolingOffPolicy(id string, wait time.Duration, cancellers ...string) *policy.Policy {
+	delay := policy.Delay{Duration: wait}
+	if len(cancellers) > 0 {
+		delay.CancellableBy = &policy.ApproverSet{Members: cancellers}
+	}
+	return &policy.Policy{
+		ID:       id,
+		Subject:  "account",
+		Resource: "account",
+		Actions:  []string{"close"},
+		Condition: policy.Compare{
+			Op: policy.OpGe, Left: policy.Field(policy.RoleResource, "amount"), Right: policy.Int(1000),
+		},
+		Challenges: []policy.Challenge{delay},
+	}
+}
+
+// stepUpPolicy gates a closure on a delegated authentication by the decision's
+// subject.
+func stepUpPolicy(id string, acr ...string) *policy.Policy {
+	return &policy.Policy{
+		ID:       id,
+		Subject:  "account",
+		Resource: "account",
+		Actions:  []string{"close"},
+		Condition: policy.Compare{
+			Op: policy.OpGe, Left: policy.Field(policy.RoleResource, "amount"), Right: policy.Int(1000),
+		},
+		Challenges: []policy.Challenge{policy.MFA{Mode: policy.MFADelegated, ACRValues: acr}},
+	}
+}
+
+// challengeRow reads one challenge's stored row.
+func (h *harness) challengeRow(decisionID string, ordinal int) store.ChallengeProgress {
+	h.t.Helper()
+	rows, err := store.ChallengeProgressFor(context.Background(), h.app.Store().Pool(), decisionID)
+	if err != nil {
+		h.t.Fatalf("read challenge progress: %v", err)
+	}
+	for _, row := range rows {
+		if row.Ordinal == ordinal {
+			return row
+		}
+	}
+	h.t.Fatalf("decision %s carries no challenge %d", decisionID, ordinal)
+	return store.ChallengeProgress{}
+}
+
+// delayDetail decodes the wait a decision is holding on.
+func (h *harness) delayDetail(decisionID string) challenge.DelayDetail {
+	h.t.Helper()
+	detail, err := challenge.DecodeDelayDetail(h.challengeRow(decisionID, 0).Detail)
+	if err != nil {
+		h.t.Fatalf("decode delay detail: %v", err)
+	}
+	return detail
+}
+
+// mfaDetail decodes the step-up a decision is waiting on.
+func (h *harness) mfaDetail(decisionID string) mfa.Detail {
+	h.t.Helper()
+	detail, err := mfa.DecodeDetail(h.challengeRow(decisionID, 0).Detail)
+	if err != nil {
+		h.t.Fatalf("decode mfa detail: %v", err)
+	}
+	return detail
+}
+
+// nextDeadline reports the decision's scheduler column, which is what the
+// sweeper wakes for.
+func (h *harness) nextDeadline(decisionID string) *time.Time {
+	h.t.Helper()
+	d, err := store.GetDecision(context.Background(), h.app.Store().Pool(), decisionID)
+	if err != nil {
+		h.t.Fatalf("read decision %s: %v", decisionID, err)
+	}
+	return d.NextDeadline
 }
 
 // evaluation is one AuthZEN request body.

@@ -63,6 +63,23 @@ stamp --roles=all
 | `STAMP_FACT_ALLOW_FAIL_OPEN` | Permit source declarations that fail open. Off by default. |
 | `STAMP_AUDIT_FAIL_CLOSED` | Deny while the check-path audit buffer is saturated. On by default. |
 | `STAMP_GOVERNANCE_MIN_APPROVERS` | The operator floor under any revision quorum. |
+| `STAMP_EXTERNAL_TARGETS` | Webhook destinations an `external` challenge may reach, as a JSON document or a path to one: `name`, `url`, `secret`, and optionally `timeout` and `respond_within`. A policy names an entry; it cannot name a URL. |
+| `STAMP_CALLBACK_BASE_URL` | This deployment's externally reachable callback base. Told to an external target and used to build the step-up redirect a completion returns to. |
+| `STAMP_MFA_ACR_VALUES` | The operator allowlist of authentication context classes. Required to run delegated MFA at all: an IdP downgrades an `acr` request it cannot satisfy without saying so, so an unchecked response is an unchecked authentication. |
+| `STAMP_MFA_AUTHORIZATION_ENDPOINT`, `STAMP_MFA_CLIENT_ID`, `STAMP_MFA_REDIRECT_URI` | The step-up redirect flow, which is the default delegation path (D26). |
+| `STAMP_MFA_CIBA_*` | The optional CIBA backchannel client, tried ahead of the step-up and falling back to it when the IdP has no decoupled authentication server behind its CIBA grant. |
+
+Configure no `STAMP_MFA_*` and the `mfa` challenge kind simply has no handler: a
+policy declaring one cannot issue a decision, which is the fail-closed reading of
+"this deployment has no step-up". If `STAMP_OIDC_ACR_VALUES` is set at all it
+bounds *every* end-user token, so it has to be a superset of
+`STAMP_MFA_ACR_VALUES` and of whatever class console login returns — otherwise a
+completed step-up is rejected as a bad credential before the challenge sees it.
+Startup checks the first half of that and says so.
+
+A policy's `mfa` challenge is completed by the decision's subject, matched on the
+token's `sub`. A decide request that puts anything else in `subject.id` — an
+account number, a resource key — produces a challenge no person can complete.
 
 On its first start with the `api` role the process installs the reserved governance policy and prints a one-time bootstrap token. It is shown once and stored only as a digest; lock governance with it as soon as the approver set is known.
 
