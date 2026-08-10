@@ -296,6 +296,11 @@ type harnessOptions struct {
 	// stepUp configures the delegated MFA handler against the mock IdP, which
 	// is what decides whether the mfa challenge kind has a handler at all.
 	stepUp bool
+	// mutate is the last word on the configuration, applied after everything
+	// above. It exists so a flow that needs a deployment surface the other
+	// options do not name — a velocity source, an ingest grant — states it as
+	// configuration rather than by growing this struct a field at a time.
+	mutate func(*Config)
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -360,6 +365,10 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 			// authorization code over http is not a code handed to the network.
 			AllowInsecureTransport: true,
 		}
+	}
+
+	if opts.mutate != nil {
+		opts.mutate(&cfg)
 	}
 
 	roles, err := ParseRoles(opts.roles)
@@ -447,6 +456,16 @@ func (h *harness) decode(raw []byte, into any) {
 // author against.
 func (h *harness) seed(schema *policy.Schema, policies ...*policy.Policy) {
 	h.t.Helper()
+	if err := h.trySeed(schema, policies...); err != nil {
+		h.t.Fatalf("refresh after seeding: %v", err)
+	}
+}
+
+// trySeed is seed for the tests where the reload is itself the thing under
+// test: the load gate refuses a policy set naming a source this deployment
+// cannot serve, and that refusal is an answer rather than a test failure.
+func (h *harness) trySeed(schema *policy.Schema, policies ...*policy.Policy) error {
+	h.t.Helper()
 	ctx := context.Background()
 	pool := h.app.Store().Pool()
 	rec, err := store.PutSchema(ctx, pool, schema, store.OriginForm, "tester")
@@ -460,9 +479,7 @@ func (h *harness) seed(schema *policy.Schema, policies ...*policy.Policy) {
 			h.t.Fatalf("seed policy %s: %v", p.ID, err)
 		}
 	}
-	if err := h.app.Refresh(ctx); err != nil {
-		h.t.Fatalf("refresh after seeding: %v", err)
-	}
+	return h.app.Refresh(ctx)
 }
 
 // auditPayloads returns the payloads of every audit row of a kind, oldest

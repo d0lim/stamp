@@ -16,6 +16,7 @@ package runtime
 // private egress, a governance floor of one approver.
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,9 +29,11 @@ import (
 	"github.com/d0lim/stamp/internal/api"
 	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/fact"
+	"github.com/d0lim/stamp/internal/fact/idpgroup"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/policy/revision"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // Defaults for the knobs a deployment does not set.
@@ -48,6 +51,22 @@ const (
 	// DefaultReconcileInterval is how often a pending revision whose quorum is
 	// in gets applied without waiting for the next approval.
 	DefaultReconcileInterval = 30 * time.Second
+
+	// DefaultIngestAdapterName and DefaultKafkaAdapterName are the names a
+	// velocity source declaration joins its ingestion adapter on. They have
+	// defaults because a single-adapter deployment has nothing to disambiguate,
+	// and an operator who runs both still writes the name in one place.
+	DefaultIngestAdapterName = "http-ingest"
+	DefaultKafkaAdapterName  = "kafka"
+
+	// DefaultRetentionSweepInterval is how often the dedup index and the bucket
+	// table are swept of rows past the retention horizon.
+	//
+	// Correctness does not depend on the sweep — the port refuses an event
+	// older than the widest declarable window, so nothing outside the horizon
+	// can affect an answer — but unbounded growth does, and the sweep is the
+	// only caller those two statements have.
+	DefaultRetentionSweepInterval = time.Hour
 )
 
 // Config is one stamp process's deployment configuration.
@@ -88,6 +107,73 @@ type Config struct {
 	// AllowFactFailOpen is the operator flag R36 requires: without it a source
 	// declaration asking to fail open is rejected at load.
 	AllowFactFailOpen bool
+
+	// StreamSources are the deployment's velocity source declarations: which
+	// metric each declared event source reads, how wide its buckets are, which
+	// ingestion adapter feeds it. A schema that declares an event source this
+	// list does not configure is refused at load, exactly as a synchronous one
+	// is — and a deployment that configures none refuses every event source,
+	// which is the shape that keeps the kind from being checked by nobody.
+	StreamSources []stream.Declaration
+	// IngestCredentials are the HTTP ingest grants. A credential is bound to
+	// the (source, metric) pairs it may write and separately to whether it may
+	// send a deduction.
+	//
+	// CallerID is the identifier the identity layer derives from a verified
+	// token — `workload:<issuer>#<sub>` — and not the bare `sub`. A subject
+	// identifier is unique only inside its issuer, so an ingest grant written
+	// against a bare one would be a grant to whoever holds that name at any
+	// pinned IdP.
+	IngestCredentials []stream.IngestCredential
+	// IngestAdapterName is the HTTP ingest adapter's name, which is what a
+	// source declaration joins on. Empty selects DefaultIngestAdapterName.
+	IngestAdapterName string
+	// IngestRate and IngestSubjectRate are the deployment defaults a credential
+	// that configured none inherits. Zero leaves that credential unlimited,
+	// which is only reachable when an operator configured no limit at all.
+	IngestRate        stream.RateLimit
+	IngestSubjectRate stream.RateLimit
+	// IngestMaxBatchEvents caps one ingest batch. Zero selects the stream
+	// package's default.
+	IngestMaxBatchEvents int
+	// IngestMaxRequestBytes bounds an ingest request body. It is a separate
+	// bound from the event cap because it is the one that applies before the
+	// body has been parsed. Zero selects the api package's default.
+	IngestMaxRequestBytes int64
+
+	// Kafka is the optional broker ingestion adapter. It is optional in the
+	// strong sense: with no brokers configured the deployment still ingests
+	// over HTTP, which is what removes the broker from the demo bundle.
+	Kafka KafkaConfig
+
+	// RetentionSweepInterval is how often the consumer role prunes dedup rows
+	// and buckets past the retention horizon. Zero selects
+	// DefaultRetentionSweepInterval.
+	RetentionSweepInterval time.Duration
+
+	// IdPGroupSources are the deployment's group directory sources. The
+	// directory credential lives here and nowhere else: a policy document can
+	// name a source but can never name or reach what it is pointed at (D21).
+	IdPGroupSources []idpgroup.Declaration
+	// IdPGroupMaxTTL lowers the cap on how stale a membership answer may be.
+	// Zero selects the idpgroup package's default. An operator may lower it; a
+	// policy author cannot raise it.
+	IdPGroupMaxTTL time.Duration
+
+	// ApproverIssuer designates the IdP a bare approver identifier in a policy
+	// belongs to.
+	//
+	// A policy that writes `{members: [alice]}` has named an identity only
+	// relative to an issuer: OIDC promises `sub` is unique inside one issuer
+	// and says nothing across two. A deployment that pins exactly one issuer
+	// has already answered the question and needs none of this. A deployment
+	// that pins several genuinely has not, and the challenge handlers refuse a
+	// bare set until it is answered — so this is where the answer goes.
+	//
+	// It must name one of the pinned issuers. Naming an unpinned one would
+	// designate an IdP whose tokens this process rejects, which produces a
+	// quorum nobody can satisfy rather than the misconfiguration it is.
+	ApproverIssuer string
 
 	// AuditFailClosed makes the check surface deny while the audit buffer is
 	// saturated. R32 requires this to be the operator's choice; the default is
@@ -183,6 +269,51 @@ type ConsoleConfig struct {
 	// AllowInsecureTransport permits plaintext console endpoints, for loopback
 	// development and tests.
 	AllowInsecureTransport bool
+}
+
+// KafkaConfig is the broker ingestion adapter's deployment configuration.
+//
+// The topic bindings carry the caller identity rather than reading one off a
+// record, because the caller namespaces the dedup key: a record that could name
+// its own caller could claim another producer's namespace and suppress its
+// events. Which producers may write a topic is the broker's ACLs to enforce,
+// and D17 makes those mandatory rather than advisory — without them the topic
+// is an unauthenticated write to somebody's velocity aggregate.
+type KafkaConfig struct {
+	// Brokers are the seed broker addresses. A non-empty list is what asks for
+	// the adapter at all.
+	Brokers []string
+	// Group is the consumer group. Required when Brokers is set.
+	Group string
+	// Topics binds each consumed topic to a velocity source and to the caller
+	// identity the broker admits as producer on it.
+	Topics []stream.KafkaTopic
+	// AdapterName is the name a source declaration joins on. Empty selects
+	// DefaultKafkaAdapterName.
+	AdapterName string
+	// PollRecords caps one poll, and therefore one aggregation transaction.
+	// Zero selects the stream package's default.
+	PollRecords int
+}
+
+// Configured reports whether a broker adapter was asked for.
+func (k KafkaConfig) Configured() bool { return len(k.Brokers) > 0 }
+
+// validate refuses a broker configuration that could only fail at the first
+// poll, which is after the process reported itself healthy.
+func (k KafkaConfig) validate() []error {
+	if !k.Configured() {
+		return nil
+	}
+	var errs []error
+	if strings.TrimSpace(k.Group) == "" {
+		errs = append(errs, fmt.Errorf("%s is set but %s is not: a consumer with no group cannot commit a position",
+			EnvKafkaBrokers, EnvKafkaGroup))
+	}
+	if len(k.Topics) == 0 {
+		errs = append(errs, fmt.Errorf("%s is set but %s binds no topic to a source", EnvKafkaBrokers, EnvKafkaTopics))
+	}
+	return errs
 }
 
 // MFAConfig is the delegated MFA trust boundary and transport.
@@ -308,6 +439,29 @@ const (
 	EnvEgressLoopback    = "STAMP_EGRESS_ALLOW_LOOPBACK"
 	EnvEgressPrivate     = "STAMP_EGRESS_ALLOW_PRIVATE"
 	EnvFactAllowFailOpen = "STAMP_FACT_ALLOW_FAIL_OPEN"
+
+	EnvStreamSources      = "STAMP_STREAM_SOURCES"
+	EnvIngestCredentials  = "STAMP_INGEST_CREDENTIALS" //nolint:gosec // a variable name, not a credential
+	EnvIngestAdapterName  = "STAMP_INGEST_ADAPTER_NAME"
+	EnvIngestRate         = "STAMP_INGEST_RATE_PER_SECOND"
+	EnvIngestBurst        = "STAMP_INGEST_RATE_BURST"
+	EnvIngestSubjectRate  = "STAMP_INGEST_SUBJECT_RATE_PER_SECOND"
+	EnvIngestSubjectBurst = "STAMP_INGEST_SUBJECT_RATE_BURST"
+	EnvIngestMaxBatch     = "STAMP_INGEST_MAX_BATCH_EVENTS"
+	EnvIngestMaxBytes     = "STAMP_INGEST_MAX_REQUEST_BYTES"
+
+	EnvKafkaBrokers     = "STAMP_KAFKA_BROKERS"
+	EnvKafkaGroup       = "STAMP_KAFKA_GROUP"
+	EnvKafkaTopics      = "STAMP_KAFKA_TOPICS"
+	EnvKafkaAdapterName = "STAMP_KAFKA_ADAPTER_NAME"
+	EnvKafkaPollRecords = "STAMP_KAFKA_POLL_RECORDS"
+
+	EnvRetentionSweepInterval = "STAMP_RETENTION_SWEEP_INTERVAL"
+
+	EnvIdPGroupSources = "STAMP_IDP_GROUP_SOURCES"
+	EnvIdPGroupMaxTTL  = "STAMP_IDP_GROUP_MAX_TTL"
+
+	EnvApproverIssuer = "STAMP_APPROVER_ISSUER"
 
 	EnvAuditFailClosed    = "STAMP_AUDIT_FAIL_CLOSED"
 	EnvAuditCapacity      = "STAMP_AUDIT_CAPACITY"
@@ -456,6 +610,49 @@ func ConfigFromEnv() (Config, error) {
 	}
 	cfg.FactSources = decls
 
+	streamDecls, err := streamSourcesFrom(os.Getenv(EnvStreamSources))
+	if err != nil {
+		fail("%s: %w", EnvStreamSources, err)
+	}
+	cfg.StreamSources = streamDecls
+	creds, err := ingestCredentialsFrom(os.Getenv(EnvIngestCredentials))
+	if err != nil {
+		fail("%s: %w", EnvIngestCredentials, err)
+	}
+	cfg.IngestCredentials = creds
+	cfg.IngestAdapterName = strings.TrimSpace(os.Getenv(EnvIngestAdapterName))
+	cfg.IngestRate = stream.RateLimit{
+		PerSecond: envFloat(EnvIngestRate, fail),
+		Burst:     envFloat(EnvIngestBurst, fail),
+	}
+	cfg.IngestSubjectRate = stream.RateLimit{
+		PerSecond: envFloat(EnvIngestSubjectRate, fail),
+		Burst:     envFloat(EnvIngestSubjectBurst, fail),
+	}
+	cfg.IngestMaxBatchEvents = envInt(EnvIngestMaxBatch, 0, fail)
+	cfg.IngestMaxRequestBytes = int64(envInt(EnvIngestMaxBytes, 0, fail))
+	cfg.RetentionSweepInterval = envDuration(EnvRetentionSweepInterval, DefaultRetentionSweepInterval, fail)
+
+	topics, err := kafkaTopicsFrom(os.Getenv(EnvKafkaTopics))
+	if err != nil {
+		fail("%s: %w", EnvKafkaTopics, err)
+	}
+	cfg.Kafka = KafkaConfig{
+		Brokers:     splitList(os.Getenv(EnvKafkaBrokers)),
+		Group:       strings.TrimSpace(os.Getenv(EnvKafkaGroup)),
+		Topics:      topics,
+		AdapterName: strings.TrimSpace(os.Getenv(EnvKafkaAdapterName)),
+		PollRecords: envInt(EnvKafkaPollRecords, 0, fail),
+	}
+
+	groups, err := idpGroupSourcesFrom(os.Getenv(EnvIdPGroupSources))
+	if err != nil {
+		fail("%s: %w", EnvIdPGroupSources, err)
+	}
+	cfg.IdPGroupSources = groups
+	cfg.IdPGroupMaxTTL = envDuration(EnvIdPGroupMaxTTL, 0, fail)
+	cfg.ApproverIssuer = strings.TrimSpace(os.Getenv(EnvApproverIssuer))
+
 	aliases, err := aliasesFrom(os.Getenv(EnvCheckPropertyAliases))
 	if err != nil {
 		fail("%s: %w", EnvCheckPropertyAliases, err)
@@ -528,6 +725,29 @@ func (c Config) withDefaults() Config {
 	if c.GovernanceFloor.MinApprovers <= 0 {
 		c.GovernanceFloor.MinApprovers = revision.DefaultFloor().MinApprovers
 	}
+	if c.IngestAdapterName == "" {
+		c.IngestAdapterName = DefaultIngestAdapterName
+	}
+	if c.Kafka.AdapterName == "" {
+		c.Kafka.AdapterName = DefaultKafkaAdapterName
+	}
+	if c.RetentionSweepInterval <= 0 {
+		c.RetentionSweepInterval = DefaultRetentionSweepInterval
+	}
+	// A declaration that names no adapter takes the HTTP one. That is the
+	// deployment every install has — the Kafka adapter is the optional
+	// dependency D20 keeps optional — so it is the only default that could be
+	// filled in without guessing.
+	if len(c.StreamSources) > 0 {
+		decls := make([]stream.Declaration, len(c.StreamSources))
+		copy(decls, c.StreamSources)
+		for i := range decls {
+			if decls[i].Adapter == "" {
+				decls[i].Adapter = c.IngestAdapterName
+			}
+		}
+		c.StreamSources = decls
+	}
 	return c
 }
 
@@ -553,6 +773,22 @@ func (c Config) validate() error {
 			errs = append(errs, fmt.Errorf("unknown listener surface %q", surface))
 		}
 	}
+	// An approver issuer that is not pinned would designate an IdP whose tokens
+	// this process rejects: the quorum would open and no approval could ever
+	// satisfy it, which is a policy-shaped failure with a configuration cause.
+	if designated := strings.TrimSpace(c.ApproverIssuer); designated != "" {
+		pinned := make([]string, 0, len(c.OIDC.Issuers))
+		for _, iss := range c.OIDC.Issuers {
+			pinned = append(pinned, iss.Issuer)
+		}
+		if !slices.Contains(pinned, designated) {
+			errs = append(errs, fmt.Errorf(
+				"%s designates %q, which %s does not pin: an approver issuer this process does not verify "+
+					"tokens from is a quorum nobody can satisfy. pinned issuers: %s",
+				EnvApproverIssuer, designated, EnvOIDCIssuer, strings.Join(pinned, ", ")))
+		}
+	}
+	errs = append(errs, c.Kafka.validate()...)
 	errs = append(errs, c.MFA.validate(c.OIDC)...)
 	return errors.Join(errs...)
 }
@@ -629,10 +865,17 @@ type paramJSON struct {
 	Type string `json:"type"`
 }
 
-// factSourcesFrom reads the declaration list. The value is either a JSON
-// document or a path to one, decided by its first character: a container hands
-// this in as a mounted file, and a laptop as a literal.
-func factSourcesFrom(spec string) ([]fact.Declaration, error) {
+// configDocs reads a JSON list from an operator-supplied value. The value is
+// either the document itself or a path to one, decided by its first character:
+// a container hands these in as a mounted file, and a laptop as a literal. A
+// mounted file is the only sensible form for the two lists that carry a
+// credential, and the same rule serves both so an operator learns it once.
+//
+// Unknown fields are refused rather than ignored. A misspelled key in a
+// deployment manifest would otherwise be a setting silently left at its
+// default, which for `allow_deduction` or `freshness` is a control that reads
+// as configured and is not.
+func configDocs[T any](label, spec string) ([]T, error) {
 	trimmed := strings.TrimSpace(spec)
 	if trimmed == "" {
 		return nil, nil
@@ -641,15 +884,24 @@ func factSourcesFrom(spec string) ([]fact.Declaration, error) {
 	if !strings.HasPrefix(trimmed, "[") {
 		data, err := os.ReadFile(trimmed) //nolint:gosec // an operator-supplied configuration path
 		if err != nil {
-			return nil, fmt.Errorf("read fact source declarations: %w", err)
+			return nil, fmt.Errorf("read %s: %w", label, err)
 		}
 		raw = data
 	}
-	var docs []factSourceJSON
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	var docs []T
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&docs); err != nil {
-		return nil, fmt.Errorf("decode fact source declarations: %w", err)
+		return nil, fmt.Errorf("decode %s: %w", label, err)
+	}
+	return docs, nil
+}
+
+// factSourcesFrom reads the synchronous source declaration list.
+func factSourcesFrom(spec string) ([]fact.Declaration, error) {
+	docs, err := configDocs[factSourceJSON]("fact source declarations", spec)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]fact.Declaration, 0, len(docs))
 	for _, d := range docs {
@@ -664,7 +916,6 @@ func factSourcesFrom(spec string) ([]fact.Declaration, error) {
 		for _, p := range d.Params {
 			decl.Params = append(decl.Params, policy.Param{Name: p.Name, Type: policy.Type(p.Type)})
 		}
-		var err error
 		if decl.TTL, err = parseOptionalDuration(d.TTL); err != nil {
 			return nil, fmt.Errorf("source %q: ttl: %w", d.Name, err)
 		}
@@ -692,32 +943,17 @@ type externalTargetJSON struct {
 	RespondWithin string `json:"respond_within,omitempty"`
 }
 
-// externalTargetsFrom reads the webhook destination list. The value is either a
-// JSON document or a path to one, decided by its first character — a shared
-// secret is not something a deployment should have to put in a manifest inline.
+// externalTargetsFrom reads the webhook destination list. A shared secret is
+// not something a deployment should have to put in a manifest inline, which is
+// what the path form is for.
 func externalTargetsFrom(spec string) ([]challenge.ExternalTarget, error) {
-	trimmed := strings.TrimSpace(spec)
-	if trimmed == "" {
-		return nil, nil
-	}
-	raw := []byte(trimmed)
-	if !strings.HasPrefix(trimmed, "[") {
-		data, err := os.ReadFile(trimmed) //nolint:gosec // an operator-supplied configuration path
-		if err != nil {
-			return nil, fmt.Errorf("read external targets: %w", err)
-		}
-		raw = data
-	}
-	var docs []externalTargetJSON
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&docs); err != nil {
-		return nil, fmt.Errorf("decode external targets: %w", err)
+	docs, err := configDocs[externalTargetJSON]("external targets", spec)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]challenge.ExternalTarget, 0, len(docs))
 	for _, d := range docs {
 		target := challenge.ExternalTarget{Name: d.Name, URL: d.URL, Secret: d.Secret}
-		var err error
 		if target.Timeout, err = parseOptionalDuration(d.Timeout); err != nil {
 			return nil, fmt.Errorf("target %q: timeout: %w", d.Name, err)
 		}
@@ -725,6 +961,191 @@ func externalTargetsFrom(spec string) ([]challenge.ExternalTarget, error) {
 			return nil, fmt.Errorf("target %q: respond_within: %w", d.Name, err)
 		}
 		out = append(out, target)
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// the ingestion plane
+//
+// Same split again, and here it is the sharpest one in the file. A velocity
+// source's schema half is its name, parameters and return type; everything
+// below — which metric it reads, how wide its buckets are, how far back its
+// window reaches, which adapter feeds it, whether deductions are admitted — is
+// deployment configuration. A policy author who could write those fields could
+// point a limit at another tenant's metric, or widen the window until the limit
+// stopped biting.
+// ---------------------------------------------------------------------------
+
+type streamSourceJSON struct {
+	Name           string      `json:"name"`
+	Metric         string      `json:"metric"`
+	Adapter        string      `json:"adapter,omitempty"`
+	Window         string      `json:"window"`
+	BucketWidth    string      `json:"bucket_width"`
+	Freshness      string      `json:"freshness,omitempty"`
+	AllowDeduction bool        `json:"allow_deduction,omitempty"`
+	Params         []paramJSON `json:"params,omitempty"`
+	Returns        string      `json:"returns"`
+	OnError        string      `json:"on_error,omitempty"`
+}
+
+// streamSourcesFrom reads the velocity source declarations.
+func streamSourcesFrom(spec string) ([]stream.Declaration, error) {
+	docs, err := configDocs[streamSourceJSON]("velocity source declarations", spec)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]stream.Declaration, 0, len(docs))
+	for _, d := range docs {
+		decl := stream.Declaration{
+			Name:           d.Name,
+			Metric:         d.Metric,
+			Adapter:        d.Adapter,
+			AllowDeduction: d.AllowDeduction,
+			Returns:        policy.Type(d.Returns),
+			OnError:        policy.OnError(d.OnError),
+		}
+		for _, p := range d.Params {
+			decl.Params = append(decl.Params, policy.Param{Name: p.Name, Type: policy.Type(p.Type)})
+		}
+		for _, field := range []struct {
+			name string
+			spec string
+			into *time.Duration
+		}{
+			{"window", d.Window, &decl.Window},
+			{"bucket_width", d.BucketWidth, &decl.BucketWidth},
+			{"freshness", d.Freshness, &decl.Freshness},
+		} {
+			if *field.into, err = parseOptionalDuration(field.spec); err != nil {
+				return nil, fmt.Errorf("source %q: %s: %w", d.Name, field.name, err)
+			}
+		}
+		out = append(out, decl)
+	}
+	return out, nil
+}
+
+type rateLimitJSON struct {
+	PerSecond float64 `json:"per_second"`
+	Burst     float64 `json:"burst,omitempty"`
+}
+
+type scopeEntryJSON struct {
+	Source string `json:"source"`
+	Metric string `json:"metric"`
+}
+
+type ingestCredentialJSON struct {
+	CallerID       string           `json:"caller_id"`
+	Scope          []scopeEntryJSON `json:"scope"`
+	AllowDeduction bool             `json:"allow_deduction,omitempty"`
+	Rate           *rateLimitJSON   `json:"rate,omitempty"`
+	SubjectRate    *rateLimitJSON   `json:"subject_rate,omitempty"`
+}
+
+// ingestCredentialsFrom reads the HTTP ingest grants.
+func ingestCredentialsFrom(spec string) ([]stream.IngestCredential, error) {
+	docs, err := configDocs[ingestCredentialJSON]("ingest credentials", spec)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]stream.IngestCredential, 0, len(docs))
+	for _, d := range docs {
+		cred := stream.IngestCredential{CallerID: d.CallerID, AllowDeduction: d.AllowDeduction}
+		for _, s := range d.Scope {
+			cred.Scope = append(cred.Scope, stream.ScopeEntry{Source: s.Source, Metric: s.Metric})
+		}
+		if d.Rate != nil {
+			cred.Rate = stream.RateLimit{PerSecond: d.Rate.PerSecond, Burst: d.Rate.Burst}
+		}
+		if d.SubjectRate != nil {
+			cred.SubjectRate = stream.RateLimit{PerSecond: d.SubjectRate.PerSecond, Burst: d.SubjectRate.Burst}
+		}
+		out = append(out, cred)
+	}
+	return out, nil
+}
+
+type kafkaTopicJSON struct {
+	Topic          string `json:"topic"`
+	Source         string `json:"source"`
+	CallerID       string `json:"caller_id"`
+	AllowDeduction bool   `json:"allow_deduction,omitempty"`
+}
+
+// kafkaTopicsFrom reads the topic-to-source bindings.
+func kafkaTopicsFrom(spec string) ([]stream.KafkaTopic, error) {
+	docs, err := configDocs[kafkaTopicJSON]("kafka topic bindings", spec)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]stream.KafkaTopic, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, stream.KafkaTopic{
+			Topic:          d.Topic,
+			Source:         d.Source,
+			CallerID:       d.CallerID,
+			AllowDeduction: d.AllowDeduction,
+		})
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// idp group sources
+//
+// The credential below is the reason this list has its own reader rather than
+// riding along with the synchronous sources: it is the deployment's identity at
+// its own directory, it is operator configuration only, and there is no field
+// in any policy document that names or reaches it (D21).
+// ---------------------------------------------------------------------------
+
+type idpGroupSourceJSON struct {
+	Name          string      `json:"name"`
+	Issuer        string      `json:"issuer"`
+	URL           string      `json:"url"`
+	Credential    string      `json:"credential,omitempty"`
+	MembersField  string      `json:"members_field,omitempty"`
+	MemberIDField string      `json:"member_id_field,omitempty"`
+	TotalField    string      `json:"total_field,omitempty"`
+	TTL           string      `json:"ttl"`
+	Timeout       string      `json:"timeout"`
+	Params        []paramJSON `json:"params,omitempty"`
+	Returns       string      `json:"returns"`
+	OnError       string      `json:"on_error,omitempty"`
+}
+
+// idpGroupSourcesFrom reads the group directory declarations.
+func idpGroupSourcesFrom(spec string) ([]idpgroup.Declaration, error) {
+	docs, err := configDocs[idpGroupSourceJSON]("idp group source declarations", spec)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]idpgroup.Declaration, 0, len(docs))
+	for _, d := range docs {
+		decl := idpgroup.Declaration{
+			Name:          d.Name,
+			Issuer:        d.Issuer,
+			URL:           d.URL,
+			Credential:    d.Credential,
+			MembersField:  d.MembersField,
+			MemberIDField: d.MemberIDField,
+			TotalField:    d.TotalField,
+			Returns:       policy.Type(d.Returns),
+			OnError:       policy.OnError(d.OnError),
+		}
+		for _, p := range d.Params {
+			decl.Params = append(decl.Params, policy.Param{Name: p.Name, Type: policy.Type(p.Type)})
+		}
+		if decl.TTL, err = parseOptionalDuration(d.TTL); err != nil {
+			return nil, fmt.Errorf("source %q: ttl: %w", d.Name, err)
+		}
+		if decl.Timeout, err = parseOptionalDuration(d.Timeout); err != nil {
+			return nil, fmt.Errorf("source %q: timeout: %w", d.Name, err)
+		}
+		out = append(out, decl)
 	}
 	return out, nil
 }
@@ -799,6 +1220,22 @@ func envInt(key string, fallback int, fail func(string, ...any)) int {
 	if err != nil {
 		fail("%s: %q is not an integer", key, raw)
 		return fallback
+	}
+	return v
+}
+
+// envFloat reads a rate. It has no fallback parameter because every caller
+// wants the same one: an unset rate is zero, which the stream package reads as
+// "no limit" — the only state an operator who configured nothing can be in.
+func envFloat(key string, fail func(string, ...any)) float64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		fail("%s: %q is not a number", key, raw)
+		return 0
 	}
 	return v
 }
