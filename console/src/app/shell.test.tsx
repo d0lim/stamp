@@ -112,6 +112,11 @@ describe('접근성 뼈대', () => {
     renderShell({ roles: ['author'] })
     await screen.findByRole('heading', { level: 1 })
 
+    // The route announcer has just moved focus into main, so tabbing from there
+    // walks the screen's own controls rather than the document's first one.
+    // The claim being made is about document order — that nothing precedes the
+    // skip link — so the walk starts from the top.
+    ;(document.activeElement as HTMLElement | null)?.blur()
     await userEvent.tab()
     expect(document.activeElement).toHaveTextContent('본문으로 건너뛰기')
   })

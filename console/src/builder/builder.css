@@ -1,0 +1,166 @@
+/*
+ * The builder's own stylesheet.
+ *
+ * It introduces no colour of its own. Every rule below reuses a token declared
+ * in src/styles.css, where each foreground/background pair is written down with
+ * its contrast ratio — so there is no new pair here whose ratio would have to be
+ * stated, and no chance of a builder-only colour drifting away from the shell's
+ * in one scheme and not the other. R19 wants 4.5:1 across the authoring flow;
+ * inheriting the palette is the cheapest way to keep that true.
+ *
+ * No inline styles, here or in the components: the console is served under
+ * style-src 'self' with no 'unsafe-inline', so a style attribute is a rule the
+ * browser drops.
+ *
+ * An error is marked by a border, a bullet character and its text — never by
+ * colour alone, because colour alone is not a signal every reader receives.
+ */
+
+.builder {
+  max-width: 64rem;
+}
+
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  list-style: none;
+  margin: var(--gap) 0;
+  padding: 0;
+}
+
+.field {
+  margin-bottom: 0.75rem;
+}
+
+.field--inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.field__label {
+  display: block;
+  font-weight: 600;
+  font-size: 0.9375rem;
+}
+
+.field__hint {
+  margin: 0.15rem 0 0.35rem;
+  color: var(--ink-quiet);
+  font-size: 0.875rem;
+}
+
+/* The marker is content, not decoration: it is the non-colour half of the
+   signal, so it is drawn with ::before rather than typed into every message. */
+.field__error {
+  margin: 0.25rem 0 0;
+  padding-left: 0.6rem;
+  border-left: 3px solid var(--refusal-line);
+  font-size: 0.9375rem;
+}
+
+.field__error::before {
+  content: '● ';
+}
+
+.control {
+  font: inherit;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.35rem 0.5rem;
+  max-width: 32rem;
+  width: 100%;
+}
+
+.field--inline .control {
+  width: auto;
+}
+
+input[type='checkbox'].control,
+input[type='radio'].control {
+  width: 1rem;
+  height: 1rem;
+  padding: 0;
+}
+
+.group,
+.node {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  margin: 0 0 0.75rem;
+}
+
+.group--nested,
+.node .node {
+  background: var(--paper-sunk);
+}
+
+.group__legend {
+  font-weight: 700;
+  padding: 0 0.35rem;
+}
+
+.node__children {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 0.75rem;
+  border-left: 2px solid var(--line);
+}
+
+.palette {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin: 0.5rem 0;
+}
+
+.operand {
+  border-left: 2px solid var(--line);
+  padding-left: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.summary-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.summary-list dt {
+  font-weight: 700;
+}
+
+.summary-list dd {
+  margin: 0;
+}
+
+.trace,
+.source-list,
+.policy-list {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+}
+
+.trace li,
+.source-list li {
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.document {
+  background: var(--paper-sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.875rem;
+  white-space: pre;
+}

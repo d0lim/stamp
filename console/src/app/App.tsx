@@ -11,13 +11,8 @@ import { AuthGate } from './AuthGate'
 import { CallbackScreen } from './CallbackScreen'
 import { Layout } from './Layout'
 import { RequireRole } from './RequireRole'
-import {
-  AuditScreen,
-  InboxScreen,
-  NoAccessScreen,
-  NotFoundScreen,
-  PoliciesScreen,
-} from './screens'
+import { AuditScreen, InboxScreen, NoAccessScreen, NotFoundScreen } from './screens'
+import { PolicyRoutes } from '../builder/routes'
 import { useAuth } from '../auth/AuthProvider'
 
 function Landing() {
@@ -43,7 +38,7 @@ export function App() {
           element={
             <AuthGate>
               <RequireRole role="author">
-                <PoliciesScreen />
+                <PolicyRoutes />
               </RequireRole>
             </AuthGate>
           }
