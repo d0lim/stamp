@@ -29,6 +29,11 @@ func clearEnv(t *testing.T) {
 		EnvFloorMinApprovers, EnvFloorProposerMayApprove,
 		EnvRevisionTTL, EnvReconcileInterval, EnvBootstrapWarnInterval,
 		EnvCheckContextEntity, EnvCheckPropertyAliases,
+		EnvExternalTargets, EnvCallbackBaseURL,
+		EnvMFAACRValues, EnvMFARequiredAMR, EnvMFAAuthzEndpoint, EnvMFAClientID,
+		EnvMFARedirectURI, EnvMFAScopes, EnvMFAIssuer, EnvMFATokenClientID,
+		EnvMFAAudience, EnvMFAAllowInsecure,
+		EnvCIBABackchannel, EnvCIBATokenURL, EnvCIBAClientID, EnvCIBAClientSecret, EnvCIBAScope,
 	} {
 		t.Setenv(key, "")
 		_ = os.Unsetenv(key)
@@ -182,5 +187,111 @@ func TestWriterIDFor(t *testing.T) {
 	}
 	if got := writerIDFor(strings.Repeat("a", 100)); len(got) != 64 {
 		t.Errorf("a long instance name produced a %d character writer id, want it capped at 64", len(got))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the M2 challenge configuration
+// ---------------------------------------------------------------------------
+
+func TestExternalTargetsAreReadFromTheEnvironment(t *testing.T) {
+	doc := `[{"name":"reviewer","url":"https://reviewer.example/hook",
+	           "secret":"0123456789abcdef0123456789abcdef","timeout":"3s","respond_within":"10m"}]`
+	targets, err := externalTargetsFrom(doc)
+	if err != nil {
+		t.Fatalf("read external targets: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("read %d targets, want 1", len(targets))
+	}
+	got := targets[0]
+	if got.Name != "reviewer" || got.URL != "https://reviewer.example/hook" {
+		t.Errorf("target = %+v", got)
+	}
+	if got.Timeout != 3*time.Second || got.RespondWithin != 10*time.Minute {
+		t.Errorf("timeout = %v, respond_within = %v", got.Timeout, got.RespondWithin)
+	}
+}
+
+func TestExternalTargetsRejectAnUnknownField(t *testing.T) {
+	// A misspelled key is a target that silently loses its secret or its
+	// deadline, so it is refused rather than ignored.
+	if _, err := externalTargetsFrom(`[{"name":"x","url":"https://x.example","secrat":"y"}]`); err == nil {
+		t.Fatal("a target with an unknown field was accepted")
+	}
+}
+
+// U10's first trap, as a configuration rule: the allowlist is the only defence
+// the delegated handler has, so asking for the handler without one fails the
+// boot instead of producing a handler whose one real check does not run.
+func TestDelegatedMFANeedsAnACRAllowlist(t *testing.T) {
+	cfg := baseConfig()
+	cfg.MFA = MFAConfig{
+		AuthorizationEndpoint: "https://idp.example/authorize",
+		ClientID:              "stamp-console",
+		RedirectURI:           "https://stamp.example/callback",
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("a delegated mfa handler with no acr allowlist was accepted")
+	}
+	if !strings.Contains(err.Error(), EnvMFAACRValues) {
+		t.Errorf("the error does not name %s:\n%v", EnvMFAACRValues, err)
+	}
+}
+
+// U10's second trap. The process-wide allowlist bounds every end-user token, so
+// a step-up class outside it is rejected by token verification before the mfa
+// handler ever sees the completion — which looks like a credential failure and
+// not like a challenge failure.
+func TestStepUpClassesMustBeAdmittedByTheProcessWideAllowlist(t *testing.T) {
+	cfg := baseConfig()
+	cfg.OIDC.AllowedACRValues = []string{"aal1"}
+	cfg.MFA = MFAConfig{
+		AllowedACRValues:      []string{"aal2"},
+		AuthorizationEndpoint: "https://idp.example/authorize",
+		ClientID:              "stamp-console",
+		RedirectURI:           "https://stamp.example/callback",
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("a step-up class outside the process-wide allowlist was accepted")
+	}
+	if !strings.Contains(err.Error(), EnvOIDCACRValues) {
+		t.Errorf("the error does not name %s:\n%v", EnvOIDCACRValues, err)
+	}
+
+	// The superset is fine, and so is the empty process-wide allowlist, which
+	// means "no bound" rather than "no classes".
+	cfg.OIDC.AllowedACRValues = []string{"aal1", "aal2"}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("a superset allowlist was refused: %v", err)
+	}
+	cfg.OIDC.AllowedACRValues = nil
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("an unbounded process-wide allowlist was refused: %v", err)
+	}
+}
+
+// A deployment that configures no step-up at all is valid: the mfa kind simply
+// has no handler, which is fail-closed rather than permissive.
+func TestNoMFAConfigurationIsValid(t *testing.T) {
+	if err := baseConfig().validate(); err != nil {
+		t.Fatalf("a deployment with no delegated mfa was refused: %v", err)
+	}
+	if baseConfig().MFA.Configured() {
+		t.Error("an empty MFAConfig reports itself configured")
+	}
+}
+
+// baseConfig is the smallest configuration that validates.
+func baseConfig() Config {
+	return Config{
+		DSN:       "postgres://stamp@localhost/stamp",
+		Addresses: map[api.Surface]string{api.SurfacePEP: ":8080"},
+		OIDC: OIDCConfig{
+			Issuers:  []IssuerConfig{{Issuer: "https://idp.example", JWKSURL: "https://idp.example/jwks"}},
+			Audience: "stamp",
+		},
 	}
 }

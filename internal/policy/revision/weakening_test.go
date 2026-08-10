@@ -2,8 +2,10 @@ package revision_test
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/policy/revision"
@@ -447,5 +449,233 @@ func TestSatisfiableDeltaPasses(t *testing.T) {
 	}}}
 	if err := revision.CheckSatisfiable(d); err != nil {
 		t.Fatalf("CheckSatisfiable = %v, want nil", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// bypasses through the three kinds M2 added
+//
+// Until M2 the quorum was the only challenge kind, so a classifier that
+// inspected quorums was a classifier that inspected challenges. Landing delay,
+// mfa and external turned that into a hole: every relaxation below left the
+// challenge list the same length and every quorum untouched, which is the whole
+// of what the classifier used to look at.
+//
+// The stance is U9's, unchanged: anything not provably a tightening is a
+// loosening. Over-charging a revision is friction; under-charging it is the
+// bypass.
+// ---------------------------------------------------------------------------
+
+// delayed is the shape of a policy gated by a wait.
+func delayed(id string, wait time.Duration, cancellers ...string) *policy.Policy {
+	p := guarded(id, 2, "a", "b", "c")
+	d := policy.Delay{Duration: wait}
+	if len(cancellers) > 0 {
+		d.CancellableBy = &policy.ApproverSet{Members: cancellers}
+	}
+	p.Challenges = []policy.Challenge{d}
+	return p
+}
+
+func steppedUp(id string, acr ...string) *policy.Policy {
+	p := guarded(id, 2, "a", "b", "c")
+	p.Challenges = []policy.Challenge{policy.MFA{Mode: policy.MFADelegated, ACRValues: acr}}
+	return p
+}
+
+func referred(id, target string) *policy.Policy {
+	p := guarded(id, 2, "a", "b", "c")
+	p.Challenges = []policy.Challenge{policy.External{Target: target}}
+	return p
+}
+
+func modify(id string, before, after *policy.Policy) revision.Delta {
+	return revision.Delta{Changes: []revision.Change{{
+		Kind: revision.ChangeModify, PolicyID: id, Before: before, After: after,
+	}}}
+}
+
+// Bypass: leave the delay challenge in place and cut it to nothing. The
+// challenge list is the same length and the quorum is untouched, so every check
+// the classifier used to run passes — and a twenty-four hour hold that somebody
+// was expected to notice within has become a millisecond.
+func TestShorteningADelayIsWeakening(t *testing.T) {
+	cases := map[string]time.Duration{
+		"cut to a millisecond": time.Millisecond,
+		"cut by a third":       16 * time.Hour,
+		"cut by twenty pct":    80 * time.Minute,
+	}
+	for name, shortened := range cases {
+		t.Run(name, func(t *testing.T) {
+			class := revision.Classify(modify("cooling-off",
+				delayed("cooling-off", 24*time.Hour), delayed("cooling-off", shortened)))
+			if !hasReason(class, revision.ReasonDelayShortened) {
+				t.Fatalf("findings = %s, want a %s finding", reasonsOf(class), revision.ReasonDelayShortened)
+			}
+		})
+	}
+}
+
+// A longer wait is a stricter control, and charging it a weakening revision's
+// price would make every tightening expensive — the same reason the numeric
+// bound comparison exists for triggers.
+func TestLengtheningADelayIsNotWeakening(t *testing.T) {
+	class := revision.Classify(modify("cooling-off",
+		delayed("cooling-off", time.Hour), delayed("cooling-off", 24*time.Hour)))
+	if class.Weakening() {
+		t.Fatalf("lengthening a wait classified as weakening: %s", reasonsOf(class))
+	}
+}
+
+// Bypass: keep the wait and take away the ability to stop it.
+//
+// A cancellation authority is not an escape hatch from the wait — cancelling a
+// delay resolves the decision to deny — so it is a veto, and taking a veto away
+// grows the set of requests that end in allow. Narrowing it, dropping it, and
+// swapping it for a form that cannot be compared are the same act at three
+// different volumes.
+func TestNarrowingACancellationAuthorityIsWeakening(t *testing.T) {
+	cases := map[string]*policy.Policy{
+		"member removed": delayed("cooling-off", time.Hour, "carol"),
+		"dropped whole":  delayed("cooling-off", time.Hour),
+		"swapped for a claim": func() *policy.Policy {
+			p := delayed("cooling-off", time.Hour)
+			p.Challenges = []policy.Challenge{policy.Delay{
+				Duration:      time.Hour,
+				CancellableBy: &policy.ApproverSet{Claim: "can_cancel"},
+			}}
+			return p
+		}(),
+	}
+	for name, after := range cases {
+		t.Run(name, func(t *testing.T) {
+			class := revision.Classify(modify("cooling-off",
+				delayed("cooling-off", time.Hour, "carol", "dave"), after))
+			if !hasReason(class, revision.ReasonCancellationNarrowed) {
+				t.Fatalf("findings = %s, want a %s finding", reasonsOf(class), revision.ReasonCancellationNarrowed)
+			}
+		})
+	}
+}
+
+// Handing the veto to more people is a tightening, and this is where a delay
+// parts company with a quorum: a quorum approver grants and a delay canceller
+// denies, so the two run in opposite directions and reusing the approver-set
+// rule here would charge a revision for strengthening a control.
+func TestWideningACancellationAuthorityIsNotWeakening(t *testing.T) {
+	class := revision.Classify(modify("cooling-off",
+		delayed("cooling-off", time.Hour, "carol"),
+		delayed("cooling-off", time.Hour, "carol", "dave")))
+	if class.Weakening() {
+		t.Fatalf("widening a cancellation authority classified as weakening: %s", reasonsOf(class))
+	}
+}
+
+// Bypass: keep the step-up and accept a weaker authentication for it. The
+// challenge is still declared, so a classifier counting challenges sees nothing,
+// and `acr` is the only thing standing between a password login and a satisfied
+// step-up.
+func TestRelaxingTheRequiredACRIsWeakening(t *testing.T) {
+	const gold, silver = "urn:mace:incommon:iap:gold", "urn:mace:incommon:iap:silver"
+	cases := map[string]*policy.Policy{
+		"class added":         steppedUp("step-up", gold, silver),
+		"requirement dropped": steppedUp("step-up"),
+		"class exchanged":     steppedUp("step-up", silver),
+	}
+	for name, after := range cases {
+		t.Run(name, func(t *testing.T) {
+			class := revision.Classify(modify("step-up", steppedUp("step-up", gold), after))
+			if !hasReason(class, revision.ReasonAuthenticationRelaxed) {
+				t.Fatalf("findings = %s, want a %s finding", reasonsOf(class), revision.ReasonAuthenticationRelaxed)
+			}
+		})
+	}
+}
+
+// Naming fewer classes, or naming any at all where the operator allowlist used
+// to be the whole requirement, accepts strictly fewer authentications.
+func TestTighteningTheRequiredACRIsNotWeakening(t *testing.T) {
+	const gold, silver = "urn:mace:incommon:iap:gold", "urn:mace:incommon:iap:silver"
+	cases := map[string][2]*policy.Policy{
+		"class removed":     {steppedUp("step-up", gold, silver), steppedUp("step-up", gold)},
+		"requirement added": {steppedUp("step-up"), steppedUp("step-up", gold)},
+		"reordered":         {steppedUp("step-up", gold, silver), steppedUp("step-up", silver, gold)},
+		// Restating one class, padded and repeated, is the same requirement —
+		// the classifier normalizes with the same function the handler does.
+		"restated and padded": {steppedUp("step-up", gold), steppedUp("step-up", gold, " "+gold+" ", "", gold)},
+	}
+	for name, pair := range cases {
+		t.Run(name, func(t *testing.T) {
+			class := revision.Classify(modify("step-up", pair[0], pair[1]))
+			if hasReason(class, revision.ReasonAuthenticationRelaxed) {
+				t.Fatalf("findings = %s, want no %s finding", reasonsOf(class), revision.ReasonAuthenticationRelaxed)
+			}
+		})
+	}
+}
+
+// Bypass: point the external challenge at a system that always says yes. The
+// challenge is still there, and the operator's own target list is the only place
+// the difference is visible — which is exactly why the floor should price it.
+func TestRepointingAnExternalTargetIsWeakening(t *testing.T) {
+	class := revision.Classify(modify("second-opinion",
+		referred("second-opinion", "fraud-desk"), referred("second-opinion", "my-own-service")))
+	if !hasReason(class, revision.ReasonExternalTargetChanged) {
+		t.Fatalf("findings = %s, want a %s finding", reasonsOf(class), revision.ReasonExternalTargetChanged)
+	}
+}
+
+// The same target respelled is the same target. The handler trims the name
+// before it looks it up, so the classifier has to trim it before it compares.
+func TestRestatingTheSameExternalTargetIsNotWeakening(t *testing.T) {
+	class := revision.Classify(modify("second-opinion",
+		referred("second-opinion", "fraud-desk"), referred("second-opinion", "  fraud-desk  ")))
+	if class.Weakening() {
+		t.Fatalf("restating a target classified as weakening: %s", reasonsOf(class))
+	}
+}
+
+// The whole point, stated once: none of the four relaxations above changes the
+// number of challenges or touches a quorum, which is all the classifier looked
+// at before M2.
+func TestNoneOfTheNewRelaxationsTouchesAQuorumOrTheChallengeCount(t *testing.T) {
+	const gold = "urn:mace:incommon:iap:gold"
+	cases := map[string]revision.Delta{
+		"delay cut": modify("cooling-off",
+			delayed("cooling-off", 24*time.Hour, "carol"), delayed("cooling-off", time.Millisecond, "carol")),
+		"veto removed": modify("cooling-off",
+			delayed("cooling-off", time.Hour, "carol"), delayed("cooling-off", time.Hour)),
+		"acr relaxed": modify("step-up", steppedUp("step-up", gold), steppedUp("step-up")),
+		"target repointed": modify("second-opinion",
+			referred("second-opinion", "fraud-desk"), referred("second-opinion", "my-own-service")),
+	}
+	for name, d := range cases {
+		t.Run(name, func(t *testing.T) {
+			class := revision.Classify(d)
+			if !class.Weakening() {
+				t.Fatalf("Classify(%s).Weakening() = false, want true; findings = %s", name, reasonsOf(class))
+			}
+			for _, f := range class.Findings {
+				if f.Reason == revision.ReasonChallengeRemoved || f.Reason == revision.ReasonQuorumReduced {
+					t.Fatalf("the finding came from the pre-M2 checks (%s), so this case proves nothing", f)
+				}
+			}
+		})
+	}
+}
+
+// Every declared ground has a name in the exported list. A ground the classifier
+// can produce but Reasons() does not name is a vocabulary that has drifted from
+// the code, and the vocabulary is what an operator reads.
+func TestEveryNewGroundIsInTheDeclaredVocabulary(t *testing.T) {
+	for _, want := range []revision.Reason{
+		revision.ReasonDelayShortened,
+		revision.ReasonCancellationNarrowed,
+		revision.ReasonAuthenticationRelaxed,
+		revision.ReasonExternalTargetChanged,
+	} {
+		if !slices.Contains(revision.Reasons(), want) {
+			t.Errorf("Reasons() does not name %q", want)
+		}
 	}
 }

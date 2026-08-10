@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/d0lim/stamp/internal/challenge/mfa"
 	"github.com/d0lim/stamp/internal/policy"
 )
 
@@ -74,6 +75,23 @@ const (
 	// ReasonTriggerNarrowed is a policy that now fires on fewer requests than it
 	// did, which is deletion by another route.
 	ReasonTriggerNarrowed Reason = "trigger_narrowed"
+	// ReasonDelayShortened is a wait that got shorter. A delay buys the time
+	// somebody needs to notice, so cutting it is removing that much of the
+	// challenge without removing the challenge.
+	ReasonDelayShortened Reason = "delay_shortened"
+	// ReasonCancellationNarrowed is a delay whose cancellation authority admits
+	// fewer identities, or none. Cancelling a wait denies the decision, so the
+	// authority is a veto and taking it away grows the set of requests that end
+	// in allow.
+	ReasonCancellationNarrowed Reason = "cancellation_narrowed"
+	// ReasonAuthenticationRelaxed is an mfa challenge that now accepts an
+	// authentication context class it did not accept before.
+	ReasonAuthenticationRelaxed Reason = "authentication_relaxed"
+	// ReasonExternalTargetChanged is an external challenge pointed at a
+	// different system. The new target answers a different question, and which
+	// system is asked is not something a policy author is trusted to move for
+	// free (D21).
+	ReasonExternalTargetChanged Reason = "external_target_changed"
 )
 
 // Reasons returns every weakening ground, in declaration order.
@@ -81,6 +99,8 @@ func Reasons() []Reason {
 	return []Reason{
 		ReasonQuorumReduced, ReasonApproverSetWidened, ReasonErrorBehaviourLoosened,
 		ReasonChallengeRemoved, ReasonPolicyDeleted, ReasonTriggerNarrowed,
+		ReasonDelayShortened, ReasonCancellationNarrowed, ReasonAuthenticationRelaxed,
+		ReasonExternalTargetChanged,
 	}
 }
 
@@ -370,8 +390,21 @@ func numericLiteral(o policy.Operand) (float64, bool) {
 // the challenges
 // ---------------------------------------------------------------------------
 
-// challengeFindings reports challenges a policy stopped demanding, quorums it
-// lowered, and approver sets it widened.
+// challengeFindings reports challenges a policy stopped demanding, and every way
+// the four kinds can be relaxed while still being demanded.
+//
+// Until M2 a quorum was the only kind, so inspecting quorums was inspecting
+// challenges. Landing delay, mfa and external turned that into a hole: cutting a
+// twenty-four hour wait to a millisecond, dropping the `acr` a step-up requires,
+// taking away the authority that could stop a wait, and pointing an external
+// challenge at a system that always says yes all leave the challenge list the
+// same length and every quorum untouched.
+//
+// Each kind gets its own rule because the kinds do not generalize — most
+// sharply, a quorum's approver *grants* and a delay's canceller *denies*, so
+// widening the first is a relaxation and widening the second is a tightening.
+// What is shared is the stance: anything not provably a tightening is a
+// loosening.
 func challengeFindings(id string, before, after *policy.Policy) []Finding {
 	var out []Finding
 
@@ -388,15 +421,55 @@ func challengeFindings(id string, before, after *policy.Policy) []Finding {
 		}
 	}
 
-	// Quorums are paired in declaration order. Normalization sorts challenges by
-	// kind stably, so two quorums keep the order they were written in and the
-	// pairing is the one an author would draw.
-	oldQuorums, newQuorums := quorumsOf(beforeByKind), quorumsOf(afterByKind)
-	for i := range oldQuorums {
-		if i >= len(newQuorums) {
-			break
+	// Challenges of one kind are paired in declaration order. Normalization
+	// sorts challenges by kind stably, so two of a kind keep the order they were
+	// written in and the pairing is the one an author would draw. A kind that
+	// grew keeps its extra entries unpaired: adding a challenge is not a
+	// relaxation, and a kind that shrank has already been reported above.
+	out = append(out, quorumFindings(id,
+		challengesOf[policy.Quorum](beforeByKind, policy.ChallengeQuorum),
+		challengesOf[policy.Quorum](afterByKind, policy.ChallengeQuorum))...)
+	out = append(out, delayFindings(id,
+		challengesOf[policy.Delay](beforeByKind, policy.ChallengeDelay),
+		challengesOf[policy.Delay](afterByKind, policy.ChallengeDelay))...)
+	out = append(out, mfaFindings(id,
+		challengesOf[policy.MFA](beforeByKind, policy.ChallengeMFA),
+		challengesOf[policy.MFA](afterByKind, policy.ChallengeMFA))...)
+	out = append(out, externalFindings(id,
+		challengesOf[policy.External](beforeByKind, policy.ChallengeExternal),
+		challengesOf[policy.External](afterByKind, policy.ChallengeExternal))...)
+	return out
+}
+
+func groupChallenges(p *policy.Policy) map[policy.ChallengeType][]policy.Challenge {
+	out := map[policy.ChallengeType][]policy.Challenge{}
+	for _, c := range p.Challenges {
+		out[c.ChallengeType()] = append(out[c.ChallengeType()], c)
+	}
+	return out
+}
+
+// challengesOf narrows one kind's declarations to their concrete type. A
+// declaration whose type does not match its own reported kind is dropped rather
+// than guessed at; validation refuses it long before this runs.
+func challengesOf[T policy.Challenge](byKind map[policy.ChallengeType][]policy.Challenge, kind policy.ChallengeType) []T {
+	var out []T
+	for _, c := range byKind[kind] {
+		if v, ok := c.(T); ok {
+			out = append(out, v)
 		}
-		old, fresh := oldQuorums[i], newQuorums[i]
+	}
+	return out
+}
+
+// paired reports how many of a kind can be compared side by side.
+func paired[T any](before, after []T) int { return min(len(before), len(after)) }
+
+// quorumFindings reports quorums that got easier to meet.
+func quorumFindings(id string, before, after []policy.Quorum) []Finding {
+	var out []Finding
+	for i := range paired(before, after) {
+		old, fresh := before[i], after[i]
 		if fresh.Threshold < old.Threshold {
 			out = append(out, Finding{
 				Subject: id,
@@ -411,19 +484,122 @@ func challengeFindings(id string, before, after *policy.Policy) []Finding {
 	return out
 }
 
-func groupChallenges(p *policy.Policy) map[policy.ChallengeType][]policy.Challenge {
-	out := map[policy.ChallengeType][]policy.Challenge{}
-	for _, c := range p.Challenges {
-		out[c.ChallengeType()] = append(out[c.ChallengeType()], c)
+// delayFindings reports waits that got shorter and vetoes that got smaller.
+//
+// The two halves run in opposite directions, and the reason is what a delay's
+// cancellation actually does: [challenge.Delay.Submit] records a cancellation as
+// a *failed* challenge, so the decision resolves to deny. The authority is a
+// veto, not a way out of the wait. Handing it to more people shrinks the set of
+// requests that end in allow, which is a tightening; taking it away grows that
+// set, which is not.
+func delayFindings(id string, before, after []policy.Delay) []Finding {
+	var out []Finding
+	for i := range paired(before, after) {
+		old, fresh := before[i], after[i]
+		if fresh.Duration < old.Duration {
+			out = append(out, Finding{
+				Subject: id,
+				Reason:  ReasonDelayShortened,
+				Detail: fmt.Sprintf("wait %d went from %s to %s, which is %s less time to notice",
+					i, old.Duration, fresh.Duration, old.Duration-fresh.Duration),
+			})
+		}
+		if detail, narrowed := cancellationNarrowed(old.CancellableBy, fresh.CancellableBy); narrowed {
+			out = append(out, Finding{Subject: id, Reason: ReasonCancellationNarrowed, Detail: detail})
+		}
 	}
 	return out
 }
 
-func quorumsOf(byKind map[policy.ChallengeType][]policy.Challenge) []policy.Quorum {
-	var out []policy.Quorum
-	for _, c := range byKind[policy.ChallengeQuorum] {
-		if q, ok := c.(policy.Quorum); ok {
-			out = append(out, q)
+// cancellationNarrowed reports a wait fewer identities can stop.
+//
+// A wait that nobody could cancel before cannot have its veto narrowed, so
+// adding one is only ever a tightening. Everything else defers to
+// [approverSetNarrowed].
+func cancellationNarrowed(before, after *policy.ApproverSet) (string, bool) {
+	if before == nil {
+		return "", false
+	}
+	if after == nil {
+		return "the wait can no longer be cancelled by anybody, and used to be stoppable", true
+	}
+	return approverSetNarrowed(*before, *after)
+}
+
+// mfaFindings reports step-ups that now accept an authentication they did not
+// accept before.
+func mfaFindings(id string, before, after []policy.MFA) []Finding {
+	var out []Finding
+	for i := range paired(before, after) {
+		old, fresh := before[i], after[i]
+		if old.Mode != fresh.Mode {
+			out = append(out, Finding{
+				Subject: id,
+				Reason:  ReasonAuthenticationRelaxed,
+				Detail: fmt.Sprintf("the step-up is delegated %s where it used to be delegated %s, "+
+					"and two modes cannot be compared without implementing both", fresh.Mode, old.Mode),
+			})
+			continue
+		}
+		if detail, relaxed := acrRelaxed(old.ACRValues, fresh.ACRValues); relaxed {
+			out = append(out, Finding{Subject: id, Reason: ReasonAuthenticationRelaxed, Detail: detail})
+		}
+	}
+	return out
+}
+
+// acrRelaxed reports a class requirement that now admits an authentication it
+// used to turn away.
+//
+// An empty list is not "no requirement" — it means the operator's allowlist is
+// the whole requirement, which is the widest this can be. So naming classes
+// where none were named can only narrow, and dropping the names widens to
+// whatever the deployment happens to admit.
+//
+// The two sides are normalized by the mfa package's own function, so reordering
+// a list, restating a class and padding one with whitespace are the same
+// requirement here and at the handler that enforces it.
+func acrRelaxed(before, after []string) (string, bool) {
+	old, fresh := mfa.NormalizeACRValues(before), mfa.NormalizeACRValues(after)
+	if len(old) == 0 {
+		return "", false
+	}
+	if len(fresh) == 0 {
+		return fmt.Sprintf("the step-up now accepts any class the operator allowlist admits, "+
+			"and used to require one of %s", strings.Join(old, ", ")), true
+	}
+	var added []string
+	for _, class := range fresh {
+		if !slices.Contains(old, class) {
+			added = append(added, class)
+		}
+	}
+	if len(added) > 0 {
+		sort.Strings(added)
+		return "the step-up now accepts " + strings.Join(added, ", "), true
+	}
+	return "", false
+}
+
+// externalFindings reports an external challenge asked of a different system.
+//
+// Any change is a finding, in both directions. Which system answers is operator
+// configuration a policy author selects from and cannot define (D21), so this
+// side has no way to tell a stricter reviewer from a service the author
+// controls — and "not provably a tightening" makes that an unprovable case
+// rather than a free one. The name is trimmed first because the handler trims it
+// before it looks the target up.
+func externalFindings(id string, before, after []policy.External) []Finding {
+	var out []Finding
+	for i := range paired(before, after) {
+		old, fresh := strings.TrimSpace(before[i].Target), strings.TrimSpace(after[i].Target)
+		if old != fresh {
+			out = append(out, Finding{
+				Subject: id,
+				Reason:  ReasonExternalTargetChanged,
+				Detail: fmt.Sprintf("external challenge %d now asks %q where it used to ask %q",
+					i, fresh, old),
+			})
 		}
 	}
 	return out
@@ -465,6 +641,50 @@ func approverSetWidened(before, after policy.ApproverSet) (string, bool) {
 	default:
 		if !reflect.DeepEqual(before.Source, after.Source) {
 			return "the approver set now resolves from a different group source", true
+		}
+		return "", false
+	}
+}
+
+// approverSetNarrowed reports a set that no longer admits somebody it admitted
+// before.
+//
+// It is the mirror of [approverSetWidened] and it exists because the same data
+// shape carries two opposite powers. R18's resolutions describe who is in a set;
+// whether being in that set is a grant or a veto is the challenge kind's
+// business, and a delay's cancellation authority is a veto (see
+// [delayFindings]). The fail-closed direction therefore flips with it: an
+// uncomparable change is a narrowing here, exactly as it is a widening there,
+// because in both cases the unprovable case is the one that has to cost
+// something.
+func approverSetNarrowed(before, after policy.ApproverSet) (string, bool) {
+	oldMode, newMode := approverMode(before), approverMode(after)
+	if oldMode != newMode {
+		return fmt.Sprintf("the cancellation authority is resolved by %s where it used to be resolved by %s, "+
+			"and the two cannot be compared without resolving them", newMode, oldMode), true
+	}
+	switch oldMode {
+	case "members":
+		var dropped []string
+		for _, m := range before.Members {
+			if !slices.Contains(after.Members, m) {
+				dropped = append(dropped, m)
+			}
+		}
+		if len(dropped) > 0 {
+			sort.Strings(dropped)
+			return "the cancellation authority no longer admits " + strings.Join(dropped, ", "), true
+		}
+		return "", false
+	case "claim":
+		if before.Claim != after.Claim {
+			return fmt.Sprintf("the cancellation authority now admits holders of the %q claim rather than the %q claim",
+				after.Claim, before.Claim), true
+		}
+		return "", false
+	default:
+		if !reflect.DeepEqual(before.Source, after.Source) {
+			return "the cancellation authority now resolves from a different group source", true
 		}
 		return "", false
 	}
