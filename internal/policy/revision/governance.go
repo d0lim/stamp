@@ -222,6 +222,11 @@ type Config struct {
 	// TTL bounds how long a revision may stay pending. Zero uses
 	// [DefaultRevisionTTL], which is D24's answer to approvers who do nothing.
 	TTL time.Duration
+	// WarnEvery is how often a live bootstrap token raises its warning. Zero
+	// uses [DefaultWarnInterval]. It is on this config rather than only on
+	// [BootstrapConfig] because the gate is built here and a deployment has no
+	// other way to reach it.
+	WarnEvery time.Duration
 	// Authoring is which authoring paths may write (R49). The empty mode is
 	// [AuthoringBoth].
 	Authoring AuthoringMode
@@ -273,7 +278,9 @@ func New(cfg Config) (*Service, error) {
 	case cfg.Revalidator == nil:
 		return nil, errors.New("revision: governance needs a revalidator")
 	}
-	bootstrap, err := NewBootstrap(BootstrapConfig{Store: cfg.Store, Audit: cfg.Audit, Now: cfg.Now})
+	bootstrap, err := NewBootstrap(BootstrapConfig{
+		Store: cfg.Store, Audit: cfg.Audit, WarnEvery: cfg.WarnEvery, Now: cfg.Now,
+	})
 	if err != nil {
 		return nil, err
 	}
