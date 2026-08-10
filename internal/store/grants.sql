@@ -1,0 +1,68 @@
+-- Per-role database privileges (R39).
+--
+-- This ships with the migrations and Migrate applies it as the last step, but
+-- it is not itself a numbered migration. Roles are cluster-global objects while
+-- migrations are per-database, and the role names have to be settable per
+-- deployment — a cluster that already has a role called stamp_check must not be
+-- silently co-opted. golang-migrate files are static text, so the names are
+-- templated here and validated as SQL identifiers before substitution.
+--
+-- No passwords and no LOGIN attribute are set here. These are privilege
+-- templates; a deployment grants them to whatever login roles it already
+-- manages, and credentials never live in a file that ships with the binary.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Check}}') THEN
+        CREATE ROLE {{.Check}} NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Decide}}') THEN
+        CREATE ROLE {{.Decide}} NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Consumer}}') THEN
+        CREATE ROLE {{.Consumer}} NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Admin}}') THEN
+        CREATE ROLE {{.Admin}} NOLOGIN;
+    END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO {{.Check}}, {{.Decide}}, {{.Consumer}}, {{.Admin}};
+
+-- Start from nothing on every apply so that a privilege removed from this file
+-- is actually removed from the database.
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {{.Check}}, {{.Decide}}, {{.Consumer}}, {{.Admin}};
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {{.Check}}, {{.Decide}}, {{.Consumer}}, {{.Admin}};
+
+-- check: reads what it evaluates against and appends audit rows. It never
+-- writes a policy — a compromised check tier must not be able to author the
+-- rules it is judged by.
+GRANT SELECT ON
+    policy_schemas, policies, decisions, challenge_progress, approvals,
+    velocity_buckets, audit_log, audit_checkpoints
+    TO {{.Check}};
+GRANT INSERT ON audit_log TO {{.Check}};
+GRANT SELECT, INSERT, UPDATE ON audit_writers TO {{.Check}};
+
+-- decide: owns the decision lifecycle and appends the audit rows that go in the
+-- same transaction as each state transition. Still read-only on policies.
+GRANT SELECT ON policy_schemas, policies, velocity_buckets TO {{.Decide}};
+GRANT SELECT, INSERT, UPDATE ON decisions, challenge_progress, approvals TO {{.Decide}};
+GRANT SELECT, INSERT ON audit_log, audit_checkpoints TO {{.Decide}};
+GRANT SELECT, INSERT, UPDATE ON audit_writers TO {{.Decide}};
+
+-- consumer: bucket upsert and the dedup index that makes the upsert idempotent.
+-- Nothing else. An ingestion adapter reachable from a broker is the least
+-- trusted writer in the system.
+GRANT SELECT, INSERT, UPDATE ON velocity_buckets TO {{.Consumer}};
+GRANT SELECT, INSERT, DELETE ON processed_events TO {{.Consumer}};
+
+-- admin: the governance and authoring path. It writes policies; it does not get
+-- UPDATE or DELETE on the audit log, because append-only is a grant and not a
+-- convention.
+GRANT SELECT, INSERT, UPDATE ON policy_schemas, policies TO {{.Admin}};
+GRANT SELECT, INSERT, UPDATE ON decisions, challenge_progress, approvals TO {{.Admin}};
+GRANT SELECT, INSERT ON audit_log, audit_checkpoints TO {{.Admin}};
+GRANT SELECT, INSERT, UPDATE ON audit_writers TO {{.Admin}};
+GRANT SELECT, INSERT, UPDATE, DELETE ON velocity_buckets, processed_events TO {{.Admin}};
