@@ -1,0 +1,42 @@
+# The AuthZEN interop scenario's data model, expressed as a STAMP schema.
+#
+# The upstream harness fires bare AuthZEN requests: a subject with an opaque
+# identifier, an action name, and a resource. Everything the reference PDP knows
+# about who those identifiers are comes from a directory it was loaded with. In
+# STAMP that directory is not policy data — it is the fact plane, declared here
+# as two sources and served by the deployment.
+apiVersion: stamp/v1
+kind: Schema
+entities:
+  - name: user
+    attributes:
+      # `id` is where the AuthZEN envelope puts identity; the check surface
+      # binds it to this attribute so a condition can read it.
+      id: string
+  - name: todo
+    attributes:
+      id: string
+      # The harness sends this as `ownerID`. A STAMP attribute name becomes a
+      # CEL identifier, so the deployment maps the two names explicitly.
+      owner_id: string
+actions:
+  - can_read_user
+  - can_read_todos
+  - can_create_todo
+  - can_update_todo
+  - can_delete_todo
+sources:
+  # Roles are read as "who is in this role", not "what roles does this user
+  # have". That direction is what the condition AST admits — a membership test
+  # reads a declared field on the left — and it is also how an approver set is
+  # resolved elsewhere, so one shape serves both.
+  - name: role_members
+    kind: http
+    params:
+      - role: string
+    returns: list<string>
+  - name: user_email
+    kind: http
+    params:
+      - user_id: string
+    returns: string
