@@ -27,6 +27,8 @@ func clearEnv(t *testing.T) {
 		EnvOIDCAlgorithms, EnvOIDCACRValues, EnvOIDCAllowInsecure,
 		EnvFactSources, EnvEgressAllow, EnvEgressLoopback, EnvEgressPrivate, EnvFactAllowFailOpen,
 		EnvAuditFailClosed, EnvAuditCapacity, EnvAuditBatchSize, EnvAuditFlushInterval,
+		EnvCheckpointKeyFile, EnvCheckpointKeyID, EnvCheckpointVerifyKeys,
+		EnvCheckpointSinkFile, EnvCheckpointSinkWebhook, EnvCheckpointInterval,
 		EnvPolicyRefreshInterval, EnvPolicyStalenessDeadline,
 		EnvDecisionTTL, EnvMaxOutstanding,
 		EnvFloorMinApprovers, EnvFloorProposerMayApprove,

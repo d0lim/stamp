@@ -175,6 +175,17 @@ func NewCheckpointSigner(keyID string, priv ed25519.PrivateKey) (*CheckpointSign
 // KeyID reports the identifier stamped on checkpoints this signer produces.
 func (s *CheckpointSigner) KeyID() string { return s.keyID }
 
+// String renders the signer without its key.
+//
+// Without it, the default rendering of this struct is its fields, and one of
+// its fields is the private key: a single `%v` in a log line or an error — the
+// kind nobody writes deliberately and everybody writes eventually — would print
+// the seed. The identifier is the only part of a signing key that belongs in a
+// log, and this makes that the only part there is.
+func (s *CheckpointSigner) String() string {
+	return fmt.Sprintf("store.CheckpointSigner{key_id=%q}", s.keyID)
+}
+
 // Public returns the verification key.
 func (s *CheckpointSigner) Public() ed25519.PublicKey {
 	pub, _ := s.priv.Public().(ed25519.PublicKey)

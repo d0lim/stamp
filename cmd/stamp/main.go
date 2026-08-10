@@ -40,6 +40,13 @@ func run(args []string, logOut *os.File) error {
 	if len(args) > 0 && args[0] == policyCommand {
 		return runPolicy(context.Background(), args[1:], logOut)
 	}
+	// `audit` is a reader of the database rather than a way of starting the
+	// service, for the same reason breakglass is a subcommand: the thing it
+	// checks is the storage, and asking the running process whether its own log
+	// is intact would be asking the writer to audit itself.
+	if len(args) > 0 && args[0] == auditCommand {
+		return runAudit(context.Background(), args[1:], logOut)
+	}
 
 	fs := flag.NewFlagSet("stamp", flag.ContinueOnError)
 	rolesSpec := fs.String("roles", runtime.RoleAll,

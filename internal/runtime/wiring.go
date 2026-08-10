@@ -52,6 +52,7 @@ type App struct {
 
 	store      *store.Store
 	writer     *store.AuditWriter
+	checkpoint *checkpointPlane
 	facts      *fact.Registry
 	groups     *idpgroup.Sources
 	events     *ingestPlane
@@ -402,6 +403,19 @@ func (a *App) build(ctx context.Context) error {
 		return err
 	}
 
+	// --- audit checkpoints -------------------------------------------------
+	//
+	// Built on every process, whatever its roles, because the warning a
+	// deployment with no checkpoints has to see is a fact about the deployment
+	// and not about this process's role selection — and because a misconfigured
+	// key file should fail the boot of whichever process reads it first, rather
+	// than only the one that happens to run the loop.
+	checkpoints, err := a.checkpoints(gate)
+	if err != nil {
+		return err
+	}
+	a.checkpoint = checkpoints
+
 	// --- components --------------------------------------------------------
 	registry := NewRegistry()
 	if err := registry.Add(Component{
@@ -508,6 +522,42 @@ func (a *App) build(ctx context.Context) error {
 		Run:   a.reconcileLoop,
 	}); err != nil {
 		return err
+	}
+	if checkpoints != nil {
+		if err := registry.Add(Component{
+			// The api role, and only it.
+			//
+			// A checkpoint is not a per-request or per-tier operation: one row
+			// binds *every* writer's head at a moment, so it describes the whole
+			// installation and one producer says everything there is to say.
+			// Running it on check or decide would attach a scan of every segment
+			// head and a global advisory lock to the two tiers that scale
+			// horizontally, so each added replica would buy another serialized
+			// writer against a series that needed one.
+			//
+			// The api role is where the installation-wide duties already are —
+			// the reserved governance policy is installed there, and the revision
+			// reconciler runs there — and it is the tier an operator runs one or
+			// a few of. Several replicas stay correct rather than merely
+			// tolerated: creation is serialized by an advisory lock, and the
+			// repair pass at the head of each tick pulls whatever another replica
+			// recorded into this host's copy of the sink, so every copy converges
+			// on the whole series instead of each holding its own fraction.
+			Name:  "audit-checkpointer",
+			Roles: []Role{RoleAPI},
+			Run:   a.runCheckpoints,
+		}); err != nil {
+			return err
+		}
+		if !a.roles.Has(RoleAPI) {
+			// Not a warning: on a role-split deployment this is every check and
+			// decide process, and the tier that does record them is configured
+			// and running. It is said once so that an operator reading this
+			// process's log does not conclude the deployment takes none.
+			a.logger.Info("audit checkpoints are configured but are recorded by the api role, which this "+
+				"process does not run",
+				slog.String("roles", a.roles.String()))
+		}
 	}
 	consoleShell, err := a.consoleShell()
 	if err != nil {
