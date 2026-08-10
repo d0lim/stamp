@@ -1,0 +1,145 @@
+name: bench
+
+# A separate workflow from CI rather than a job inside it. The bench takes
+# minutes, needs a container, and — by R26's own terms — reports rather than
+# gates, so putting it in CI would either slow every pull request down or add a
+# job whose red is meaningless. Here it can be read on its own terms.
+#
+# No `branches:` filter on pull_request, for the same reason CI has none: the
+# landing strategy stacks pull requests on other units' branches.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # A run anyone can start by hand, which is what re-measuring a runner after a
+  # threshold argument looks like.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25"
+  # The load the scenarios are driven at. Lower than a developer machine on
+  # purpose: a GitHub-hosted runner has two vCPUs, the load generator lives in
+  # the same process as the thing it measures, and eight clients on two cores
+  # measures the scheduler.
+  BENCH_CONCURRENCY: "4"
+  BENCH_DURATION: "5s"
+  BENCH_WARMUP: "2s"
+  # Repeats of every scenario in one invocation. The artifact's spread column is
+  # computed across these, and the spread is what says whether a threshold on
+  # this runner is a gate or a coin flip.
+  BENCH_REPEATS: "3"
+
+jobs:
+  bench:
+    name: check path benchmark
+    runs-on: ubuntu-latest
+    # Six scenarios, three repeats, an assembled process and a fresh database
+    # per repeat. The default 360 minutes would let a hung run burn an hour of
+    # somebody's quota before anyone noticed.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The previous run's results, restored by prefix so that the newest
+      # surviving entry wins. This is what the regression column compares
+      # against. actions/cache rather than a downloaded artifact because it is
+      # first-party and needs no token to read another workflow run.
+      - name: restore the previous run's results
+        id: baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: bench/baseline
+          key: bench-baseline-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            bench-baseline-${{ github.ref_name }}-
+            bench-baseline-main-
+
+      - name: what the runner is
+        run: |
+          echo "cpus: $(nproc)"
+          free -m || true
+          echo "ephemeral ports: $(cat /proc/sys/net/ipv4/ip_local_port_range)"
+          echo "tcp fin timeout: $(cat /proc/sys/net/ipv4/tcp_fin_timeout)"
+
+      # Docker is present on ubuntu-latest, which the testcontainers-backed
+      # harness needs. `-run '^$'` keeps the package's unit tests out of the
+      # measurement; they run in CI like everything else.
+      - name: run the benchmark
+        env:
+          BENCH_PROFILE: ci
+          BENCH_OUT: out
+          BENCH_BASELINE: baseline/results.json
+          BENCH_COMMIT: ${{ github.sha }}
+        working-directory: bench
+        run: |
+          go test -run '^$' -bench . -benchtime=1x \
+            -count="${BENCH_REPEATS}" -timeout=25m . | tee bench-output.txt
+
+      # The report is a job summary as well as an artifact. A number nobody
+      # opens is a number nobody reads, and the miss path's ceiling — the fact
+      # that its latency bound is a source's declared timeout and not a
+      # performance result — is the part most likely to be misread by someone
+      # skimming.
+      - name: put the report in the job summary
+        if: always()
+        working-directory: bench
+        run: |
+          if [ -f out/report.md ]; then
+            cat out/report.md >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "the benchmark produced no report; see the job log" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: upload the artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_id }}
+          path: |
+            bench/out/results.json
+            bench/out/report.md
+            bench/bench-output.txt
+          if-no-files-found: warn
+
+      # Saved under this run's own key so the next run restores it by prefix.
+      # Only from main: a pull request's numbers are the pull request's, and
+      # letting a branch write the shared baseline would make every later
+      # regression column relative to whatever landed in a fork's cache.
+      - name: save this run's results as the next baseline
+        if: github.ref == 'refs/heads/main' && success()
+        run: |
+          mkdir -p bench/baseline
+          cp bench/out/results.json bench/baseline/results.json
+
+      - name: store the baseline
+        if: github.ref == 'refs/heads/main' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: bench/baseline
+          key: bench-baseline-${{ github.ref_name }}-${{ github.run_id }}
+
+      # The gate this unit ships is a warning, not a failure. Every missed
+      # threshold and every regression is already a `::warning::` annotation
+      # emitted by the bench itself; this step only makes the count visible in
+      # the log. Promoting any of it to a failing status check is U18's release
+      # gate, and it needs a calibrated profile for this runner first — which
+      # the `ci` profile does not yet have, by its own admission.
+      - name: summarize the warnings
+        if: always()
+        working-directory: bench
+        run: |
+          count=$(grep -c '^::warning' bench-output.txt || true)
+          echo "the benchmark raised ${count} warning(s); they are annotations on this run"
+          exit 0
