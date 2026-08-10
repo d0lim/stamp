@@ -72,6 +72,7 @@ type StepUp struct {
 	endpoint     *url.URL
 	clientID     string
 	redirectURI  string
+	redirectBase *url.URL
 	scope        string
 	responseType string
 	extra        map[string]string
@@ -107,10 +108,15 @@ func NewStepUp(cfg StepUpConfig) (*StepUp, error) {
 	if responseType == "" {
 		responseType = "code"
 	}
+	redirectBase, err := url.Parse(cfg.RedirectURI)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %q is not a url: %w", ErrStepUpRequest, cfg.RedirectURI, err)
+	}
 	s := &StepUp{
 		endpoint:     endpoint,
 		clientID:     cfg.ClientID,
 		redirectURI:  cfg.RedirectURI,
+		redirectBase: redirectBase,
 		scope:        strings.Join(scopes, " "),
 		responseType: responseType,
 		extra:        make(map[string]string, len(cfg.ExtraParams)),
@@ -154,6 +160,16 @@ type StepUpRequest struct {
 	// LoginHint tells the IdP which account to authenticate, so a step-up does
 	// not silently satisfy itself with whoever is already signed in.
 	LoginHint string
+	// RedirectURI narrows the configured redirect target for this one request,
+	// so a completion can land on the challenge it belongs to rather than on a
+	// single endpoint that would then have to look the challenge up.
+	//
+	// It is a narrowing and not a replacement: the value must sit under the
+	// configured redirect URI, same scheme, same host, same path prefix. That
+	// is what keeps this from being a way to have the IdP hand an authorization
+	// code to somewhere else — the operator still owns the origin, and the IdP
+	// still owns whether it will redirect there at all.
+	RedirectURI string
 }
 
 // AuthorizationURL renders the request as a URL to send the subject to.
@@ -168,6 +184,10 @@ func (s *StepUp) AuthorizationURL(req StepUpRequest) (string, error) {
 	if strings.TrimSpace(req.Nonce) == "" {
 		return "", fmt.Errorf("%w: a step-up must carry a nonce", ErrStepUpRequest)
 	}
+	redirect, err := s.redirectFor(req.RedirectURI)
+	if err != nil {
+		return "", err
+	}
 
 	u := *s.endpoint
 	q := u.Query()
@@ -176,7 +196,7 @@ func (s *StepUp) AuthorizationURL(req StepUpRequest) (string, error) {
 	}
 	q.Set("response_type", s.responseType)
 	q.Set("client_id", s.clientID)
-	q.Set("redirect_uri", s.redirectURI)
+	q.Set("redirect_uri", redirect)
 	q.Set("scope", s.scope)
 	q.Set("state", req.State)
 	q.Set("nonce", req.Nonce)
@@ -196,6 +216,35 @@ func (s *StepUp) AuthorizationURL(req StepUpRequest) (string, error) {
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// redirectFor validates a per-request redirect target against the configured
+// one and returns the value to send.
+//
+// Everything about it is a refusal except the empty case. A different host, a
+// different scheme, a path outside the configured one, credentials in the
+// authority, a value that does not parse — all of them are the same mistake
+// with different spellings, and the consequence of getting any of them wrong is
+// an IdP handing an authorization code to somebody else.
+func (s *StepUp) redirectFor(requested string) (string, error) {
+	if strings.TrimSpace(requested) == "" {
+		return s.redirectURI, nil
+	}
+	u, err := url.Parse(requested)
+	if err != nil {
+		return "", fmt.Errorf("%w: redirect %q is not a url: %w", ErrStepUpRequest, requested, err)
+	}
+	if u.Scheme != s.redirectBase.Scheme || u.Host != s.redirectBase.Host || u.User != nil {
+		return "", fmt.Errorf("%w: redirect %q is not under the configured target %q",
+			ErrStepUpRequest, requested, s.redirectURI)
+	}
+	base := strings.TrimSuffix(s.redirectBase.EscapedPath(), "/")
+	path := u.EscapedPath()
+	if path != base && !strings.HasPrefix(path, base+"/") {
+		return "", fmt.Errorf("%w: redirect %q is not under the configured target %q",
+			ErrStepUpRequest, requested, s.redirectURI)
+	}
+	return requested, nil
 }
 
 // essentialACRClaims renders the OIDC essential-claim form of the same request.

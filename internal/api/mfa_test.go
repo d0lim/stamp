@@ -277,6 +277,29 @@ func TestMFACallbackBoundsTheBody(t *testing.T) {
 	}
 }
 
+// TestMFACallbackPathMatchesTheMountedPattern is the seam between the challenge
+// handler and this route stated as a test: the URL a step-up is told to come
+// back to has to be a URL this router actually serves.
+func TestMFACallbackPathMatchesTheMountedPattern(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	path := api.MFACallbackPath(testDecisionID, 0)
+	if path != mfaPath {
+		t.Fatalf("MFACallbackPath = %q, want %q", path, mfaPath)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(completionBody("c", "a.b.c")))
+	rec := httptest.NewRecorder()
+	f.server.Handler(api.SurfaceCallback).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d for the rendered callback path, want 200: %s", rec.Code, rec.Body.String())
+	}
+	// A decision identifier carrying a path separator must not escape the route
+	// it was rendered for.
+	if got := api.MFACallbackPath("a/b", 3); got != "/decisions/a%2Fb/challenges/3/mfa" {
+		t.Fatalf("MFACallbackPath escaped as %q", got)
+	}
+}
+
 func TestNewMFARequiresItsCollaborators(t *testing.T) {
 	t.Parallel()
 	if _, err := api.NewMFA(api.MFAConfig{Tokens: &stubVerifier{}}); err == nil {

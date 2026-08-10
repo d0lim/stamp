@@ -40,10 +40,11 @@ func NewStepUp(requests *identity.StepUp) (*StepUp, error) {
 // Initiate implements [Initiator].
 func (s *StepUp) Initiate(_ context.Context, req InitiateRequest) (InitiateResult, error) {
 	url, err := s.requests.AuthorizationURL(identity.StepUpRequest{
-		State:     req.Correlator,
-		Nonce:     req.Nonce,
-		ACRValues: req.ACRValues,
-		LoginHint: req.SubjectID,
+		State:       req.Correlator,
+		Nonce:       req.Nonce,
+		ACRValues:   req.ACRValues,
+		LoginHint:   req.SubjectID,
+		RedirectURI: req.RedirectURI,
 	})
 	if err != nil {
 		return InitiateResult{}, fmt.Errorf("mfa: building a step-up request: %w", err)

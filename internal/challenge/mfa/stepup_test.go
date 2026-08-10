@@ -3,9 +3,12 @@ package mfa
 import (
 	"errors"
 	"net/url"
+	"strconv"
 	"testing"
 
+	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/identity"
+	"github.com/d0lim/stamp/internal/policy"
 )
 
 func testStepUpInitiator(t *testing.T) *StepUp {
@@ -91,5 +94,42 @@ func TestIssueSurfacesAnInitiatorFailure(t *testing.T) {
 	_, err := h.Issue(t.Context(), issueRequestFor(dec))
 	if !errors.Is(err, boom) {
 		t.Fatalf("issue err = %v, want the initiator's failure", err)
+	}
+}
+
+// TestIssueTellsTheInitiatorWhereToComeBack closes the loop between the
+// challenge and the callback route: a browser redirect has to land somewhere
+// that knows which challenge it answers, and the route pattern belongs to the
+// API layer, so the composition root supplies the URL rather than this package
+// building a second copy of it.
+func TestIssueTellsTheInitiatorWhereToComeBack(t *testing.T) {
+	t.Parallel()
+	init := &recordingInitiator{}
+	cfg := testConfig(init)
+	cfg.CallbackURL = func(in challenge.Instance) string {
+		return "https://stamp.example.test/decisions/" + in.DecisionID +
+			"/challenges/" + strconv.Itoa(in.Ordinal) + "/mfa"
+	}
+	h := newTestHandler(t, cfg)
+	issue(t, h, policy.MFA{Mode: policy.MFADelegated}, testDecision(t), testNow)
+
+	if len(init.calls) != 1 {
+		t.Fatalf("initiator called %d times, want 1", len(init.calls))
+	}
+	want := "https://stamp.example.test/decisions/dec-A/challenges/0/mfa"
+	if init.calls[0].RedirectURI != want {
+		t.Fatalf("redirect uri = %q, want %q", init.calls[0].RedirectURI, want)
+	}
+}
+
+// TestIssueLeavesTheRedirectEmptyWithoutASeam keeps the default harmless: a
+// deployment with one fixed callback says nothing and gets the configured one.
+func TestIssueLeavesTheRedirectEmptyWithoutASeam(t *testing.T) {
+	t.Parallel()
+	init := &recordingInitiator{}
+	h := newTestHandler(t, testConfig(init))
+	issue(t, h, policy.MFA{Mode: policy.MFADelegated}, testDecision(t), testNow)
+	if init.calls[0].RedirectURI != "" {
+		t.Fatalf("redirect uri = %q, want empty", init.calls[0].RedirectURI)
 	}
 }

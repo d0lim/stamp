@@ -234,3 +234,61 @@ func TestNewSubjectCarriesClaimsWithoutVerifying(t *testing.T) {
 		t.Fatal("a subject with no claims answered Claims")
 	}
 }
+
+// TestAuthorizationURLNarrowsTheRedirectTarget is what lets a completion land
+// on the challenge it answers instead of on one endpoint that would then have
+// to look the challenge up. The narrowing is the whole safety property: the
+// operator still owns the origin.
+func TestAuthorizationURLNarrowsTheRedirectTarget(t *testing.T) {
+	t.Parallel()
+	s := testStepUp(t, func(c *StepUpConfig) {
+		c.RedirectURI = "https://stamp.example.test/decisions"
+	})
+	raw, err := s.AuthorizationURL(StepUpRequest{
+		State:       "s",
+		Nonce:       "n",
+		RedirectURI: "https://stamp.example.test/decisions/dec-A/challenges/0/mfa",
+	})
+	if err != nil {
+		t.Fatalf("authorization url: %v", err)
+	}
+	if got := parsedQuery(t, raw).Get("redirect_uri"); got != "https://stamp.example.test/decisions/dec-A/challenges/0/mfa" {
+		t.Fatalf("redirect_uri = %q", got)
+	}
+
+	// A request that names none falls back to the configured target.
+	fallback, err := s.AuthorizationURL(StepUpRequest{State: "s", Nonce: "n"})
+	if err != nil {
+		t.Fatalf("authorization url: %v", err)
+	}
+	if got := parsedQuery(t, fallback).Get("redirect_uri"); got != "https://stamp.example.test/decisions" {
+		t.Fatalf("redirect_uri = %q, want the configured target", got)
+	}
+}
+
+// TestAuthorizationURLRefusesARedirectOutsideTheConfiguredTarget is the reason
+// the override is a narrowing. Every row here is the same mistake spelled
+// differently, and the consequence of any of them is an IdP handing an
+// authorization code to somebody else.
+func TestAuthorizationURLRefusesARedirectOutsideTheConfiguredTarget(t *testing.T) {
+	t.Parallel()
+	s := testStepUp(t, func(c *StepUpConfig) {
+		c.RedirectURI = "https://stamp.example.test/decisions"
+	})
+	for name, redirect := range map[string]string{
+		"another host":   "https://evil.example.test/decisions/dec-A",
+		"another scheme": "http://stamp.example.test/decisions/dec-A",
+		"a sibling path": "https://stamp.example.test/decisionsX/dec-A",
+		"a parent path":  "https://stamp.example.test/",
+		"userinfo":       "https://user@stamp.example.test/decisions/dec-A",
+		"not a url":      "://nonsense",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := s.AuthorizationURL(StepUpRequest{State: "s", Nonce: "n", RedirectURI: redirect})
+			if !errors.Is(err, ErrStepUpRequest) {
+				t.Fatalf("redirect %q was accepted: err = %v", redirect, err)
+			}
+		})
+	}
+}

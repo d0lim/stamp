@@ -91,6 +91,16 @@ type Config struct {
 	// MaxTrackedIssues overrides [DefaultMaxTrackedIssues].
 	MaxTrackedIssues int
 
+	// CallbackURL reports where a completion for one challenge should land.
+	//
+	// A step-up returns through a browser redirect, so the completion has to
+	// arrive somewhere that knows which challenge it answers. Nil means one
+	// fixed callback for every challenge, which is what a deployment that
+	// resolves the challenge some other way wants. It is a function rather
+	// than a template because the route pattern lives in the API layer, and a
+	// second copy of it here is a second copy that can drift.
+	CallbackURL func(challenge.Instance) string
+
 	// NewCorrelator overrides correlator generation, for tests. Nil selects a
 	// crypto/rand source.
 	NewCorrelator func() (string, error)
@@ -107,6 +117,7 @@ type Delegated struct {
 
 	minReissue  time.Duration
 	maxTracked  int
+	callbackURL func(challenge.Instance) string
 	correlator  func() (string, error)
 	mu          sync.Mutex
 	recent      map[string]recentIssue
@@ -148,16 +159,17 @@ func NewDelegated(cfg Config) (*Delegated, error) {
 	}
 
 	d := &Delegated{
-		initiator:  cfg.Initiator,
-		allowedACR: allowed,
-		requireAMR: normalizeACR(cfg.RequiredAMR),
-		issuer:     cfg.Issuer,
-		clientID:   cfg.ClientID,
-		audience:   cfg.Audience,
-		minReissue: cfg.MinReissueInterval,
-		maxTracked: cfg.MaxTrackedIssues,
-		correlator: cfg.NewCorrelator,
-		recent:     make(map[string]recentIssue),
+		initiator:   cfg.Initiator,
+		allowedACR:  allowed,
+		requireAMR:  normalizeACR(cfg.RequiredAMR),
+		issuer:      cfg.Issuer,
+		clientID:    cfg.ClientID,
+		audience:    cfg.Audience,
+		minReissue:  cfg.MinReissueInterval,
+		maxTracked:  cfg.MaxTrackedIssues,
+		callbackURL: cfg.CallbackURL,
+		correlator:  cfg.NewCorrelator,
+		recent:      make(map[string]recentIssue),
 	}
 	if d.minReissue == 0 {
 		d.minReissue = DefaultMinReissueInterval
@@ -244,14 +256,15 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 	nonce := NonceFor(correlator)
 
 	out, err := d.initiate(ctx, InitiateRequest{
-		Instance:   req.Instance,
-		Decision:   req.Decision,
-		SubjectID:  subjectID,
-		Correlator: correlator,
-		Reference:  reference,
-		Nonce:      nonce,
-		ACRValues:  required,
-		Now:        req.Now,
+		Instance:    req.Instance,
+		Decision:    req.Decision,
+		SubjectID:   subjectID,
+		Correlator:  correlator,
+		Reference:   reference,
+		Nonce:       nonce,
+		ACRValues:   required,
+		RedirectURI: d.callbackFor(req.Instance),
+		Now:         req.Now,
 	})
 	if err != nil {
 		return challenge.IssueResult{}, err
@@ -279,6 +292,14 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 	}
 	d.remember(subjectID, contextHash, detail, req.Now)
 	return challenge.IssueResult{State: challenge.StatePending, Detail: detail}, nil
+}
+
+// callbackFor asks where a completion for this challenge should land.
+func (d *Delegated) callbackFor(in challenge.Instance) string {
+	if d.callbackURL == nil {
+		return ""
+	}
+	return d.callbackURL(in)
 }
 
 func (d *Delegated) initiate(ctx context.Context, req InitiateRequest) (InitiateResult, error) {

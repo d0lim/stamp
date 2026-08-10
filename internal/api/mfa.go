@@ -27,6 +27,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/d0lim/stamp/internal/challenge"
@@ -42,6 +44,16 @@ import (
 // redirect target itself and therefore knows both; the correlator in the body
 // is what proves the completion belongs to them.
 const MFACallbackPattern = "POST /decisions/{id}/challenges/{ordinal}/mfa"
+
+// MFACallbackPath renders the callback path for one challenge.
+//
+// It is exported because a step-up has to be told where to come back to before
+// it starts, and the alternative is the challenge handler holding its own copy
+// of the route pattern. Pass the result, joined to the deployment's callback
+// base URL, as [mfa.Config].CallbackURL.
+func MFACallbackPath(decisionID string, ordinal int) string {
+	return "/decisions/" + url.PathEscape(decisionID) + "/challenges/" + strconv.Itoa(ordinal) + "/mfa"
+}
 
 // DefaultMaxMFACallbackBytes bounds a completion body. It holds a correlator
 // and an ID token, and an ID token is the larger of the two by an order of

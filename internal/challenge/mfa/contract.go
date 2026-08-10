@@ -266,6 +266,11 @@ type InitiateRequest struct {
 	// silently, which is why the response is checked rather than the request
 	// trusted.
 	ACRValues []string
+	// RedirectURI is where a completion should land, empty when the deployment
+	// uses one fixed callback for every challenge. It is supplied rather than
+	// derived because the route pattern belongs to the API layer: a challenge
+	// handler that built the path would be a second copy of it.
+	RedirectURI string
 	// Now is the issuing instant.
 	Now time.Time
 }
