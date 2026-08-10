@@ -21,10 +21,30 @@ import (
 
 // ErrChainConflict reports that an append collided with an existing row in the
 // writer's own segment. It means either that the in-process head drifted from
-// the database or that a second process is writing this segment; the two are
-// indistinguishable from here and both are correctness problems, so the writer
-// stops rather than guessing.
+// the database or that a second process is writing this segment.
+//
+// The collision itself cannot tell those apart, so it always stops the writer.
+// What separates them is evidence gathered afterwards — the advisory claim, and
+// whether the rows ahead of the head re-chain from it — which is what
+// reconcileLocked goes and gets before the writer is allowed to continue.
 var ErrChainConflict = errors.New("store: audit chain sequence conflict")
+
+// ErrUnreconciled reports that a conflicted writer could not prove the rows it
+// found ahead of its own head are rows it wrote itself. The writer stays
+// stopped: a stopped writer is recoverable by an operator, and a chain that
+// adopted somebody else's rows is not.
+var ErrUnreconciled = errors.New("store: audit chain head cannot be reconciled")
+
+// maxReconcilableDrift bounds how many rows an automatic reconciliation will
+// re-chain inline.
+//
+// The bound is about the work, not the trust: reconciliation runs under the
+// writer's append lock, so every audited write in the process waits behind it,
+// and the drift it exists to repair is a single unobserved transaction. A
+// segment that has run far ahead of what this process believes is not that
+// case, and an operator reading the log is a better tool for it than a stalled
+// append path.
+const maxReconcilableDrift = 1024
 
 // The audit record kinds this package writes or expects. The set is open —
 // later units add their own — but the names are stable, because verification
@@ -68,6 +88,18 @@ const (
 	// auditors needs, and a surface that recorded only successful reads would
 	// leave probing invisible.
 	AuditKindAuditRefused = "audit.console.refused"
+
+	// AuditKindWriterReconciled marks the one change a writer is allowed to
+	// make to its own head without an operator: adopting rows it committed but
+	// never observed committing.
+	//
+	// It is a chain entry rather than a log line because the rows it adopts
+	// were reported to their callers as failures. Without this marker an
+	// auditor would read a run of records the system says never happened and
+	// have nothing to tell them why — which is the same class of lie the chain
+	// exists to prevent. The marker names both heads and the span adopted, so
+	// the ambiguous window is bounded rather than merely admitted.
+	AuditKindWriterReconciled = "audit.writer.reconciled"
 )
 
 // hashDomain separates this hash construction from any other in the system, so
@@ -230,6 +262,10 @@ func (w *AuditWriter) Close(ctx context.Context) error {
 func (w *AuditWriter) VerifyHold(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.verifyHoldLocked(ctx)
+}
+
+func (w *AuditWriter) verifyHoldLocked(ctx context.Context) error {
 	if w.closed {
 		return fmt.Errorf("store: writer %q is closed", w.id)
 	}
@@ -260,6 +296,14 @@ func (w *AuditWriter) VerifyHold(ctx context.Context) error {
 // writer. It exists for the one case where the in-process head can legitimately
 // drift: a commit whose outcome was never observed. Calling it discards
 // whatever the process believed and adopts what the database holds.
+//
+// It checks nothing. That is deliberate and is why it is not the automatic
+// recovery path: adopting whatever the database holds is the right move for an
+// operator who has already established what happened, and the wrong move for an
+// append that has just collided, because the collision cannot tell a commit
+// this process lost sight of from a second writer forking the segment. The
+// append path goes through reconcileLocked, which shares this method's head
+// read and refuses the cases this one would accept.
 func (w *AuditWriter) ReloadHead(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -290,6 +334,152 @@ func (w *AuditWriter) reloadHeadLocked(ctx context.Context, q Querier) error {
 	w.headSeq = seq
 	copy(w.headHash[:], hash)
 	return nil
+}
+
+// reconcileLocked tries to bring a conflicted writer back into agreement with
+// the database, and reports why it would not when it does not.
+//
+// The conflict it repairs has exactly one benign cause: a transaction that
+// committed on the server while this process was losing the connection or its
+// context, so the rows landed and the head never advanced. Every other cause —
+// a second process on this writer id, a hand-written row, a rewritten segment —
+// produces the same primary-key violation, so reconciliation is only allowed
+// once the benign cause has been positively established rather than assumed:
+//
+//   - The advisory claim must still be held. While it is, no other live process
+//     can be appending to this segment, which is what separates the drift this
+//     repairs from the fork it must not paper over.
+//   - Every row ahead of the believed head must re-chain from that believed
+//     head and hash to its own contents. Rows this process wrote do; rows
+//     invented by anything else do not, unless they were built with the head
+//     this process was holding — which is the same thing as having been written
+//     through this writer.
+//   - The reconciliation must itself be appended to the chain before the writer
+//     is declared healthy. A repair that could not be recorded does not happen.
+//
+// Anything else leaves the writer stopped. A stopped writer is an outage an
+// operator can see and unwind; a chain that quietly absorbed somebody else's
+// rows is a document that has stopped meaning anything.
+//
+// Nothing here rewrites or skips a row: the adopted rows are already committed
+// and already linked, and the marker extends the chain from them. Nothing here
+// re-runs the transaction that collided either — that decision belongs to the
+// caller, and only [AuditWriter.Append], whose transaction holds nothing but
+// its own rows, is allowed to make it.
+func (w *AuditWriter) reconcileLocked(ctx context.Context) error {
+	believedSeq, believedHash := w.headSeq, w.headHash
+
+	if err := w.verifyHoldLocked(ctx); err != nil {
+		return fmt.Errorf("store: %w: the claim on writer %q could not be confirmed: %w",
+			ErrUnreconciled, w.id, err)
+	}
+
+	tail, err := w.readTail(ctx, believedSeq)
+	if err != nil {
+		return err
+	}
+	if len(tail) == 0 {
+		// Nothing landed past what the writer already knew, so the collision
+		// was not a lost commit. Something removed a row, or the segment is
+		// being written from outside this process.
+		return fmt.Errorf("store: %w: writer %q collided at seq %d but the log holds nothing past it",
+			ErrUnreconciled, w.id, believedSeq+1)
+	}
+	if len(tail) > maxReconcilableDrift {
+		return fmt.Errorf("store: %w: writer %q is %d rows behind the log, more than one lost transaction can explain",
+			ErrUnreconciled, w.id, len(tail))
+	}
+
+	prev, expected := believedHash, believedSeq+1
+	for _, rec := range tail {
+		if rec.Seq != expected {
+			return fmt.Errorf("store: %w: writer %q found seq %d where %d should be",
+				ErrUnreconciled, w.id, rec.Seq, expected)
+		}
+		if rec.PrevHash != prev {
+			return fmt.Errorf("store: %w: writer %q found a row at seq %d linking to %x, not to %x",
+				ErrUnreconciled, w.id, rec.Seq, rec.PrevHash, prev)
+		}
+		if got := recordHash(rec); got != rec.Hash {
+			return fmt.Errorf("store: %w: writer %q found a row at seq %d whose stored hash %x is not the hash of its contents %x",
+				ErrUnreconciled, w.id, rec.Seq, rec.Hash, got)
+		}
+		prev, expected = rec.Hash, rec.Seq+1
+	}
+
+	adopted := tail[len(tail)-1]
+	w.headSeq, w.headHash = adopted.Seq, adopted.Hash
+	err = w.inTxLocked(ctx, func(ctx context.Context, _ pgx.Tx, ap *Appender) error {
+		_, aerr := ap.Append(ctx, AuditEntry{
+			Kind:    AuditKindWriterReconciled,
+			Subject: w.id,
+			Payload: map[string]any{
+				"believed_seq":  believedSeq,
+				"believed_hash": fmt.Sprintf("%x", believedHash),
+				"adopted_seq":   adopted.Seq,
+				"adopted_hash":  fmt.Sprintf("%x", adopted.Hash),
+				"adopted_rows":  len(tail),
+				"reason":        "rows committed without the commit being observed",
+			},
+		})
+		return aerr
+	})
+	if err != nil {
+		// The head goes back to what the writer believed so that a later
+		// attempt repeats the whole check rather than starting from a head it
+		// never got to record adopting.
+		w.headSeq, w.headHash = believedSeq, believedHash
+		return fmt.Errorf("store: writer %q could not record its reconciliation: %w", w.id, err)
+	}
+
+	w.broken = false
+	return nil
+}
+
+// readTail reads the rows of this segment past seq, in order, whole enough to
+// re-chain and re-hash.
+func (w *AuditWriter) readTail(ctx context.Context, seq int64) ([]AuditRecord, error) {
+	rows, err := w.store.pool.Query(ctx, `
+		SELECT seq, prev_hash, hash, kind, subject, payload::text, recorded_at
+		FROM audit_log
+		WHERE writer_id = $1 AND seq > $2
+		ORDER BY seq
+		LIMIT $3`, w.id, seq, maxReconcilableDrift+1)
+	if err != nil {
+		return nil, fmt.Errorf("store: read tail of writer %q: %w", w.id, err)
+	}
+	defer rows.Close()
+
+	var out []AuditRecord
+	for rows.Next() {
+		var (
+			rec      AuditRecord
+			prevHash []byte
+			hash     []byte
+			payload  string
+		)
+		if err := rows.Scan(&rec.Seq, &prevHash, &hash, &rec.Kind, &rec.Subject, &payload, &rec.RecordedAt); err != nil {
+			return nil, fmt.Errorf("store: scan tail of writer %q: %w", w.id, err)
+		}
+		if len(prevHash) != len(zeroHash) || len(hash) != len(zeroHash) {
+			return nil, fmt.Errorf("store: %w: writer %q has a malformed hash at seq %d",
+				ErrUnreconciled, w.id, rec.Seq)
+		}
+		canonical, cerr := canonicalJSONBytes([]byte(payload))
+		if cerr != nil {
+			return nil, fmt.Errorf("store: %w: writer %q has an unreadable payload at seq %d: %w",
+				ErrUnreconciled, w.id, rec.Seq, cerr)
+		}
+		rec.WriterID = w.id
+		rec.Payload = canonical
+		copy(rec.PrevHash[:], prevHash)
+		copy(rec.Hash[:], hash)
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: read tail of writer %q: %w", w.id, err)
+	}
+	return out, nil
 }
 
 // Appender appends rows to a segment inside an already-open transaction. It is
@@ -364,9 +554,20 @@ func (w *AuditWriter) InTx(ctx context.Context, fn func(ctx context.Context, tx 
 		return fmt.Errorf("store: writer %q is closed", w.id)
 	}
 	if w.broken {
-		return fmt.Errorf("store: writer %q needs ReloadHead after a previous conflict: %w", w.id, ErrChainConflict)
+		// A conflicted writer used to stay conflicted for the life of the
+		// process, because the method that clears the state had no caller. It
+		// gets one attempt to reconcile here — at the start of the next write,
+		// with that write's context, rather than on the failing call's way out
+		// with the context that had just been cancelled.
+		if err := w.reconcileLocked(ctx); err != nil {
+			return fmt.Errorf("store: writer %q is stopped after a conflict: %w: %w", w.id, ErrChainConflict, err)
+		}
 	}
 
+	return w.inTxLocked(ctx, fn)
+}
+
+func (w *AuditWriter) inTxLocked(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx, ap *Appender) error) error {
 	ap := &Appender{writer: w, seq: w.headSeq, prev: w.headHash}
 	err := w.store.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		ap.tx = tx
@@ -385,7 +586,26 @@ func (w *AuditWriter) InTx(ctx context.Context, fn func(ctx context.Context, tx 
 
 // Append writes entries in a transaction of their own. Use InTx when the audit
 // row has to land with something else.
+//
+// A sequence conflict is retried exactly once. The first append after a commit
+// this process lost sight of is the one that discovers the drift, and without
+// the retry that append is lost even though the writer is healthy again by the
+// time the next one arrives — which, on the flush that runs at shutdown, is a
+// record that never gets written at all.
+//
+// The retry lives here and not in InTx because it is only safe here: this
+// transaction contains nothing but these rows and it rolled back whole, so
+// running it again writes what it was always going to write. An InTx closure
+// belongs to a caller who never agreed to be run twice.
 func (w *AuditWriter) Append(ctx context.Context, entries ...AuditEntry) ([]AuditRecord, error) {
+	out, err := w.appendOnce(ctx, entries...)
+	if errors.Is(err, ErrChainConflict) {
+		out, err = w.appendOnce(ctx, entries...)
+	}
+	return out, err
+}
+
+func (w *AuditWriter) appendOnce(ctx context.Context, entries ...AuditEntry) ([]AuditRecord, error) {
 	var out []AuditRecord
 	err := w.InTx(ctx, func(ctx context.Context, _ pgx.Tx, ap *Appender) error {
 		recs, err := ap.Append(ctx, entries...)
