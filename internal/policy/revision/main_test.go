@@ -418,6 +418,11 @@ func (h *harness) tenantDecision(in engine.Input) decision.Result {
 	return result
 }
 
+// testApproverIssuer is the IdP this harness's approvers log in to. The quorum
+// and the delay are told which one it is, because a bare approver name is an
+// identity only relative to an issuer.
+const testApproverIssuer = "https://idp.test"
+
 // submitApproval hands one approval to a tenant decision.
 func (h *harness) submitApproval(decisionID, approver string) error {
 	h.t.Helper()
@@ -677,7 +682,7 @@ func factPolicy(id, source string, threshold int, approvers ...string) *policy.P
 }
 
 func user(id string) *identity.Subject {
-	return &identity.Subject{Kind: identity.SubjectUser, Issuer: "https://idp.test", ID: id}
+	return &identity.Subject{Kind: identity.SubjectUser, Issuer: testApproverIssuer, ID: id}
 }
 
 func transferRequest(subject string, amount int64) engine.Input {
@@ -746,7 +751,7 @@ const (
 
 func allHandlers(t *testing.T, writer *store.AuditWriter, s *store.Store, webhook *webhookTarget) (*challenge.Registry, error) {
 	t.Helper()
-	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: writer, DB: s.Pool()})
+	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: writer, DB: s.Pool(), ApproverIssuer: testApproverIssuer})
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +777,7 @@ func allHandlers(t *testing.T, writer *store.AuditWriter, s *store.Store, webhoo
 	if err != nil {
 		return nil, err
 	}
-	return challenge.NewRegistry(quorum, challenge.NewDelay(challenge.DelayConfig{}), external, delegated)
+	return challenge.NewRegistry(quorum, challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: testApproverIssuer}), external, delegated)
 }
 
 // stubInitiator stands in for an IdP. It reports the step-up transport, which

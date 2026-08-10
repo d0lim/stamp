@@ -115,6 +115,13 @@ func TestAQuorumResolvesItsApproversFromAGroup(t *testing.T) {
 	if len(detail.Members) != 2 || detail.Members[0] != "alice" || detail.Members[1] != "bob" {
 		t.Fatalf("members = %#v, want the deduplicated pair", detail.Members)
 	}
+	// The issuer the operator bound this source to is frozen with the members.
+	// A member identifier is a `sub`, and a `sub` names somebody only inside one
+	// issuer — so a set frozen without it would admit the same name from any
+	// trusted IdP.
+	if detail.Issuer != testIssuer {
+		t.Fatalf("frozen issuer = %q, want the source's own %q", detail.Issuer, testIssuer)
+	}
 	if detail.BindingHash == "" {
 		t.Fatal("the challenge was issued with no binding hash")
 	}
@@ -361,5 +368,46 @@ func TestAnEmptyFrozenRequestRefusesAFieldReference(t *testing.T) {
 	f := mustFailure(t, err)
 	if f.Reason != fact.ReasonBadArgument {
 		t.Fatalf("reason = %q, want %q", f.Reason, fact.ReasonBadArgument)
+	}
+}
+
+// A group source needs no deployment-wide approver-issuer designation, because
+// the operator already bound it to one. This is the payoff of returning the
+// issuer with the members: a deployment whose approvers live in a second IdP can
+// name them, which a bare member list deliberately cannot.
+func TestAGroupSourceCarriesItsOwnIssuer(t *testing.T) {
+	d := newDirectory(t)
+	s, _, _ := sourcesFor(t, d)
+
+	group, err := s.ResolveApprovers(context.Background(),
+		policy.SourceRef{Name: "release_approvers", Args: []policy.Operand{policy.String("sre-oncall")}},
+		frozenDecision(t, nil))
+	if err != nil {
+		t.Fatalf("ResolveApprovers: %v", err)
+	}
+	if group.Issuer != testIssuer {
+		t.Fatalf("issuer = %q, want the declaration's %q", group.Issuer, testIssuer)
+	}
+	if len(group.Members) != 2 {
+		t.Fatalf("members = %#v", group.Members)
+	}
+
+	// And a handler that designates nothing still issues a group-resolved
+	// quorum, where a bare member list would be refused.
+	q, err := challenge.NewQuorum(challenge.QuorumConfig{Groups: s})
+	if err != nil {
+		t.Fatalf("NewQuorum: %v", err)
+	}
+	res, err := issue(t, q, policy.Quorum{
+		Threshold: 2,
+		Approvers: policy.ApproverSet{
+			Source: &policy.SourceRef{Name: "release_approvers", Args: []policy.Operand{policy.String("sre-oncall")}},
+		},
+	}, frozenDecision(t, nil))
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if got := detailOf(t, res).Issuer; got != testIssuer {
+		t.Fatalf("frozen issuer = %q, want %q", got, testIssuer)
 	}
 }

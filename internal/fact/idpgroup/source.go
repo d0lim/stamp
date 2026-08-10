@@ -559,6 +559,15 @@ func (s *Sources) ResolveSources(ctx context.Context, calls []engine.SourceCall)
 
 // ResolveApprovers implements [challenge.GroupResolver]: R18's third mode.
 //
+// The answer carries the declaration's issuer alongside the members, and that
+// is the reason this mode needs no deployment-wide approver-issuer
+// designation. A member identifier is a `sub`, and a `sub` is unique only
+// inside its issuer; the operator already stated which issuer this directory
+// speaks for when they configured the source, so the pair travels together and
+// the challenge freezes both. A quorum resolved this way can name approvers in
+// an IdP that is not the deployment's default one, which a bare member list
+// deliberately cannot.
+//
 // The argument is reduced against the decision's frozen request rather than
 // against a live one, because the challenge is being issued for a decision that
 // has already been made and every other term of it is frozen too. The
@@ -568,17 +577,18 @@ func (s *Sources) ResolveSources(ctx context.Context, calls []engine.SourceCall)
 // The declaration's failure behaviour is deliberately not consulted. There is
 // no fail-open shape for "who is permitted to approve this", so a directory
 // that cannot answer means the challenge is not issued.
-func (s *Sources) ResolveApprovers(ctx context.Context, ref policy.SourceRef, dec challenge.DecisionContext) ([]string, error) {
+func (s *Sources) ResolveApprovers(ctx context.Context, ref policy.SourceRef, dec challenge.DecisionContext) (challenge.ApproverGroup, error) {
+	none := challenge.ApproverGroup{}
 	decl, ok := s.decls[ref.Name]
 	if !ok {
-		return nil, s.record(ctx, &fact.Failure{
+		return none, s.record(ctx, &fact.Failure{
 			Source: ref.Name,
 			Reason: fact.ReasonUnknownSource,
 			Detail: "no group source by that name is configured on this deployment",
 		}, policy.OnErrorDeny)
 	}
 	if len(ref.Args) != 1 {
-		return nil, s.record(ctx, &fact.Failure{
+		return none, s.record(ctx, &fact.Failure{
 			Source: ref.Name,
 			Reason: fact.ReasonBadArgument,
 			Detail: fmt.Sprintf("expected 1 argument, got %d", len(ref.Args)),
@@ -586,7 +596,7 @@ func (s *Sources) ResolveApprovers(ctx context.Context, ref policy.SourceRef, de
 	}
 	group, err := frozenOperand(ref.Args[0], dec)
 	if err != nil {
-		return nil, s.record(ctx, &fact.Failure{
+		return none, s.record(ctx, &fact.Failure{
 			Source: ref.Name,
 			Reason: fact.ReasonBadArgument,
 			Detail: err.Error(),
@@ -598,11 +608,11 @@ func (s *Sources) ResolveApprovers(ctx context.Context, ref policy.SourceRef, de
 	// cannot — a *Failure comes back either way and this returns it on.
 	v, err := s.Lookup(ctx, decl.Name, fact.String(group))
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 	items, ok := v.Data.([]any)
 	if !ok {
-		return nil, s.record(ctx, &fact.Failure{
+		return none, s.record(ctx, &fact.Failure{
 			Source: ref.Name,
 			Reason: fact.ReasonDecode,
 			Detail: fmt.Sprintf("expected a member list, got %T", v.Data),
@@ -612,7 +622,7 @@ func (s *Sources) ResolveApprovers(ctx context.Context, ref policy.SourceRef, de
 	for _, item := range items {
 		member, ok := item.(string)
 		if !ok {
-			return nil, s.record(ctx, &fact.Failure{
+			return none, s.record(ctx, &fact.Failure{
 				Source: ref.Name,
 				Reason: fact.ReasonDecode,
 				Detail: fmt.Sprintf("member is %T, not a subject identifier", item),
@@ -620,7 +630,10 @@ func (s *Sources) ResolveApprovers(ctx context.Context, ref policy.SourceRef, de
 		}
 		out = append(out, member)
 	}
-	return out, nil
+	// decl.Issuer is non-empty and trusted by construction: the load gate
+	// refuses a declaration without one, and refuses one the identity layer
+	// does not pin.
+	return challenge.ApproverGroup{Issuer: decl.Issuer, Members: out}, nil
 }
 
 // Close releases the connections the directory client is holding.

@@ -36,8 +36,9 @@ func newQuorumFixture(t *testing.T, spec policy.Quorum) *quorumFixture {
 	s := openStore(t, func() time.Time { return testNow })
 	w := claimWriter(t, s, "quorum-1")
 	policyVersion := seedPolicy(t, s, "high-value-transfer")
+	idp := newMockIdP(t)
 
-	handler, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: w, DB: s.Pool()})
+	handler, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: w, DB: s.Pool(), ApproverIssuer: idp.issuer()})
 	if err != nil {
 		t.Fatalf("new quorum handler: %v", err)
 	}
@@ -125,7 +126,7 @@ func newQuorumFixture(t *testing.T, spec policy.Quorum) *quorumFixture {
 		store:    s,
 		writer:   w,
 		handler:  handler,
-		idp:      newMockIdP(t),
+		idp:      idp,
 		decision: created,
 		context:  stored,
 		detail:   progress[0].Detail,
@@ -413,6 +414,7 @@ func hashOf(t *testing.T, dec challenge.DecisionContext, detail challenge.Quorum
 
 func membersDetail(threshold int, members ...string) challenge.QuorumDetail {
 	return challenge.QuorumDetail{
+		Issuer:    testApproverIssuer,
 		Threshold: threshold,
 		Mode:      challenge.ResolveMembers,
 		Members:   members,
@@ -534,7 +536,7 @@ func TestIssueFreezesTheResolvedTermsAndTheHash(t *testing.T) {
 // it must fail at issue rather than open a challenge nothing can satisfy.
 func TestGroupSourceApproverSetIsRefusedUntilItsResolverArrives(t *testing.T) {
 	t.Parallel()
-	handler, err := challenge.NewQuorum(challenge.QuorumConfig{})
+	handler, err := challenge.NewQuorum(challenge.QuorumConfig{ApproverIssuer: testApproverIssuer})
 	if err != nil {
 		t.Fatalf("new quorum handler: %v", err)
 	}
@@ -558,7 +560,7 @@ func TestGroupSourceApproverSetIsRefusedUntilItsResolverArrives(t *testing.T) {
 // resolve, so it is refused where it is declared rather than where it stalls.
 func TestIssueRefusesAnUnreachableThreshold(t *testing.T) {
 	t.Parallel()
-	handler, err := challenge.NewQuorum(challenge.QuorumConfig{})
+	handler, err := challenge.NewQuorum(challenge.QuorumConfig{ApproverIssuer: testApproverIssuer})
 	if err != nil {
 		t.Fatalf("new quorum handler: %v", err)
 	}
@@ -786,5 +788,191 @@ func TestReviewRefusesAnExpiredDecision(t *testing.T) {
 	})
 	if !errors.Is(err, store.ErrDecisionExpired) {
 		t.Fatalf("want ErrDecisionExpired, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// cross-issuer approver confusion
+// ---------------------------------------------------------------------------
+
+// R17 lets a deployment pin more than one trusted issuer, and OIDC only
+// promises that `sub` is unique *within* an issuer. So two trusted IdPs can both
+// mint sub=alice while a policy that writes `{members: [alice]}` means exactly
+// one of them — and U8 has known the right shape all along, since
+// [identity.Subject.CallerID] is `kind:issuer#sub` and that is what the audit
+// row records. Matching on the bare `sub` recorded one identity and authorised
+// another.
+//
+// This is the test that catches it. It covers both list-shaped resolutions,
+// because the hole was in the comparison and not in any one resolution.
+func TestATokenFromAnUndesignatedIssuerIsNotAnApprover(t *testing.T) {
+	t.Parallel()
+	const designated = "https://idp.corp.test"
+	const other = "https://idp.contractor.test"
+
+	handler, err := challenge.NewQuorum(challenge.QuorumConfig{
+		ApproverIssuer: designated,
+		Groups:         stubGroups{issuer: other, members: []string{"alice", "bob"}},
+	})
+	if err != nil {
+		t.Fatalf("new quorum handler: %v", err)
+	}
+
+	// A group source carries its own issuer, so the group case is stated
+	// against `other` while the member list is stated against `designated`.
+	// Each must admit its own issuer and refuse the other — which is also the
+	// proof that a group's issuer is not quietly overridden by the deployment
+	// designation.
+	cases := []struct {
+		name   string
+		spec   policy.Quorum
+		stated string
+		wrong  string
+	}{
+		{"an explicit member list", membersQuorum(2, "alice", "bob"), designated, other},
+		{"a resolved group",
+			policy.Quorum{Threshold: 2, Approvers: policy.ApproverSet{Source: &policy.SourceRef{Name: "oncall"}}},
+			other, designated},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := handler.Issue(context.Background(), challenge.IssueRequest{
+				Instance: challenge.Instance{DecisionID: "d-1", Kind: policy.ChallengeQuorum},
+				Spec:     tc.spec,
+				Decision: baseContext(),
+				Now:      testNow,
+			})
+			if err != nil {
+				t.Fatalf("issue: %v", err)
+			}
+			frozen, ok := res.Detail.(challenge.QuorumDetail)
+			if !ok {
+				t.Fatalf("detail is %T", res.Detail)
+			}
+			if frozen.Issuer != tc.stated {
+				t.Fatalf("frozen issuer %q, want %q", frozen.Issuer, tc.stated)
+			}
+			detail, err := json.Marshal(frozen)
+			if err != nil {
+				t.Fatalf("marshal detail: %v", err)
+			}
+
+			target := func(iss string) bool {
+				t.Helper()
+				ok, err := handler.IsTarget(context.Background(), challenge.TargetRequest{
+					Instance: challenge.Instance{DecisionID: "d-1", Kind: policy.ChallengeQuorum},
+					Decision: baseContext(),
+					Detail:   detail,
+					Subject:  &identity.Subject{Kind: identity.SubjectUser, Issuer: iss, ID: "alice"},
+				})
+				if err != nil {
+					t.Fatalf("IsTarget(%s): %v", iss, err)
+				}
+				return ok
+			}
+
+			if !target(tc.stated) {
+				t.Fatalf("alice at %s is not an approver of a set stated against it", tc.stated)
+			}
+			if target(tc.wrong) {
+				t.Fatalf("a token from %s satisfied a set that means %s: "+
+					"the audit row would read user:%s#alice while the match was made on bare alice",
+					tc.wrong, tc.stated, tc.wrong)
+			}
+		})
+	}
+}
+
+// A claim is asserted *by* an issuer, so the same substitution works through the
+// claim mode unless the issuer is pinned there too: an IdP that releases
+// `stamp_approver` to everyone would otherwise satisfy a policy that meant
+// another IdP's claim of that name.
+func TestAClaimAssertedByAnotherIssuerIsNotAnApproval(t *testing.T) {
+	t.Parallel()
+	const designated = "https://idp.corp.test"
+
+	handler, err := challenge.NewQuorum(challenge.QuorumConfig{ApproverIssuer: designated})
+	if err != nil {
+		t.Fatalf("new quorum handler: %v", err)
+	}
+	res, err := handler.Issue(context.Background(), challenge.IssueRequest{
+		Instance: challenge.Instance{DecisionID: "d-1", Kind: policy.ChallengeQuorum},
+		Spec:     claimQuorum(1, "stamp_approver"),
+		Decision: baseContext(),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	detail, err := json.Marshal(res.Detail)
+	if err != nil {
+		t.Fatalf("marshal detail: %v", err)
+	}
+
+	claims := json.RawMessage(`{"stamp_approver": true}`)
+	for _, tc := range []struct {
+		issuer string
+		want   bool
+	}{
+		{designated, true},
+		{"https://idp.contractor.test", false},
+	} {
+		subject := identity.NewSubject(
+			identity.Subject{Kind: identity.SubjectUser, Issuer: tc.issuer, ID: "alice"}, claims)
+		got, err := handler.IsTarget(context.Background(), challenge.TargetRequest{
+			Instance: challenge.Instance{DecisionID: "d-1", Kind: policy.ChallengeQuorum},
+			Decision: baseContext(),
+			Detail:   detail,
+			Subject:  subject,
+		})
+		if err != nil {
+			t.Fatalf("IsTarget(%s): %v", tc.issuer, err)
+		}
+		if got != tc.want {
+			t.Fatalf("a token from %s asserting the claim: target = %v, want %v", tc.issuer, got, tc.want)
+		}
+	}
+}
+
+// A deployment that has not said which IdP its approvers live in has not
+// described an approver set, and finds that out at issue rather than when
+// somebody tries to approve.
+func TestABareApproverSetIsRefusedWithoutADesignatedIssuer(t *testing.T) {
+	t.Parallel()
+	handler, err := challenge.NewQuorum(challenge.QuorumConfig{})
+	if err != nil {
+		t.Fatalf("new quorum handler: %v", err)
+	}
+	for name, spec := range map[string]policy.Quorum{
+		"an explicit member list": membersQuorum(2, "alice", "bob"),
+		"a token claim":           claimQuorum(1, "stamp_approver"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := handler.Issue(context.Background(), challenge.IssueRequest{
+				Instance: challenge.Instance{DecisionID: "d-1", Kind: policy.ChallengeQuorum},
+				Spec:     spec,
+				Decision: baseContext(),
+				Now:      testNow,
+			})
+			if !errors.Is(err, challenge.ErrApproverIssuerUndesignated) {
+				t.Fatalf("want ErrApproverIssuerUndesignated, got %v", err)
+			}
+			if !errors.Is(err, challenge.ErrUnsupportedSpec) {
+				t.Fatalf("it must also read as an unsupported spec, got %v", err)
+			}
+		})
+	}
+}
+
+// The issuer is part of the material an approval binds to (R31). Moving it does
+// not rename the approver set — it replaces it with a different set of people
+// spelled the same way — so approvals already collected must not survive it.
+func TestBindingHashCoversTheApproverIssuer(t *testing.T) {
+	t.Parallel()
+	one := membersDetail(2, "bob", "carol")
+	two := one
+	two.Issuer = "https://idp.contractor.test"
+	if hashOf(t, baseContext(), one) == hashOf(t, baseContext(), two) {
+		t.Fatal("moving the approver issuer left the binding hash unchanged")
 	}
 }
