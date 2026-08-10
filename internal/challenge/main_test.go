@@ -285,6 +285,14 @@ func (m *mockIdP) verifier(t *testing.T) *identity.Verifier {
 
 // user mints and verifies an end-user token, returning the Subject a request
 // would have carried.
+// issuer is the `iss` this mock signs under. A handler that has to be told
+// which IdP its approvers live in is told this.
+func (m *mockIdP) issuer() string { return m.server.URL }
+
+// testApproverIssuer designates an approver issuer for the tests that never
+// present a credential, where any non-empty designation does.
+const testApproverIssuer = "https://idp.test"
+
 func (m *mockIdP) user(t *testing.T, subject string, extra map[string]any) *identity.Subject {
 	t.Helper()
 	return m.subject(t, subject, testConsoleApp, extra)
