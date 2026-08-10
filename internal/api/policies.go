@@ -41,6 +41,10 @@ import (
 const (
 	// PolicyListPattern lists the effective policy set.
 	PolicyListPattern = "GET /policies"
+	// SchemaReadPath is where the schema in force is read.
+	SchemaReadPath = "/policies/schema"
+	// SchemaReadPattern reads the schema in force.
+	SchemaReadPattern = "GET " + SchemaReadPath
 	// RevisionPreviewPattern answers R23's pre-submission question.
 	RevisionPreviewPattern = "POST /policies/revisions/preview"
 	// RevisionSubmitPattern submits a revision.
@@ -101,12 +105,34 @@ func (f PolicyListerFunc) EffectivePolicies(ctx context.Context) ([]store.Policy
 	return f(ctx)
 }
 
+// SchemaReader reads the schema in force.
+//
+// It is a separate reader from [PolicyLister] because the schema is a separate
+// document with its own version line: a policy list carries policy documents and
+// no schema at all, which is why an author could see every policy in the
+// deployment and still not be able to render the form that edits one (U15).
+type SchemaReader interface {
+	EffectiveSchema(ctx context.Context) (store.SchemaRecord, error)
+}
+
+// SchemaReaderFunc adapts a function to [SchemaReader].
+type SchemaReaderFunc func(ctx context.Context) (store.SchemaRecord, error)
+
+// EffectiveSchema calls f.
+func (f SchemaReaderFunc) EffectiveSchema(ctx context.Context) (store.SchemaRecord, error) {
+	return f(ctx)
+}
+
 // PoliciesConfig configures a [Policies].
 type PoliciesConfig struct {
 	// Governance turns a revision into a decision. Required.
 	Governance Governor
 	// Policies reads the effective set. Required.
 	Policies PolicyLister
+	// Schema reads the schema in force. Required: an authoring surface that
+	// cannot say what vocabulary a policy is written in can only author the
+	// first policy of a deployment.
+	Schema SchemaReader
 	// Bootstrap reports the token's status. Optional; without it the governance
 	// read omits the token's state.
 	Bootstrap BootstrapReporter
@@ -125,6 +151,7 @@ type PoliciesConfig struct {
 type Policies struct {
 	governance    Governor
 	policies      PolicyLister
+	schema        SchemaReader
 	bootstrap     BootstrapReporter
 	files         FileApplier
 	maxBytes      int64
@@ -141,9 +168,13 @@ func NewPolicies(cfg PoliciesConfig) (*Policies, error) {
 	if cfg.Policies == nil {
 		return nil, errors.New("api: the policy surface requires a policy reader")
 	}
+	if cfg.Schema == nil {
+		return nil, errors.New("api: the policy surface requires a schema reader")
+	}
 	p := &Policies{
 		governance:    cfg.Governance,
 		policies:      cfg.Policies,
+		schema:        cfg.Schema,
 		bootstrap:     cfg.Bootstrap,
 		files:         cfg.Files,
 		maxBytes:      cfg.MaxRequestBytes,
@@ -163,6 +194,8 @@ func (p *Policies) Routes() []Route {
 	return []Route{
 		{Name: "policy-list", Surface: SurfaceConsole, Pattern: PolicyListPattern,
 			Auth: AuthUser, Handler: http.HandlerFunc(p.list)},
+		{Name: "schema-read", Surface: SurfaceConsole, Pattern: SchemaReadPattern,
+			Auth: AuthUser, Handler: http.HandlerFunc(p.readSchema)},
 		{Name: "revision-preview", Surface: SurfaceConsole, Pattern: RevisionPreviewPattern,
 			Auth: AuthUser, Handler: http.HandlerFunc(p.preview)},
 		{Name: "revision-submit", Surface: SurfaceConsole, Pattern: RevisionSubmitPattern,
@@ -220,6 +253,39 @@ func (p *Policies) list(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// SchemaView is the schema in force, as its exchange-format document and the
+// version line that names it.
+//
+// It is a capability and not a control. A revision's classification is computed
+// against the schema the store holds whatever the submitter sends, so nothing
+// here is load-bearing for R33; what it is load-bearing for is the form. A
+// console that cannot read the entity types, actions and fact sources a
+// deployment declares can render a blank policy and nothing else, which is what
+// made editing an existing policy impossible (U15).
+type SchemaView struct {
+	Version  int64  `json:"version"`
+	Document string `json:"document"`
+}
+
+func (p *Policies) readSchema(w http.ResponseWriter, r *http.Request) {
+	if _, ok := callerOf(w, r); !ok {
+		return
+	}
+	rec, err := p.schema.EffectiveSchema(r.Context())
+	if errors.Is(err, store.ErrNotFound) {
+		// Answered here rather than through the revision table, which reads a
+		// missing row as a missing revision. Before installation there is no
+		// schema, and that is a deployment state and not a bad request.
+		writeError(w, http.StatusServiceUnavailable, "not_installed", "no policy schema is in force yet")
+		return
+	}
+	if err != nil {
+		writeRevisionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, SchemaView{Version: rec.Version, Document: rec.Document})
 }
 
 // RevisionRequest is the body of a preview or a submission.

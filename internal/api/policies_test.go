@@ -129,6 +129,9 @@ func newPolicyFixture(t *testing.T, gov *recordingGovernor, records []store.Poli
 		Policies: api.PolicyListerFunc(func(context.Context) ([]store.PolicyRecord, error) {
 			return records, nil
 		}),
+		Schema: api.SchemaReaderFunc(func(context.Context) (store.SchemaRecord, error) {
+			return testSchemaRecord, nil
+		}),
 	})
 	if err != nil {
 		t.Fatalf("build policy surface: %v", err)
@@ -194,6 +197,9 @@ func TestPolicyRoutesAreConsoleOnlyAndUserAuthenticated(t *testing.T) {
 	policies, err := api.NewPolicies(api.PoliciesConfig{
 		Governance: &recordingGovernor{},
 		Policies:   api.PolicyListerFunc(func(context.Context) ([]store.PolicyRecord, error) { return nil, nil }),
+		Schema: api.SchemaReaderFunc(func(context.Context) (store.SchemaRecord, error) {
+			return testSchemaRecord, nil
+		}),
 	})
 	if err != nil {
 		t.Fatalf("build policy surface: %v", err)
@@ -391,6 +397,47 @@ func TestLockForwardsTheQuorumAndTheToken(t *testing.T) {
 
 // The listing ships the exchange-format document and flags the reserved policy,
 // so a console never renders the governance rule as an ordinary editable one.
+// testSchemaRecord is the schema in force for the surface tests. Its content is
+// irrelevant to every one of them except the schema read: what the surface owes
+// is the document and its version, unexamined.
+var testSchemaRecord = store.SchemaRecord{
+	Version:  7,
+	Document: "apiVersion: stamp/v1\nkind: Schema\n",
+	Origin:   store.OriginForm,
+}
+
+// The schema in force is readable, and readable behind the same credential the
+// policy listing asks for. Without it an author can see every policy in a
+// deployment and still not know what vocabulary to write one in, which is what
+// made editing an existing policy impossible from the console (U15).
+func TestSchemaReadReturnsTheDocumentAndItsVersion(t *testing.T) {
+	t.Parallel()
+	f := newPolicyFixture(t, &recordingGovernor{}, nil)
+
+	rec := f.do(t, api.SurfaceConsole, http.MethodGet, api.SchemaReadPath, f.userToken(t, "alice"), "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var out api.SchemaView
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode the schema view: %v", err)
+	}
+	if out.Version != testSchemaRecord.Version || out.Document != testSchemaRecord.Document {
+		t.Errorf("schema view = %+v, want version %d and the stored document",
+			out, testSchemaRecord.Version)
+	}
+}
+
+func TestSchemaReadNeedsAnEndUserCredential(t *testing.T) {
+	t.Parallel()
+	f := newPolicyFixture(t, &recordingGovernor{}, nil)
+
+	rec := f.do(t, api.SurfaceConsole, http.MethodGet, api.SchemaReadPath, "", "", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestPolicyListingMarksTheReservedPolicy(t *testing.T) {
 	t.Parallel()
 	records := []store.PolicyRecord{
