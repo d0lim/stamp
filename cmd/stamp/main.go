@@ -32,6 +32,13 @@ func main() {
 }
 
 func run(args []string, logOut *os.File) error {
+	// Subcommands come before flag parsing. breakglass is not a way of starting
+	// the service — it refuses to run while the service is up — so it must not
+	// share the server's flag set or its startup path.
+	if len(args) > 0 && args[0] == breakglassCommand {
+		return runBreakglass(context.Background(), args[1:], logOut)
+	}
+
 	fs := flag.NewFlagSet("stamp", flag.ContinueOnError)
 	rolesSpec := fs.String("roles", runtime.RoleAll,
 		"comma-separated subsystems to run, or \"all\" (check,decide,consumer,api,console)")
