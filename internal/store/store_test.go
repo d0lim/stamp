@@ -210,13 +210,14 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean migrate")
 	}
-	if version != 4 {
-		t.Fatalf("schema version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("schema version = %d, want 5", version)
 	}
 
 	for _, table := range []string{
 		"policy_schemas", "policies", "decisions", "challenge_progress", "approvals",
 		"audit_writers", "audit_log", "audit_checkpoints", "velocity_buckets", "processed_events",
+		"policy_revisions", "governance_bootstrap",
 	} {
 		if !tableExists(t, s, table) {
 			t.Errorf("table %q is missing after migrate", table)
@@ -233,11 +234,17 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean rollback")
 	}
-	if version != 3 {
-		t.Fatalf("schema version after one rollback = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("schema version after one rollback = %d, want 4", version)
 	}
-	if tableExists(t, s, "processed_events") {
-		t.Error("processed_events survived the rollback of its own migration")
+	if tableExists(t, s, "policy_revisions") {
+		t.Error("policy_revisions survived the rollback of its own migration")
+	}
+	if tableExists(t, s, "governance_bootstrap") {
+		t.Error("governance_bootstrap survived the rollback of its own migration")
+	}
+	if !tableExists(t, s, "processed_events") {
+		t.Error("processed_events was dropped by a one-step rollback that should not have touched it")
 	}
 	if !tableExists(t, s, "audit_log") {
 		t.Error("audit_log was dropped by a one-step rollback that should not have touched it")
@@ -246,8 +253,8 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("re-migrate after rollback: %v", err)
 	}
-	if !tableExists(t, s, "processed_events") {
-		t.Error("processed_events did not come back after re-migrating")
+	if !tableExists(t, s, "policy_revisions") {
+		t.Error("policy_revisions did not come back after re-migrating")
 	}
 }
 

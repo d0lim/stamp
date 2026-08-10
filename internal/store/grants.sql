@@ -63,6 +63,16 @@ GRANT SELECT, INSERT, DELETE ON processed_events TO {{.Consumer}};
 -- convention.
 GRANT SELECT, INSERT, UPDATE ON policy_schemas, policies TO {{.Admin}};
 GRANT SELECT, INSERT, UPDATE ON decisions, challenge_progress, approvals TO {{.Admin}};
+-- The revision effect hook invalidates approvals whose binding hash no longer
+-- matches, and rebuilds a decision's challenge rows when the revision changed
+-- which challenges it carries (R5, R31). Both are deletes, and both are on the
+-- governance path alone — the decide role never gets them, so a compromised
+-- decide tier cannot erase the evidence a quorum was collected on.
+GRANT DELETE ON approvals, challenge_progress TO {{.Admin}};
+GRANT SELECT, INSERT, UPDATE ON policy_revisions, governance_bootstrap TO {{.Admin}};
+-- The decide tier reads the pending revision so a console can show what is in
+-- flight; it never writes one.
+GRANT SELECT ON policy_revisions TO {{.Decide}};
 GRANT SELECT, INSERT ON audit_log, audit_checkpoints TO {{.Admin}};
 GRANT SELECT, INSERT, UPDATE ON audit_writers TO {{.Admin}};
 GRANT SELECT, INSERT, UPDATE, DELETE ON velocity_buckets, processed_events TO {{.Admin}};
