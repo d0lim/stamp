@@ -59,6 +59,20 @@
       "group": "api"
     },
     {
+      "name": "policy-apply",
+      "method": "POST",
+      "path": "/policies/apply",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "policy-export",
+      "method": "GET",
+      "path": "/policies/export",
+      "auth": "user",
+      "group": "api"
+    },
+    {
       "name": "revision-submit",
       "method": "POST",
       "path": "/policies/revisions",

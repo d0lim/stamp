@@ -22,16 +22,23 @@ var version = "dev"
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "stamp: %v\n", err)
-		os.Exit(1)
+		// The exit code is part of the contract for `policy apply --wait`:
+		// governance refusing a revision and a network failing are different
+		// events, and a CI step has to be able to branch on which one happened.
+		os.Exit(exitCodeOf(err))
 	}
 }
 
 func run(args []string, logOut *os.File) error {
 	// Subcommands come before flag parsing. breakglass is not a way of starting
 	// the service — it refuses to run while the service is up — so it must not
-	// share the server's flag set or its startup path.
+	// share the server's flag set or its startup path. `policy` is a client of
+	// the API rather than a server at all, for the same reason.
 	if len(args) > 0 && args[0] == breakglassCommand {
 		return runBreakglass(context.Background(), args[1:], logOut)
+	}
+	if len(args) > 0 && args[0] == policyCommand {
+		return runPolicy(context.Background(), args[1:], logOut)
 	}
 
 	fs := flag.NewFlagSet("stamp", flag.ContinueOnError)

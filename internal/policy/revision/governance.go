@@ -133,6 +133,11 @@ const (
 	StateApplied   State = "applied"
 	StateWithdrawn State = "withdrawn"
 	StateRejected  State = "rejected"
+	// StateSuperseded is a proposal replaced by a newer one from the same
+	// authoring path (D24). It is distinct from StateWithdrawn because nobody
+	// withdrew: an operator reading the history has to be able to tell a
+	// proposal somebody took back from one the next merge replaced.
+	StateSuperseded State = "superseded"
 )
 
 // GovernanceSchema is the schema the reserved policy is written against.
@@ -217,6 +222,20 @@ type Config struct {
 	// TTL bounds how long a revision may stay pending. Zero uses
 	// [DefaultRevisionTTL], which is D24's answer to approvers who do nothing.
 	TTL time.Duration
+	// Authoring is which authoring paths may write (R49). The empty mode is
+	// [AuthoringBoth].
+	Authoring AuthoringMode
+	// Rate bounds how often one authoring origin may take the serialization
+	// gate. The zero value uses [DefaultRate].
+	Rate Rate
+	// Limits bound an apply payload. The zero value uses
+	// [DefaultPayloadLimits].
+	Limits PayloadLimits
+	// Capabilities names what a caller is entitled to. Optional, and its
+	// absence is fail-closed: export refuses every caller until a deployment
+	// configures one, because the alternative — exporting to anyone
+	// authenticated — is the reconnaissance path R48 exists to close.
+	Capabilities Capabilities
 	// Now is the clock. Nil uses the store's.
 	Now func() time.Time
 }
@@ -227,15 +246,19 @@ const DefaultRevisionTTL = 24 * time.Hour
 
 // Service is the governance path.
 type Service struct {
-	store       *store.Store
-	audit       *store.AuditWriter
-	challenges  *challenge.Registry
-	revalidator *decision.Revalidator
-	resolver    engine.SourceResolver
-	bootstrap   *Bootstrap
-	floor       Floor
-	ttl         time.Duration
-	now         func() time.Time
+	store        *store.Store
+	audit        *store.AuditWriter
+	challenges   *challenge.Registry
+	revalidator  *decision.Revalidator
+	resolver     engine.SourceResolver
+	bootstrap    *Bootstrap
+	floor        Floor
+	ttl          time.Duration
+	authoring    AuthoringMode
+	rate         Rate
+	limits       PayloadLimits
+	capabilities Capabilities
+	now          func() time.Time
 }
 
 // New builds the governance service.
@@ -254,16 +277,23 @@ func New(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !cfg.Authoring.OrDefault().Valid() {
+		return nil, fmt.Errorf("revision: authoring mode %q must be one of %v", cfg.Authoring, AuthoringModes())
+	}
 	s := &Service{
-		store:       cfg.Store,
-		audit:       cfg.Audit,
-		challenges:  cfg.Challenges,
-		revalidator: cfg.Revalidator,
-		resolver:    cfg.Resolver,
-		bootstrap:   bootstrap,
-		floor:       cfg.Floor,
-		ttl:         cfg.TTL,
-		now:         cfg.Now,
+		store:        cfg.Store,
+		audit:        cfg.Audit,
+		challenges:   cfg.Challenges,
+		revalidator:  cfg.Revalidator,
+		resolver:     cfg.Resolver,
+		bootstrap:    bootstrap,
+		floor:        cfg.Floor,
+		ttl:          cfg.TTL,
+		authoring:    cfg.Authoring.OrDefault(),
+		rate:         cfg.Rate,
+		limits:       cfg.Limits,
+		capabilities: cfg.Capabilities,
+		now:          cfg.Now,
 	}
 	if s.floor.MinApprovers <= 0 {
 		s.floor.MinApprovers = DefaultFloor().MinApprovers
@@ -271,6 +301,10 @@ func New(cfg Config) (*Service, error) {
 	if s.ttl <= 0 {
 		s.ttl = DefaultRevisionTTL
 	}
+	if s.rate.Window <= 0 || s.rate.Burst <= 0 {
+		s.rate = DefaultRate()
+	}
+	s.limits = s.limits.orDefault()
 	if s.now == nil {
 		s.now = cfg.Store.Now
 	}
@@ -448,9 +482,13 @@ func (s *Service) Lock(ctx context.Context, req LockRequest) error {
 
 // Proposal is a revision as it stands.
 type Proposal struct {
-	ID          string                     `json:"id"`
-	DecisionID  string                     `json:"decision_id,omitempty"`
-	ProposerID  string                     `json:"proposer_id"`
+	ID         string `json:"id"`
+	DecisionID string `json:"decision_id,omitempty"`
+	ProposerID string `json:"proposer_id"`
+	// Origin is the authoring path the proposal arrived through. It decides
+	// which later proposal may replace this one (D24) and is not the same thing
+	// as the origin of the policies the delta touches.
+	Origin      store.Origin               `json:"origin"`
 	Delta       Delta                      `json:"delta"`
 	DeltaDigest string                     `json:"delta_digest"`
 	Mode        decision.ApplicationMode   `json:"application_mode"`
@@ -673,6 +711,10 @@ type ProposeRequest struct {
 	Proposer *identity.Subject
 	// Delta is the change set.
 	Delta Delta
+	// Origin is the authoring path this submission came through. The empty
+	// origin is the form: the console is the path that predates the file one,
+	// and a caller that says nothing is the console.
+	Origin store.Origin
 	// Mode is how open decisions are treated. The empty mode is revaluation.
 	Mode decision.ApplicationMode
 	// BootstrapToken authorizes a pre-lock revision. Ignored after the lock.
@@ -695,6 +737,25 @@ func (s *Service) Propose(ctx context.Context, req ProposeRequest) (Proposal, er
 	if !req.Mode.Valid() {
 		return Proposal{}, fmt.Errorf("%w: unknown application mode %q", ErrInvalidDelta, req.Mode)
 	}
+	origin := req.Origin
+	if origin == "" {
+		origin = store.OriginForm
+	}
+	if !origin.Valid() {
+		return Proposal{}, fmt.Errorf("%w: unknown authoring origin %q", ErrInvalidDelta, origin)
+	}
+	// The mode check and the gate are here rather than at either surface. This
+	// is the one entrance to the pipeline, so an authoring path added later is
+	// covered without anybody remembering to cover it (R49, R47).
+	if err := s.checkAuthoring(origin); err != nil {
+		return Proposal{}, err
+	}
+	if err := s.gate(ctx, origin); err != nil {
+		return Proposal{}, err
+	}
+	if err := s.checkRate(ctx, s.store.Pool(), origin); err != nil {
+		return Proposal{}, err
+	}
 	assessed, err := s.assess(ctx, req.Delta, req.Proposer.ID)
 	if err != nil {
 		return Proposal{}, err
@@ -716,6 +777,7 @@ func (s *Service) Propose(ctx context.Context, req ProposeRequest) (Proposal, er
 	proposal := Proposal{
 		ID:          id,
 		ProposerID:  req.Proposer.ID,
+		Origin:      origin,
 		Delta:       req.Delta,
 		DeltaDigest: hex.EncodeToString(digest[:]),
 		Mode:        req.Mode.OrDefault(),
@@ -830,11 +892,19 @@ func (s *Service) insertProposal(ctx context.Context, p Proposal, proposer *iden
 		return fmt.Errorf("revision: decode delta digest: %w", err)
 	}
 	return s.audit.InTx(ctx, func(ctx context.Context, tx pgx.Tx, ap *store.Appender) error {
+		// The replacement of a same-origin proposal happens here, inside the
+		// transaction the partial unique index is enforced in. Doing it outside
+		// would leave a window in which neither proposal held the gate and a
+		// third could take it.
+		if err := s.supersede(ctx, tx, ap, p.Origin, p.ID); err != nil {
+			return err
+		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO policy_revisions
-				(id, proposer_id, delta, delta_digest, application_mode, state, weakening, findings, threshold, created_at)
-			VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9)`,
-			p.ID, p.ProposerID, delta, digest, string(p.Mode), p.Weakening, findings, p.Threshold, p.CreatedAt)
+				(id, proposer_id, origin, delta, delta_digest, application_mode, state, weakening, findings, threshold, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10)`,
+			p.ID, p.ProposerID, string(p.Origin), delta, digest, string(p.Mode),
+			p.Weakening, findings, p.Threshold, p.CreatedAt)
 		if err != nil {
 			if isPendingConflict(err) {
 				return ErrRevisionPending
@@ -847,6 +917,7 @@ func (s *Service) insertProposal(ctx context.Context, p Proposal, proposer *iden
 			Payload: map[string]any{
 				SeverityKey:        severityOf(p.Weakening),
 				"proposer":         proposer.CallerID(),
+				"origin":           string(p.Origin),
 				"application_mode": string(p.Mode),
 				"delta_digest":     p.DeltaDigest,
 				"weakening":        p.Weakening,
@@ -1079,7 +1150,11 @@ func (s *Service) writeSchema(ctx context.Context, tx pgx.Tx, ap *store.Appender
 		}
 		return latest.Version, nil
 	}
-	rec, err := store.PutSchema(ctx, tx, p.Delta.SchemaAfter, store.OriginForm, p.ProposerID)
+	schemaOrigin := p.Origin
+	if schemaOrigin == "" {
+		schemaOrigin = store.OriginForm
+	}
+	rec, err := store.PutSchema(ctx, tx, p.Delta.SchemaAfter, schemaOrigin, p.ProposerID)
 	if err != nil {
 		return 0, err
 	}
@@ -1111,7 +1186,13 @@ func (s *Service) writeChange(ctx context.Context, tx pgx.Tx, ap *store.Appender
 		return err
 	}
 
-	origin := store.OriginForm
+	// A policy this revision introduces is owned by the path that introduced it
+	// (R54). A policy that already exists keeps its owner, whoever proposed the
+	// change — origin moves only on an explicit handover.
+	origin := p.Origin
+	if origin == "" {
+		origin = store.OriginForm
+	}
 	version := schemaVersion
 	existing, err := store.EffectivePolicy(ctx, tx, c.PolicyID)
 	switch {
@@ -1243,12 +1324,13 @@ func readProposal(ctx context.Context, q store.Querier, id string) (Proposal, er
 		findings   []byte
 		mode       string
 		state      string
+		origin     string
 	)
 	err := q.QueryRow(ctx, `
-		SELECT id, decision_id, proposer_id, delta::text, delta_digest, application_mode,
+		SELECT id, decision_id, proposer_id, origin, delta::text, delta_digest, application_mode,
 		       state, weakening, findings::text, threshold, created_at, resolved_at
 		FROM policy_revisions WHERE id = $1`, id).Scan(
-		&p.ID, &decisionID, &p.ProposerID, &delta, &digest, &mode,
+		&p.ID, &decisionID, &p.ProposerID, &origin, &delta, &digest, &mode,
 		&state, &p.Weakening, &findings, &p.Threshold, &p.CreatedAt, &p.ResolvedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Proposal{}, store.ErrNotFound
@@ -1261,6 +1343,7 @@ func readProposal(ctx context.Context, q store.Querier, id string) (Proposal, er
 	}
 	p.Mode = decision.ApplicationMode(mode)
 	p.State = State(state)
+	p.Origin = store.Origin(origin)
 	p.DeltaDigest = hex.EncodeToString(digest)
 	p.CreatedAt = p.CreatedAt.UTC()
 	if err := p.Delta.UnmarshalJSON(delta); err != nil {
