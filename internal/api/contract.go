@@ -80,6 +80,8 @@ var consoleContract = []ContractEndpoint{
 	{Name: "revision-submit", Method: "POST", Path: "/policies/revisions", Auth: AuthUser, Group: GroupAPI},
 	{Name: "revision-read", Method: "GET", Path: "/policies/revisions/{id}", Auth: AuthUser, Group: GroupAPI},
 	{Name: "revision-withdraw", Method: "POST", Path: "/policies/revisions/{id}/withdrawal", Auth: AuthUser, Group: GroupAPI},
+	{Name: "policy-apply", Method: "POST", Path: PolicyApplyPath, Auth: AuthUser, Group: GroupAPI},
+	{Name: "policy-export", Method: "GET", Path: PolicyExportPath, Auth: AuthUser, Group: GroupAPI},
 	{Name: "governance-read", Method: "GET", Path: "/governance", Auth: AuthUser, Group: GroupAPI},
 	{Name: "governance-lock", Method: "POST", Path: "/governance/lock", Auth: AuthUser, Group: GroupAPI},
 	{Name: "approval-review", Method: "GET", Path: "/decisions/{id}/challenges/{ordinal}/approval", Auth: AuthUser, Group: GroupAPI},
