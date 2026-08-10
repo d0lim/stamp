@@ -10,6 +10,7 @@ import (
 
 	"github.com/d0lim/stamp/internal/api"
 	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/policy/revision"
 	"github.com/d0lim/stamp/internal/stream"
 )
 
@@ -30,6 +31,10 @@ func clearEnv(t *testing.T) {
 		EnvDecisionTTL, EnvMaxOutstanding,
 		EnvFloorMinApprovers, EnvFloorProposerMayApprove,
 		EnvRevisionTTL, EnvReconcileInterval, EnvBootstrapWarnInterval,
+		EnvAuthoringMode, EnvCapabilityClaim,
+		EnvRevisionRateWindow, EnvRevisionRateBurst,
+		EnvApplyMaxDocuments, EnvApplyMaxDocumentBytes, EnvApplyMaxTotalBytes,
+		EnvApplyMaxPolicies, EnvApplyMaxConditionNodes, EnvApplyMaxConditionDepth,
 		EnvCheckContextEntity, EnvCheckPropertyAliases,
 		EnvExternalTargets, EnvCallbackBaseURL,
 		EnvMFAACRValues, EnvMFARequiredAMR, EnvMFAAuthzEndpoint, EnvMFAClientID,
@@ -110,6 +115,74 @@ func TestConfigFromEnvReadsADeployment(t *testing.T) {
 	if cfg.GovernanceFloor.MinApprovers != 2 {
 		t.Errorf("operator floor = %d, want 2", cfg.GovernanceFloor.MinApprovers)
 	}
+}
+
+// TestConfigFromEnvReadsTheFileAuthoringSurface is the environment half of M4's
+// wiring: every one of these knobs has a package default that is correct, which
+// is precisely why an unread variable is invisible — the deployment behaves
+// well and the operator's setting does nothing at all.
+func TestConfigFromEnvReadsTheFileAuthoringSurface(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvDSN, "postgres://stamp@localhost/stamp")
+	t.Setenv(EnvOIDCIssuer, "https://idp.example")
+	t.Setenv(EnvOIDCJWKSURL, "https://idp.example/jwks")
+	t.Setenv(EnvOIDCAudience, "stamp")
+
+	t.Run("unset leaves every field zero, which is the package default", func(t *testing.T) {
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		if cfg.AuthoringMode != revision.AuthoringBoth {
+			t.Errorf("authoring mode = %q, want %q", cfg.AuthoringMode, revision.AuthoringBoth)
+		}
+		// Empty and not the claim name itself: the resolution belongs to
+		// [revision.ClaimCapabilities], so that a deployment and the package
+		// cannot come to hold two different ideas of what the default is.
+		if cfg.CapabilityClaim != "" {
+			t.Errorf("capability claim = %q, want it left to the package default", cfg.CapabilityClaim)
+		}
+		if (cfg.RevisionRate != revision.Rate{}) {
+			t.Errorf("revision rate = %+v, want the zero value", cfg.RevisionRate)
+		}
+		if (cfg.ApplyLimits != revision.PayloadLimits{}) {
+			t.Errorf("apply limits = %+v, want the zero value", cfg.ApplyLimits)
+		}
+	})
+
+	t.Run("every variable reaches its field", func(t *testing.T) {
+		t.Setenv(EnvAuthoringMode, string(revision.AuthoringFile))
+		t.Setenv(EnvCapabilityClaim, "entitlements")
+		t.Setenv(EnvRevisionRateWindow, "5m")
+		t.Setenv(EnvRevisionRateBurst, "3")
+		t.Setenv(EnvApplyMaxDocuments, "11")
+		t.Setenv(EnvApplyMaxDocumentBytes, "22")
+		t.Setenv(EnvApplyMaxTotalBytes, "33")
+		t.Setenv(EnvApplyMaxPolicies, "44")
+		t.Setenv(EnvApplyMaxConditionNodes, "55")
+		t.Setenv(EnvApplyMaxConditionDepth, "66")
+
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		if cfg.AuthoringMode != revision.AuthoringFile {
+			t.Errorf("authoring mode = %q, want %q", cfg.AuthoringMode, revision.AuthoringFile)
+		}
+		if cfg.CapabilityClaim != "entitlements" {
+			t.Errorf("capability claim = %q, want entitlements", cfg.CapabilityClaim)
+		}
+		if want := (revision.Rate{Window: 5 * time.Minute, Burst: 3}); cfg.RevisionRate != want {
+			t.Errorf("revision rate = %+v, want %+v", cfg.RevisionRate, want)
+		}
+		want := revision.PayloadLimits{
+			MaxDocuments: 11, MaxDocumentBytes: 22, MaxTotalBytes: 33,
+			MaxPolicies: 44, MaxConditionNodes: 55, MaxConditionDepth: 66,
+		}
+		if cfg.ApplyLimits != want {
+			t.Errorf("apply limits = %+v, want %+v", cfg.ApplyLimits, want)
+		}
+	})
 }
 
 func TestConfigFromEnvUnbindsASurfaceSetToNothing(t *testing.T) {

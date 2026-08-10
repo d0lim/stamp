@@ -63,6 +63,11 @@ stamp --roles=all
 | `STAMP_FACT_ALLOW_FAIL_OPEN` | Permit source declarations that fail open. Off by default. |
 | `STAMP_AUDIT_FAIL_CLOSED` | Deny while the check-path audit buffer is saturated. On by default. |
 | `STAMP_GOVERNANCE_MIN_APPROVERS` | The operator floor under any revision quorum. |
+| `STAMP_AUTHORING_MODE` | Which authoring paths may write policy: `both` (default), `file` (closes the console's policy authoring), `console` (closes the file path's apply). An unrecognized value fails the boot rather than falling back to `both`. No mode closes the approval inbox, the audit views, the dry run or the lock. |
+| `STAMP_CAPABILITY_CLAIM` | The verified token claim the policy set export reads `policy.author` and `audit.read` from. Defaults to `stamp_capabilities`. The gate is fail-closed per caller: a token without the claim, or with a claim naming neither capability, is refused and the refusal is audited. |
+| `STAMP_REVISION_RATE_WINDOW`, `STAMP_REVISION_RATE_BURST` | How often one authoring path may open a revision. Defaults to ten a minute. |
+| `STAMP_APPLY_MAX_DOCUMENTS`, `STAMP_APPLY_MAX_DOCUMENT_BYTES`, `STAMP_APPLY_MAX_TOTAL_BYTES` | Apply payload bounds, checked before anything is parsed. |
+| `STAMP_APPLY_MAX_POLICIES`, `STAMP_APPLY_MAX_CONDITION_NODES`, `STAMP_APPLY_MAX_CONDITION_DEPTH` | Structural bounds on the policy set an apply payload decodes to, checked by the validator over a payload already bounded in bytes. |
 | `STAMP_EXTERNAL_TARGETS` | Webhook destinations an `external` challenge may reach, as a JSON document or a path to one: `name`, `url`, `secret`, and optionally `timeout` and `respond_within`. A policy names an entry; it cannot name a URL. |
 | `STAMP_CALLBACK_BASE_URL` | This deployment's externally reachable callback base. Told to an external target and used to build the step-up redirect a completion returns to. |
 | `STAMP_MFA_ACR_VALUES` | The operator allowlist of authentication context classes. Required to run delegated MFA at all: an IdP downgrades an `acr` request it cannot satisfy without saying so, so an unchecked response is an unchecked authentication. |
