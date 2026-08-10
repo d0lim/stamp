@@ -1,0 +1,84 @@
+# The todo application's authorization rules, as the interop fixtures expect
+# them:
+#
+#   read a user, read the todo list  — anyone the directory knows
+#   create a todo                    — admin or editor
+#   update or delete a todo          — admin, or an editor who owns it
+#
+# None of these carry a challenge, so all of them are decidable on the check
+# path. A policy with a challenge would be denied there with requires_decision,
+# which is why the interop set has none.
+apiVersion: stamp/v1
+kind: Policy
+id: todo.read-user
+description: Anyone in the directory may read a user profile.
+subject: user
+resource: user
+actions: [can_read_user]
+condition:
+  any:
+    - left: {field: subject.id}
+      in: {source: role_members, args: [admin]}
+    - left: {field: subject.id}
+      in: {source: role_members, args: [editor]}
+    - left: {field: subject.id}
+      in: {source: role_members, args: [viewer]}
+---
+apiVersion: stamp/v1
+kind: Policy
+id: todo.read-todos
+description: Anyone in the directory may read the todo list.
+subject: user
+resource: todo
+actions: [can_read_todos]
+condition:
+  any:
+    - left: {field: subject.id}
+      in: {source: role_members, args: [admin]}
+    - left: {field: subject.id}
+      in: {source: role_members, args: [editor]}
+    - left: {field: subject.id}
+      in: {source: role_members, args: [viewer]}
+---
+apiVersion: stamp/v1
+kind: Policy
+id: todo.create-todo
+description: Admins and editors may create a todo.
+subject: user
+resource: todo
+actions: [can_create_todo]
+condition:
+  any:
+    - left: {field: subject.id}
+      in: {source: role_members, args: [admin]}
+    - left: {field: subject.id}
+      in: {source: role_members, args: [editor]}
+---
+apiVersion: stamp/v1
+kind: Policy
+id: todo.admin-write
+description: Admins may update or delete any todo.
+subject: user
+resource: todo
+actions: [can_update_todo, can_delete_todo]
+condition:
+  left: {field: subject.id}
+  in: {source: role_members, args: [admin]}
+---
+apiVersion: stamp/v1
+kind: Policy
+id: todo.owner-write
+description: An editor may update or delete a todo they own.
+subject: user
+resource: todo
+actions: [can_update_todo, can_delete_todo]
+condition:
+  all:
+    - left: {field: subject.id}
+      in: {source: role_members, args: [editor]}
+    # The subject's identifier is opaque and the todo records an email, so the
+    # join goes through the directory rather than through string equality on
+    # the request alone.
+    - left: {source: user_email, args: [{field: subject.id}]}
+      op: eq
+      right: {field: resource.owner_id}

@@ -1,0 +1,114 @@
+name: conformance
+
+# No `branches:` filter on pull_request, for the same reason CI has none: the
+# landing strategy stacks pull requests on other units' branches, and a base
+# filter would leave those with no conformance check at all.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25"
+  NODE_VERSION: "22"
+  # The harness is pinned to a commit because its fixtures move on the upstream
+  # main branch. Re-pinning is a deliberate change with a diff, not something a
+  # green build should be able to do to itself overnight.
+  AUTHZEN_COMMIT: "6fb7fa85c86acda14710f9f0f161da9aaa801a45"
+  # D13 pins conformance to the single Access Evaluation profile. `-01` runs
+  # exactly that; `-02` would add the batch endpoint, which is deferred, so
+  # targeting it would fix this gate at permanently red.
+  SPEC_VERSION: "authorization-api-1_0-01"
+  EXPECTED_CASES: "40"
+  PDP_ADDR: "127.0.0.1:9090"
+
+jobs:
+  authzen:
+    name: authzen access evaluation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: fetch the interop harness at the pinned commit
+        run: |
+          mkdir -p authzen
+          cd authzen
+          git init -q
+          git remote add origin https://github.com/openid/authzen.git
+          git fetch -q --depth 1 origin "${AUTHZEN_COMMIT}"
+          git checkout -q FETCH_HEAD
+          echo "harness at $(git rev-parse HEAD)"
+
+      - name: build the harness
+        working-directory: authzen/interop/authzen-todo-backend
+        run: |
+          npx --yes yarn@1.22.19 install --frozen-lockfile
+          npx --yes yarn@1.22.19 build
+
+      - name: start the PDP
+        run: |
+          go build -o conformance-pdp ./testdata/conformance/pdp
+          nohup ./conformance-pdp \
+            -addr "${PDP_ADDR}" \
+            -dir testdata/conformance \
+            -token-file pdp-token.txt >pdp.log 2>&1 &
+          echo $! >pdp.pid
+          for _ in $(seq 1 50); do
+            if curl -sf "http://${PDP_ADDR}/healthz" >/dev/null; then
+              echo "pdp ready"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "the PDP never became ready:" >&2
+          cat pdp.log >&2
+          exit 1
+
+      # The harness authenticates like any other PEP. The token is minted by the
+      # PDP process against a key set it publishes on loopback, so the interop
+      # run exercises the R40 credential check rather than bypassing it.
+      - name: run the interop harness
+        working-directory: authzen/interop/authzen-todo-backend
+        run: |
+          AUTHZEN_PDP_API_KEY="Bearer $(cat "${GITHUB_WORKSPACE}/pdp-token.txt")" \
+            node build/test/runner.js "http://${PDP_ADDR}" "${SPEC_VERSION}" console \
+            | tee "${GITHUB_WORKSPACE}/conformance-results.txt"
+
+      # The harness exits 0 whatever it found — a run in which every case
+      # ERRORed exits 0 too. Without this step the job is green and the gate is
+      # silently empty, which is the failure U0 measured and warned about.
+      - name: assert every case passed
+        run: bash testdata/conformance/assert-results.sh conformance-results.txt "${EXPECTED_CASES}"
+
+      - name: stop the PDP
+        if: always()
+        run: |
+          if [ -f pdp.pid ]; then
+            kill "$(cat pdp.pid)" 2>/dev/null || true
+          fi
+
+      - name: upload the harness output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: |
+            conformance-results.txt
+            pdp.log
+          if-no-files-found: warn

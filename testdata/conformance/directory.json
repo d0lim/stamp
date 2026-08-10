@@ -1,0 +1,30 @@
+{
+  "_comment": "The interop scenario's user directory. It is deployment data, not policy data: the fact sources declared in policies/schema.yaml are served from it. Identifiers are the Dex subject identifiers the upstream fixtures use.",
+  "users": [
+    {
+      "id": "CiRmZDA2MTRkMy1jMzlhLTQ3ODEtYjdiZC04Yjk2ZjVhNTEwMGQSBWxvY2Fs",
+      "email": "rick@the-citadel.com",
+      "roles": ["admin", "evil_genius"]
+    },
+    {
+      "id": "CiRmZDE2MTRkMy1jMzlhLTQ3ODEtYjdiZC04Yjk2ZjVhNTEwMGQSBWxvY2Fs",
+      "email": "morty@the-citadel.com",
+      "roles": ["editor"]
+    },
+    {
+      "id": "CiRmZDI2MTRkMy1jMzlhLTQ3ODEtYjdiZC04Yjk2ZjVhNTEwMGQSBWxvY2Fs",
+      "email": "summer@the-smiths.com",
+      "roles": ["editor", "evil_genius"]
+    },
+    {
+      "id": "CiRmZDM2MTRkMy1jMzlhLTQ3ODEtYjdiZC04Yjk2ZjVhNTEwMGQSBWxvY2Fs",
+      "email": "beth@the-smiths.com",
+      "roles": ["viewer"]
+    },
+    {
+      "id": "CiRmZDQ2MTRkMy1jMzlhLTQ3ODEtYjdiZC04Yjk2ZjVhNTEwMGQSBWxvY2Fs",
+      "email": "jerry@the-smiths.com",
+      "roles": ["viewer"]
+    }
+  ]
+}
