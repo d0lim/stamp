@@ -95,15 +95,37 @@ type snapshotEntry struct {
 // Every version identifier is required, because a compiled program is cached
 // under the pair and an empty identifier would let two revisions share one cache
 // entry — which is a wrong decision, not a slow one.
+//
+// For the same reason no two policies in one snapshot may carry the same
+// version identifier. The cache key is the (schema, policy) version pair and
+// carries no policy identifier, so a repeated identifier means the second
+// policy is evaluated with the first policy's compiled condition. Nothing
+// downstream can notice: the second policy still matches on its own actions and
+// entity bindings, so it decides requests that are genuinely its own — using
+// somebody else's rule. The failure is a wrong allow, not an error.
+//
+// The collision is the default outcome rather than an exotic one. A store's
+// revision counter is per policy and starts at 1 for each, so a loader that
+// stringifies the row's version number hands every policy in the set the same
+// identifier. Refusing it here turns an invisible mis-evaluation into a startup
+// failure, which is the only stage at which it is cheap.
 func NewSnapshot(schemaVersion string, schema policy.Schema, policies []PolicyVersion) (*Snapshot, error) {
 	if schemaVersion == "" {
 		return nil, errors.New("schema version is required")
 	}
 	snap := &Snapshot{schema: schema, entries: make([]snapshotEntry, 0, len(policies))}
+	seen := make(map[string]string, len(policies))
 	for i := range policies {
 		if policies[i].Version == "" {
 			return nil, fmt.Errorf("policy %q: version is required", policies[i].Policy.ID)
 		}
+		if first, dup := seen[policies[i].Version]; dup {
+			return nil, fmt.Errorf(
+				"policies %q and %q are both versioned %q: the compile cache is keyed by version alone, "+
+					"so they would share one compiled condition — make the identifier unique per policy",
+				first, policies[i].Policy.ID, policies[i].Version)
+		}
+		seen[policies[i].Version] = policies[i].Policy.ID
 		// Held by value rather than by a pointer into the caller's slice, so a
 		// snapshot cannot change under an evaluator that is already using it.
 		p := policies[i].Policy
