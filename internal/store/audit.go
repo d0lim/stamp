@@ -58,6 +58,16 @@ const (
 	// makes the drop itself a security-relevant event, so it belongs in the
 	// chain rather than only in a log an operator may not be keeping.
 	AuditKindEventRejected = "ingest.event.rejected"
+
+	// AuditKindAuditRefused marks an audit console read that was refused for
+	// want of auditor standing (R22).
+	//
+	// The refusal is chained rather than logged because the audit console is
+	// the one surface whose reader is trying to see everything: an attempt to
+	// read the whole decision history is exactly the event an auditor of the
+	// auditors needs, and a surface that recorded only successful reads would
+	// leave probing invisible.
+	AuditKindAuditRefused = "audit.console.refused"
 )
 
 // hashDomain separates this hash construction from any other in the system, so

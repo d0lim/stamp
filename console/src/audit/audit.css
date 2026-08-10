@@ -1,0 +1,52 @@
+/*
+ * The audit console.
+ *
+ * A table is a table: real `th` cells with `scope`, a real `caption`, and no
+ * grid of divs pretending. R55 holds the audit screen to the builder's
+ * accessibility level, and a screen reader's table navigation is most of what
+ * "an auditor can read this" means.
+ */
+
+.audit-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  align-items: flex-end;
+  margin-bottom: var(--gap);
+}
+
+.audit-filters .field {
+  margin-bottom: 0;
+}
+
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: var(--gap);
+}
+
+.audit-table caption {
+  text-align: left;
+  color: var(--ink-quiet);
+  padding-bottom: 0.35rem;
+}
+
+.audit-table th,
+.audit-table td {
+  border-bottom: 1px solid var(--line);
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+  word-break: break-all;
+}
+
+.audit-table th {
+  color: var(--ink-quiet);
+  font-size: 0.9rem;
+}
+
+.pager {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: var(--gap);
+}

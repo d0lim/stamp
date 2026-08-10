@@ -24,6 +24,7 @@
  */
 import { useState } from 'react'
 import { ApiError, type ApiClient } from '../api/client'
+import { DocumentDiff } from '../diff/FieldDiff'
 import type { ApplicationMode, Delta, Preview, Proposal } from './api-types'
 import { hasNoDeclarations, type Draft } from './model'
 import { serializePolicy, serializeSchema } from './serialize'
@@ -145,6 +146,17 @@ export function SubmitPanel({
       {preview === null ? null : (
         <div className="preview" data-testid="revision-preview">
           <h3>제출하면 무슨 일이 일어나는가</h3>
+
+          {/*
+            R23 asks for the change diff beside the classification. It is drawn
+            by the renderer the approval screen uses (src/diff/), so what an
+            author reads before submitting and what an approver reads before
+            approving are the same rendering of the same delta rather than two
+            components that happen to agree today.
+          */}
+          <h4>변경 내용</h4>
+          <DocumentDiff idPrefix="submit-diff" after={serializePolicy(draft.policy)} />
+
           <dl className="summary-list">
             <dt>거버넌스</dt>
             <dd>{preview.mode === 'quorum' ? '잠김 (quorum)' : '미잠금 (solo_admin)'}</dd>

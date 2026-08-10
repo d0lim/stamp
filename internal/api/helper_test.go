@@ -79,6 +79,13 @@ func newMockIdP(t *testing.T) *mockIdP {
 // than anything inside the token.
 func (m *mockIdP) token(t *testing.T, subject, clientID string) string {
 	t.Helper()
+	return m.tokenWith(t, subject, clientID, nil)
+}
+
+// tokenWith mints a token carrying extra claims, which is what a standing rule
+// read off a claim (R22) has to be exercised against.
+func (m *mockIdP) tokenWith(t *testing.T, subject, clientID string, extra map[string]any) string {
+	t.Helper()
 	now := time.Now()
 	claims := map[string]any{
 		"iss": m.server.URL,
@@ -87,6 +94,9 @@ func (m *mockIdP) token(t *testing.T, subject, clientID string) string {
 		"azp": clientID,
 		"iat": now.Add(-time.Minute).Unix(),
 		"exp": now.Add(time.Hour).Unix(),
+	}
+	for k, v := range extra {
+		claims[k] = v
 	}
 	header := map[string]string{"alg": "RS256", "kid": testKeyID, "typ": "JWT"}
 	encode := func(v any) string {

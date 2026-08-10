@@ -1,0 +1,79 @@
+/*
+ * The diff's own styles.
+ *
+ * Every colour here is stated with its contrast ratio against the surface it
+ * sits on, for the same reason styles.css does it: R55 asks for 4.5:1 on the
+ * approval and audit screens too, and a ratio that is only checked in a browser
+ * is a ratio nobody checks. The change kind is never carried by colour alone —
+ * the row's text says 추가/수정/삭제 and the mark says +/−/~ — so these are
+ * reinforcement, not information.
+ */
+
+.fielddiff {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.fielddiff__row {
+  border-left: 4px solid var(--line);
+  padding: 0.4rem 0 0.4rem 0.6rem;
+  margin-bottom: 0.4rem;
+  background: var(--paper-sunk);
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+
+.fielddiff__row--added {
+  border-left-color: var(--diff-added-line);
+}
+
+.fielddiff__row--removed {
+  border-left-color: var(--diff-removed-line);
+}
+
+.fielddiff__row--changed {
+  border-left-color: var(--diff-changed-line);
+}
+
+.fielddiff__head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0 0 0.2rem;
+}
+
+.fielddiff__mark {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 700;
+}
+
+.fielddiff__kind {
+  font-size: 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 0.35rem;
+  color: var(--ink);
+}
+
+.fielddiff__label {
+  word-break: break-all;
+}
+
+.fielddiff__value {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.1rem 0;
+  align-items: baseline;
+}
+
+.fielddiff__value code {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.fielddiff__side {
+  flex: 0 0 2.5rem;
+  font-size: 0.85rem;
+  color: var(--ink-quiet);
+}

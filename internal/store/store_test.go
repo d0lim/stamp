@@ -210,8 +210,22 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean migrate")
 	}
-	if version != 6 {
-		t.Fatalf("schema version = %d, want 6", version)
+	if version != 7 {
+		t.Fatalf("schema version = %d, want 7", version)
+	}
+
+	// The newest migration is index-only. Its indexes are the audit console's
+	// query axes, so their absence is a silently slow console rather than a
+	// failure, which is exactly the kind of regression a count assertion alone
+	// would not catch.
+	for _, index := range []string{
+		"decisions_history_idx", "decisions_policy_history_idx",
+		"decisions_subject_history_idx", "decisions_state_history_idx",
+		"challenge_progress_open_quorum_idx",
+	} {
+		if !indexExists(t, s, index) {
+			t.Errorf("index %q is missing after migrate", index)
+		}
 	}
 
 	for _, table := range []string{
@@ -234,11 +248,33 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean rollback")
 	}
-	if version != 5 {
-		t.Fatalf("schema version after one rollback = %d, want 5", version)
+	if version != 6 {
+		t.Fatalf("schema version after one rollback = %d, want 6", version)
 	}
-	// The newest migration only adds columns to policy_revisions, so rolling it
-	// back leaves the table and takes the column.
+	// Rolling back an index-only migration takes the indexes and leaves every
+	// row where it was.
+	if indexExists(t, s, "decisions_history_idx") {
+		t.Error("decisions_history_idx survived the rollback of its own migration")
+	}
+	if !tableExists(t, s, "decisions") {
+		t.Error("decisions was dropped by a rollback that only created indexes on it")
+	}
+
+	if err := s.MigrateDown(ctx, 1); err != nil {
+		t.Fatalf("migrate down 1: %v", err)
+	}
+	version, dirty, ok, err = s.SchemaVersion(ctx)
+	if err != nil || !ok {
+		t.Fatalf("schema version after rollback: ok=%v err=%v", ok, err)
+	}
+	if dirty {
+		t.Fatal("schema is dirty after a clean rollback")
+	}
+	if version != 5 {
+		t.Fatalf("schema version after two rollbacks = %d, want 5", version)
+	}
+	// 000006 only adds columns to policy_revisions, so rolling it back leaves
+	// the table and takes the column.
 	if !tableExists(t, s, "policy_revisions") {
 		t.Error("policy_revisions was dropped by a rollback of a migration that only altered it")
 	}
@@ -279,6 +315,18 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
+}
+
+func indexExists(t *testing.T, s *store.Store, name string) bool {
+	t.Helper()
+	var exists bool
+	err := s.Pool().QueryRow(context.Background(),
+		`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1)`,
+		name).Scan(&exists)
+	if err != nil {
+		t.Fatalf("check index %q: %v", name, err)
+	}
+	return exists
 }
 
 func tableExists(t *testing.T, s *store.Store, name string) bool {

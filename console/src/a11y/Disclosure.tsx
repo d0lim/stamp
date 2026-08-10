@@ -20,6 +20,18 @@ export interface DisclosureProps {
   readonly defaultExpanded?: boolean
   /** Fired the first time this disclosure is expanded, ever. */
   readonly onFirstExpand?: () => void
+  /**
+   * Drives the open state from outside. Passing it makes this a controlled
+   * disclosure and `onToggle` becomes the only way it changes.
+   *
+   * U16 needs it for "expand everything", which R55 accepts as satisfying the
+   * approve gate in one action. The alternative — remounting every disclosure
+   * with a new default — would reset `aria-expanded` by destroying the element
+   * that carried it, which is a worse answer to an accessibility requirement
+   * than a controlled prop.
+   */
+  readonly expanded?: boolean
+  readonly onToggle?: (next: boolean) => void
 }
 
 export function Disclosure({
@@ -27,14 +39,18 @@ export function Disclosure({
   children,
   defaultExpanded = false,
   onFirstExpand,
+  expanded: controlled,
+  onToggle,
 }: DisclosureProps) {
   const id = useId()
-  const [expanded, setExpanded] = useState(defaultExpanded)
+  const [uncontrolled, setUncontrolled] = useState(defaultExpanded)
   const everExpanded = useRef(defaultExpanded)
+  const expanded = controlled ?? uncontrolled
 
   function toggle() {
     const next = !expanded
-    setExpanded(next)
+    if (controlled === undefined) setUncontrolled(next)
+    onToggle?.(next)
     if (next && !everExpanded.current) {
       everExpanded.current = true
       onFirstExpand?.()

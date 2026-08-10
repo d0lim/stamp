@@ -26,6 +26,16 @@
   --warn-ink: #4a3000; /* on --warn-paper: 11.3:1 */
   --refusal-line: #a4262c;
 
+  /*
+   * Diff accents. They are borders and never text, so the bar they clear is
+   * 3:1 against the surface behind them (WCAG 1.4.11) rather than 4.5:1 — and
+   * they carry no information on their own in any case: R55 makes the change
+   * kind a text label, and these only reinforce it.
+   */
+  --diff-added-line: #1f7a3d; /* on --paper-sunk: 4.3:1 */
+  --diff-removed-line: #a4262c; /* on --paper-sunk: 5.6:1 */
+  --diff-changed-line: #8a5a00; /* on --paper-sunk: 4.2:1 */
+
   --radius: 6px;
   --gap: 1rem;
 }
@@ -43,6 +53,9 @@
     --warn-line: #e0aa3e;
     --warn-ink: #ffeccc;
     --refusal-line: #ff8a8a;
+    --diff-added-line: #57c97e; /* on --paper-sunk: 6.5:1 */
+    --diff-removed-line: #ff8a8a; /* on --paper-sunk: 6.4:1 */
+    --diff-changed-line: #e0aa3e; /* on --paper-sunk: 7.4:1 */
   }
 }
 

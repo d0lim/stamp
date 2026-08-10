@@ -3,6 +3,20 @@
   "note": "Generated from internal/api/contract.go. Edit the Go declaration, not this file; internal/api's tests regenerate and verify it.",
   "endpoints": [
     {
+      "name": "audit-decision-list",
+      "method": "GET",
+      "path": "/audit/decisions",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "audit-decision-read",
+      "method": "GET",
+      "path": "/audit/decisions/{id}",
+      "auth": "user",
+      "group": "api"
+    },
+    {
       "name": "console-config",
       "method": "GET",
       "path": "/console/config.json",
@@ -13,6 +27,13 @@
       "name": "policy-dry-run",
       "method": "POST",
       "path": "/console/v1/policies/dry-run",
+      "auth": "user",
+      "group": "api"
+    },
+    {
+      "name": "inbox-list",
+      "method": "GET",
+      "path": "/decisions/inbox",
       "auth": "user",
       "group": "api"
     },
