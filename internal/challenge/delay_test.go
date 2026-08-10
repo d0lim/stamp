@@ -71,7 +71,7 @@ func issueDelay(t *testing.T, h *challenge.Delay, spec policy.Delay) (challenge.
 
 func TestDelayIssueFreezesTheReleaseInstantAndSetsItsOwnTimer(t *testing.T) {
 	t.Parallel()
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: testApproverIssuer})
 
 	if h.Kind() != policy.ChallengeDelay {
 		t.Fatalf("Kind() = %q, want %q", h.Kind(), policy.ChallengeDelay)
@@ -106,7 +106,7 @@ func TestDelayIssueFreezesTheReleaseInstantAndSetsItsOwnTimer(t *testing.T) {
 
 func TestDelayIssueRefusesADeclarationItCannotServe(t *testing.T) {
 	t.Parallel()
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: testApproverIssuer})
 
 	cases := map[string]policy.Challenge{
 		"another kind":  policy.Quorum{Threshold: 1, Approvers: policy.ApproverSet{Members: []string{"bob"}}},
@@ -134,7 +134,7 @@ func TestDelayIssueRefusesADeclarationItCannotServe(t *testing.T) {
 // answer, so this is the whole of "an elapsed delay satisfies its challenge".
 func TestDelayElapsedTimeReportsSatisfiedAndNeverFailed(t *testing.T) {
 	t.Parallel()
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: testApproverIssuer})
 	issued, raw := issueDelay(t, h, policy.Delay{Duration: time.Hour})
 	release := *issued.Deadline
 
@@ -178,7 +178,7 @@ func TestDelayElapsedTimeReportsSatisfiedAndNeverFailed(t *testing.T) {
 
 func TestDelayStatusNeverWalksBackATerminalState(t *testing.T) {
 	t.Parallel()
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: testApproverIssuer})
 	issued, raw := issueDelay(t, h, policy.Delay{Duration: time.Hour})
 
 	for _, stored := range []challenge.State{challenge.StateFailed, challenge.StateCancelled} {
@@ -203,9 +203,9 @@ func TestDelayStatusNeverWalksBackATerminalState(t *testing.T) {
 
 func TestDelayWithoutACancelAuthorityTakesNoSubmissions(t *testing.T) {
 	t.Parallel()
-	h := challenge.NewDelay(challenge.DelayConfig{})
-	_, raw := issueDelay(t, h, policy.Delay{Duration: time.Hour})
 	idp := newMockIdP(t)
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: idp.issuer()})
+	_, raw := issueDelay(t, h, policy.Delay{Duration: time.Hour})
 
 	_, err := h.Submit(context.Background(), challenge.SubmitRequest{
 		Instance:  delayInstance(),
@@ -253,7 +253,7 @@ func TestDelayCancellationResolvesInEveryMode(t *testing.T) {
 		{
 			name:       "source",
 			set:        policy.ApproverSet{Source: &policy.SourceRef{Name: "oncall"}},
-			groups:     stubGroups{members: []string{"frank"}},
+			groups:     stubGroups{issuer: idp.issuer(), members: []string{"frank"}},
 			authorised: idp.user(t, "frank", nil),
 			refused:    idp.user(t, "mallory", nil),
 			wantMode:   challenge.ResolveGroupSource,
@@ -262,7 +262,7 @@ func TestDelayCancellationResolvesInEveryMode(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			h := challenge.NewDelay(challenge.DelayConfig{Groups: tc.groups})
+			h := challenge.NewDelay(challenge.DelayConfig{Groups: tc.groups, ApproverIssuer: idp.issuer()})
 			set := tc.set
 			_, raw := issueDelay(t, h, policy.Delay{Duration: time.Hour, CancellableBy: &set})
 
@@ -337,7 +337,7 @@ func TestDelayCancellationResolvesInEveryMode(t *testing.T) {
 func TestDelayRefusesCancellationsFromCredentialsThatCannotHoldAuthority(t *testing.T) {
 	t.Parallel()
 	idp := newMockIdP(t)
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: idp.issuer()})
 	set := policy.ApproverSet{Members: []string{"carol"}}
 	_, raw := issueDelay(t, h, policy.Delay{Duration: time.Hour, CancellableBy: &set})
 
@@ -370,7 +370,7 @@ func TestDelayRefusesCancellationsFromCredentialsThatCannotHoldAuthority(t *test
 func TestDelayRefusesAnythingButAnExplicitCancellation(t *testing.T) {
 	t.Parallel()
 	idp := newMockIdP(t)
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: idp.issuer()})
 	set := policy.ApproverSet{Members: []string{"carol"}}
 	_, raw := issueDelay(t, h, policy.Delay{Duration: time.Hour, CancellableBy: &set})
 
@@ -408,7 +408,7 @@ func TestDelayRefusesAnythingButAnExplicitCancellation(t *testing.T) {
 func TestDelayIsTargetGrantsTheCancellerTheRead(t *testing.T) {
 	t.Parallel()
 	idp := newMockIdP(t)
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: idp.issuer()})
 
 	set := policy.ApproverSet{Members: []string{"carol"}}
 	_, cancellable := issueDelay(t, h, policy.Delay{Duration: time.Hour, CancellableBy: &set})
@@ -441,7 +441,7 @@ func TestDelayIsTargetGrantsTheCancellerTheRead(t *testing.T) {
 
 func TestDelayGroupAuthorityWithoutAResolverIsRefusedAtIssue(t *testing.T) {
 	t.Parallel()
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: testApproverIssuer})
 	set := policy.ApproverSet{Source: &policy.SourceRef{Name: "oncall"}}
 
 	_, err := h.Issue(context.Background(), challenge.IssueRequest{
@@ -469,7 +469,7 @@ func TestDelayTimerDoesNotBringForwardTheDecisionsExpiry(t *testing.T) {
 	w := claimWriter(t, s, "delay-1")
 	policyVersion := seedPolicy(t, s, "delayed-transfer")
 
-	h := challenge.NewDelay(challenge.DelayConfig{})
+	h := challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: testApproverIssuer})
 	issued, _ := issueDelay(t, h, policy.Delay{Duration: 5 * time.Minute})
 
 	id, err := store.NewDecisionID()
@@ -544,10 +544,11 @@ func TestDelayTimerDoesNotBringForwardTheDecisionsExpiry(t *testing.T) {
 // stubGroups stands in for U13's IdP group source. It is the seam, not the
 // implementation: what is tested here is that a delay reaches it.
 type stubGroups struct {
+	issuer  string
 	members []string
 	err     error
 }
 
-func (g stubGroups) ResolveApprovers(_ context.Context, _ policy.SourceRef, _ challenge.DecisionContext) ([]string, error) {
-	return g.members, g.err
+func (g stubGroups) ResolveApprovers(_ context.Context, _ policy.SourceRef, _ challenge.DecisionContext) (challenge.ApproverGroup, error) {
+	return challenge.ApproverGroup{Issuer: g.issuer, Members: g.members}, g.err
 }

@@ -57,6 +57,11 @@ const DelayActionCancel = "cancel"
 type CancelAuthority struct {
 	// Mode is which resolution produced the set.
 	Mode ResolutionMode `json:"mode"`
+	// Issuer is the token issuer this authority is stated against, carried for
+	// the same reason [QuorumDetail.Issuer] is: a bare identifier or a claim
+	// names somebody only inside one issuer's namespace, and cancelling a wait
+	// is an authorisation like any other.
+	Issuer string `json:"issuer"`
 	// Members is the resolved list, deduplicated and sorted, for the explicit
 	// and group-resolved modes.
 	Members []string `json:"members,omitempty"`
@@ -76,6 +81,7 @@ type CancelAuthority struct {
 // [normalizeMembers].
 func (a CancelAuthority) Equal(other CancelAuthority) bool {
 	return a.Mode == other.Mode &&
+		a.Issuer == other.Issuer &&
 		a.Claim == other.Claim &&
 		a.Source == other.Source &&
 		slices.Equal(a.Members, other.Members)
@@ -91,6 +97,7 @@ func (a CancelAuthority) Equal(other CancelAuthority) bool {
 func (a CancelAuthority) admits(s *identity.Subject) (bool, error) {
 	return isTarget(QuorumDetail{
 		Mode:    a.Mode,
+		Issuer:  a.Issuer,
 		Members: a.Members,
 		Claim:   a.Claim,
 		Source:  a.Source,
@@ -139,15 +146,21 @@ func DelayCancelPayload() json.RawMessage {
 
 // DelayConfig configures a [Delay].
 type DelayConfig struct {
-	// Groups resolves an IdP-group cancellation authority. Nil in v1, exactly
-	// as for the quorum: a policy that reaches for one is refused at issue
-	// rather than opening a wait whose cancellation nobody could exercise.
+	// Groups resolves an IdP-group cancellation authority. Nil refuses one at
+	// issue rather than opening a wait whose cancellation nobody could
+	// exercise.
 	Groups GroupResolver
+	// ApproverIssuer is the token issuer a bare canceller identifier belongs
+	// to, exactly as [QuorumConfig.ApproverIssuer] is for an approver. The two
+	// are the same deployment fact and a composition root sets them from the
+	// same value; they are separate fields only because the handlers are.
+	ApproverIssuer string
 }
 
 // Delay is the timed-wait handler.
 type Delay struct {
 	groups GroupResolver
+	issuer string
 }
 
 // Compile-time proof that the handler serves the whole contract, including the
@@ -162,7 +175,9 @@ var (
 // It cannot fail: a delay owns no store, no client and no credential. What can
 // fail is a declaration, and that is refused at [Delay.Issue] where the
 // declaration is.
-func NewDelay(cfg DelayConfig) *Delay { return &Delay{groups: cfg.Groups} }
+func NewDelay(cfg DelayConfig) *Delay {
+	return &Delay{groups: cfg.Groups, issuer: strings.TrimSpace(cfg.ApproverIssuer)}
+}
 
 // Kind implements [Handler].
 func (d *Delay) Kind() policy.ChallengeType { return policy.ChallengeDelay }
@@ -231,25 +246,40 @@ func (d *Delay) resolveAuthority(ctx context.Context, set policy.ApproverSet, de
 			return CancelAuthority{}, fmt.Errorf("%w: %w: source %q",
 				ErrUnsupportedSpec, ErrGroupSourceUnsupported, set.Source.Name)
 		}
-		members, err := d.groups.ResolveApprovers(ctx, *set.Source, dec)
+		group, err := d.groups.ResolveApprovers(ctx, *set.Source, dec)
 		if err != nil {
 			return CancelAuthority{}, fmt.Errorf("challenge: resolve cancellation group %q: %w", set.Source.Name, err)
 		}
-		return CancelAuthority{
+		return d.qualified(CancelAuthority{
 			Mode:    ResolveGroupSource,
+			Issuer:  strings.TrimSpace(group.Issuer),
 			Source:  set.Source.Name,
-			Members: normalizeMembers(members),
-		}, nil
+			Members: normalizeMembers(group.Members),
+		})
 	case set.Claim != "":
-		return CancelAuthority{Mode: ResolveClaim, Claim: set.Claim}, nil
+		return d.qualified(CancelAuthority{Mode: ResolveClaim, Issuer: d.issuer, Claim: set.Claim})
 	default:
 		members := normalizeMembers(set.Members)
 		if len(members) == 0 {
 			return CancelAuthority{}, fmt.Errorf(
 				"%w: a cancellation authority resolves from members, a claim, or a source", ErrUnsupportedSpec)
 		}
-		return CancelAuthority{Mode: ResolveMembers, Members: members}, nil
+		return d.qualified(CancelAuthority{Mode: ResolveMembers, Issuer: d.issuer, Members: members})
 	}
+}
+
+// qualified refuses an authority whose identifiers belong to no issuer.
+//
+// Same rule and same reason as the quorum's: a bare name is an identity only
+// relative to an issuer, so a deployment that has designated none has not
+// described who may stop this wait — and finding that out when somebody tries
+// to stop it is finding out too late.
+func (d *Delay) qualified(a CancelAuthority) (CancelAuthority, error) {
+	if a.Issuer == "" {
+		return CancelAuthority{}, fmt.Errorf("%w: %w: %s cancellation authorities are stated as bare identifiers, which name nobody until an issuer is designated",
+			ErrUnsupportedSpec, ErrApproverIssuerUndesignated, a.Mode)
+	}
+	return a, nil
 }
 
 // Submit records a cancellation.

@@ -192,7 +192,9 @@ func (a *App) build(ctx context.Context) error {
 	a.check = check
 
 	// --- decisions ---------------------------------------------------------
-	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: writer, DB: s.Pool()})
+	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{
+		Audit: writer, DB: s.Pool(), ApproverIssuer: approverIssuerFor(cfg),
+	})
 	if err != nil {
 		return err
 	}
@@ -426,6 +428,33 @@ func (a *App) build(ctx context.Context) error {
 	return registry.Mount(a.roles, server)
 }
 
+// approverIssuerFor designates the IdP this deployment's approvers log in to.
+//
+// A bare approver identifier in a policy — `{members: [alice]}` — is an
+// identity only relative to an issuer: OIDC promises `sub` is unique inside one
+// issuer and says nothing across two, so on a deployment that pins several,
+// `alice` at one IdP and `alice` at another are different people wearing one
+// name. The challenge handlers refuse a bare set until they are told which
+// issuer is meant, and this is where the deployment says so.
+//
+// It defaults exactly as the MFA token pins below do, and for the same reason:
+// an install that pinned one issuer has already answered the question, and
+// making an operator restate it would be configuration for its own sake. An
+// install that pinned several genuinely has not answered it, and returning
+// empty here is what makes those handlers refuse rather than guess. Guessing —
+// taking the first entry — would be picking which IdP's alice may approve.
+//
+// A multi-issuer deployment therefore needs an explicit designation of its own,
+// which is a configuration surface this function does not yet have; until then
+// such a deployment can name its approvers through an idp_group source, which
+// carries its own issuer.
+func approverIssuerFor(cfg Config) string {
+	if len(cfg.OIDC.Issuers) == 1 {
+		return cfg.OIDC.Issuers[0].Issuer
+	}
+	return ""
+}
+
 // challengeHandlers builds the challenge kinds this deployment serves.
 //
 // Three of the four are unconditional. A delay owns no configuration at all, an
@@ -458,7 +487,11 @@ func (a *App) challengeHandlers(quorum *challenge.Quorum) ([]challenge.Handler, 
 	if err != nil {
 		return nil, err
 	}
-	handlers := []challenge.Handler{quorum, challenge.NewDelay(challenge.DelayConfig{}), external}
+	handlers := []challenge.Handler{
+		quorum,
+		challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: approverIssuerFor(cfg)}),
+		external,
+	}
 
 	if !cfg.MFA.Configured() {
 		a.logger.Info("delegated mfa is not configured; the mfa challenge kind has no handler",

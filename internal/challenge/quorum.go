@@ -5,18 +5,35 @@ package challenge
 //
 // Three things in here are load-bearing beyond "count to m".
 //
-// The approver is the token's `sub` and nothing else. There is no approver
-// field in the submission payload, and a payload that carries one is refused
-// rather than ignored, because a field that is ignored today is a field
-// somebody reads tomorrow. D7 puts approver identity in the external IdP, so
-// the only statement about who is approving that STAMP will accept is the one
-// the IdP signed.
+// The approver is the token's `sub` qualified by the issuer that signed it, and
+// nothing else. There is no approver field in the submission payload, and a
+// payload that carries one is refused rather than ignored, because a field that
+// is ignored today is a field somebody reads tomorrow. D7 puts approver
+// identity in the external IdP, so the only statement about who is approving
+// that STAMP will accept is the one the IdP signed.
+//
+// The qualification is load-bearing and was not always here. R17 lets a
+// deployment pin several trusted issuers, and OIDC only promises that `sub` is
+// unique *within* an issuer — so two trusted IdPs can both mint sub=alice while
+// a policy that writes `{members: [alice]}` means exactly one of them. U8 has
+// known the right identity shape all along: [identity.Subject.CallerID] is
+// `kind:issuer#sub` and that is what an R40 audit row records. Matching on the
+// bare `sub` therefore recorded one identity and authorised another. Every
+// challenge now freezes the issuer its set is stated against, and a token from
+// any other issuer is not a target — in all three of R18's resolutions,
+// including the claim one, because a claim asserted by the wrong IdP is the
+// same substitution wearing a different hat.
+//
+// Which issuer the humans live in is deployment configuration, not policy: a
+// policy author names people, an operator names the directory those people are
+// in. So a bare member list is qualified by [QuorumConfig.ApproverIssuer], and
+// a deployment that has designated nothing cannot open a quorum at all. A group
+// source needs no designation — the operator bound it to an issuer when they
+// configured it, and it reports that issuer with its members.
 //
 // The set is resolved at issue and frozen in Detail. R18 allows three
-// resolutions and v1 implements two of them — an explicit list and a token
-// claim. The third, an IdP group, joins in U13 as a fact source; the seam is
-// [GroupResolver] and until something fills it a policy that reaches for it
-// fails at issue rather than opening a challenge nothing can satisfy.
+// resolutions and all three are implemented: an explicit list, a token claim,
+// and an IdP group through [GroupResolver], which U13 fills.
 //
 // Every approval is bound to a hash of the material the approver reviewed
 // (R31). The hash is computed at issue over the frozen decision, frozen in
@@ -47,6 +64,15 @@ var (
 	// [ErrUnsupportedSpec]: to a caller it is a declaration this build cannot
 	// serve, and it is refused at issue rather than at collection time.
 	ErrGroupSourceUnsupported = errors.New("challenge: idp group approver sets need a group resolver")
+
+	// ErrApproverIssuerUndesignated reports an approver set stated as bare
+	// identifiers on a deployment that has not said which issuer those
+	// identifiers belong to. It wraps [ErrUnsupportedSpec] and is raised at
+	// issue: a bare name is only an identity relative to an issuer, so a
+	// deployment that has designated none has not described an approver set at
+	// all, and opening the challenge would mean deciding later — during a
+	// submission — which IdP was meant.
+	ErrApproverIssuerUndesignated = errors.New("challenge: no approver issuer is designated on this deployment")
 
 	// ErrBindingChanged reports a submission against material that no longer
 	// hashes to the value the challenge was issued under (R31). The approvals
@@ -90,6 +116,12 @@ type QuorumDetail struct {
 	Threshold int `json:"threshold"`
 	// Mode is which resolution produced the set.
 	Mode ResolutionMode `json:"mode"`
+	// Issuer is the token issuer this set is stated against. Every identifier
+	// in Members, and any claim in Claim, means something only relative to it,
+	// so an approval is accepted from this issuer and no other. It is frozen at
+	// issue like everything else here: moving the designated issuer under a
+	// live challenge would move who may approve it.
+	Issuer string `json:"issuer"`
 	// Members is the resolved approver list, deduplicated and sorted. It is set
 	// for ResolveMembers and for a resolved ResolveGroupSource.
 	Members []string `json:"members,omitempty"`
@@ -115,14 +147,32 @@ type QuorumSubmission struct {
 	BindingHash string `json:"binding_hash,omitempty"`
 }
 
+// ApproverGroup is one resolved IdP group: the members, and the issuer whose
+// subjects those member identifiers are.
+//
+// The issuer travels with the members rather than being looked up beside them
+// because the resolver is the only party that knows it — an operator binds a
+// group source to one directory when they configure it, and that directory
+// speaks for exactly one issuer. Returning the pair means a group-resolved
+// approver set needs no deployment-wide designation and, unlike a bare member
+// list, can legitimately name approvers in an IdP other than the default one.
+type ApproverGroup struct {
+	// Issuer is the token issuer whose subjects Members names. Required: a
+	// resolver that cannot say which issuer its members belong to has not
+	// resolved an approver set.
+	Issuer string
+	// Members are the member subject identifiers.
+	Members []string
+}
+
 // GroupResolver resolves an IdP-group approver set to member identifiers.
 //
 // This is R18's third mode and the seam U13 fills: a group lookup is shaped
 // exactly like a fact source, so it resolves once at issue and freezes into the
-// challenge alongside the fact snapshot. Nothing implements it in v1, and a
-// nil resolver makes a group-backed approver set an issue-time refusal.
+// challenge alongside the fact snapshot. A nil resolver makes a group-backed
+// approver set an issue-time refusal.
 type GroupResolver interface {
-	ResolveApprovers(ctx context.Context, ref policy.SourceRef, decision DecisionContext) ([]string, error)
+	ResolveApprovers(ctx context.Context, ref policy.SourceRef, decision DecisionContext) (ApproverGroup, error)
 }
 
 // QuorumConfig configures a [Quorum].
@@ -134,8 +184,22 @@ type QuorumConfig struct {
 	// DB reads the approval rows a count is recomputed from. Required to
 	// collect or to report progress.
 	DB store.Querier
-	// Groups resolves IdP-group approver sets. Nil in v1.
+	// Groups resolves IdP-group approver sets. Nil refuses them at issue.
 	Groups GroupResolver
+	// ApproverIssuer is the token issuer a bare approver identifier belongs
+	// to — the IdP this deployment's approvers log in to.
+	//
+	// It is operator configuration because it is a fact about the deployment
+	// and not about any policy: a policy author writes `alice`, and which
+	// directory `alice` is a name in is not theirs to choose. A deployment that
+	// leaves it empty cannot open a quorum whose set is an explicit list or a
+	// claim; a group source carries its own issuer and needs no designation.
+	//
+	// It is deliberately a single issuer. Admitting a set of them would make a
+	// bare identifier mean "alice at any of these", which is the confusion this
+	// field exists to remove. A deployment that genuinely needs approvers in a
+	// second IdP names them through a group source bound to it.
+	ApproverIssuer string
 }
 
 // Quorum is the m-of-n approval handler.
@@ -143,6 +207,7 @@ type Quorum struct {
 	audit  *store.AuditWriter
 	db     store.Querier
 	groups GroupResolver
+	issuer string
 }
 
 // Compile-time proof that the handler serves the whole contract, including the
@@ -157,7 +222,12 @@ func NewQuorum(cfg QuorumConfig) (*Quorum, error) {
 	if (cfg.Audit == nil) != (cfg.DB == nil) {
 		return nil, errors.New("challenge: a quorum handler needs both an audit writer and a database, or neither")
 	}
-	return &Quorum{audit: cfg.Audit, db: cfg.DB, groups: cfg.Groups}, nil
+	return &Quorum{
+		audit:  cfg.Audit,
+		db:     cfg.DB,
+		groups: cfg.Groups,
+		issuer: strings.TrimSpace(cfg.ApproverIssuer),
+	}, nil
 }
 
 // Kind implements [Handler].
@@ -199,19 +269,33 @@ func (q *Quorum) resolve(ctx context.Context, spec policy.Quorum, dec DecisionCo
 			return QuorumDetail{}, fmt.Errorf("%w: %w: source %q",
 				ErrUnsupportedSpec, ErrGroupSourceUnsupported, set.Source.Name)
 		}
-		members, err := q.groups.ResolveApprovers(ctx, *set.Source, dec)
+		group, err := q.groups.ResolveApprovers(ctx, *set.Source, dec)
 		if err != nil {
 			return QuorumDetail{}, fmt.Errorf("challenge: resolve approver group %q: %w", set.Source.Name, err)
 		}
 		detail.Mode = ResolveGroupSource
 		detail.Source = set.Source.Name
-		detail.Members = normalizeMembers(members)
+		// The group's own issuer, not the deployment default: the operator bound
+		// this source to a directory, and that directory speaks for one issuer.
+		detail.Issuer = strings.TrimSpace(group.Issuer)
+		detail.Members = normalizeMembers(group.Members)
 	case set.Claim != "":
 		detail.Mode = ResolveClaim
 		detail.Claim = set.Claim
+		detail.Issuer = q.issuer
 	default:
 		detail.Mode = ResolveMembers
 		detail.Members = normalizeMembers(set.Members)
+		detail.Issuer = q.issuer
+	}
+
+	// A set with no issuer behind it is a list of names, not a list of people.
+	// Refusing here rather than at submission is the same rule the rest of this
+	// system follows: a refusal that arrives at collection time arrives after
+	// somebody has been told their decision is waiting on approvers.
+	if detail.Issuer == "" {
+		return QuorumDetail{}, fmt.Errorf("%w: %w: %s approver sets are stated as bare identifiers, which name nobody until an issuer is designated",
+			ErrUnsupportedSpec, ErrApproverIssuerUndesignated, detail.Mode)
 	}
 
 	// A set that cannot reach its own threshold is a decision that can never
@@ -489,11 +573,22 @@ func approverID(s *identity.Subject) (string, error) {
 
 // isTarget answers whether an identity is in the frozen approver set.
 //
-// It is fail-closed everywhere: an unreadable claim, an absent credential and a
-// resolution this build does not know are all "not a target".
+// The issuer is checked before the set, and it is checked in every mode. A
+// member list, a group's membership and a claim name are all statements inside
+// one issuer's namespace — `sub` is unique only within an issuer, and a claim
+// means whatever the IdP that asserted it means by it — so comparing any of
+// them without first fixing the issuer compares two identifiers that were never
+// in the same space. A challenge frozen with no issuer is one this rule cannot
+// evaluate, and an unevaluable rule is a refusal.
+//
+// It is fail-closed everywhere else too: an unreadable claim, an absent
+// credential and a resolution this build does not know are all "not a target".
 func isTarget(detail QuorumDetail, s *identity.Subject) (bool, error) {
 	if _, err := approverID(s); err != nil {
 		return false, nil //nolint:nilerr // not being an approver is an answer, not a failure
+	}
+	if detail.Issuer == "" || s.Issuer != detail.Issuer {
+		return false, nil
 	}
 	switch detail.Mode {
 	case ResolveMembers, ResolveGroupSource:
@@ -568,7 +663,13 @@ func assertsClaim(s *identity.Subject, name string) bool {
 // same content arrives as different bytes on either side of the database, and a
 // hash over the bytes would differ between issue and submit.
 func ApprovalBindingHash(dec DecisionContext, detail QuorumDetail) ([32]byte, error) {
-	approvers := map[string]any{"mode": string(detail.Mode)}
+	// The issuer is hashed with the set, not excluded alongside the threshold.
+	// Raising a quorum does not change what an approver was asked to judge, so
+	// R31 keeps those approvals; moving the issuer changes *which people* the
+	// frozen names refer to, which is a different approver set wearing the same
+	// spelling. Approvals collected under the old designation are approvals by
+	// people the new one may not even contain.
+	approvers := map[string]any{"mode": string(detail.Mode), "issuer": detail.Issuer}
 	switch detail.Mode {
 	case ResolveClaim:
 		approvers["claim"] = detail.Claim
