@@ -296,12 +296,15 @@ func TestOutstandingCapRefusesAndAudits(t *testing.T) {
 // same frozen policy version and facts, resolved in the same call.
 func TestUngatedPolicyResolvesImmediately(t *testing.T) {
 	ctx := context.Background()
-	h := newHarness(t, harnessOptions{policies: []*policy.Policy{openPolicy("read-only")}})
+	resolver := &recordingResolver{value: 77}
+	h := newHarness(t, harnessOptions{
+		policies: []*policy.Policy{factOpenPolicy("read-only")},
+		resolver: resolver,
+	})
 
 	res, err := h.svc.Decide(ctx, decision.Request{
-		Caller:       workload("payments"),
-		Input:        transferRequest("u1"),
-		FactSnapshot: map[string]any{"risk.score": 12},
+		Caller: workload("payments"),
+		Input:  transferRequest("u1"),
 	})
 	if err != nil {
 		t.Fatalf("decide: %v", err)
@@ -326,12 +329,22 @@ func TestUngatedPolicyResolvesImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read decision: %v", err)
 	}
+	// An immediate allow freezes its evidence too. It resolved a fact to reach
+	// that allow, and a decision that cannot show what it rested on is not
+	// explainable later just because nothing had to be collected.
+	evaluated, err := h.evaluator().Evaluate(ctx, transferRequest("u1"))
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if got, want := mustJSON(t, stored.FactSnapshot), mustJSON(t, evaluated.Facts()); got != want {
+		t.Errorf("frozen fact snapshot = %s, want the evaluated %s", got, want)
+	}
 	var frozen map[string]any
 	if err := json.Unmarshal(stored.FactSnapshot, &frozen); err != nil {
 		t.Fatalf("decode frozen fact snapshot: %v", err)
 	}
-	if frozen["risk.score"] != float64(12) {
-		t.Errorf("frozen fact snapshot = %s, want the facts the evaluation rested on", stored.FactSnapshot)
+	if len(frozen) != 1 {
+		t.Errorf("frozen fact snapshot holds %d facts, want the one the condition reached", len(frozen))
 	}
 	if stored.PolicyVersion == 0 {
 		t.Error("the decision did not pin a policy version")
@@ -400,6 +413,62 @@ func TestSubmissionFromNonTargetIsRefusedAndAudited(t *testing.T) {
 	}
 	if rows := h.auditPayloads(decision.AuditKindAccessRefused, res.ID); len(rows) != 1 {
 		t.Errorf("audited submission refusals = %d, want 1", len(rows))
+	}
+}
+
+// R7: the fact snapshot frozen onto a decision is the one the evaluation
+// rested on. Not one the caller passed alongside the request, and not one
+// re-resolved afterwards — the same values, from the same resolution, that
+// decided whether the policy applied at all.
+//
+// This is load-bearing beyond tidiness. The approval binding hash is computed
+// over this snapshot, and a revision preserves collected approvals only when
+// that hash is unchanged. A snapshot that never gated the decision would put
+// approval preservation on a value nothing checked.
+func TestFrozenFactSnapshotIsTheEvaluatedOne(t *testing.T) {
+	ctx := context.Background()
+	resolver := &recordingResolver{value: 91}
+	h := newHarness(t, harnessOptions{
+		policies: []*policy.Policy{factGatedPolicy("wire-transfer", 2, "alice", "bob", "carol")},
+		resolver: resolver,
+	})
+
+	// What an evaluation of this request resolves, asked independently of the
+	// service that has to freeze it.
+	evaluated, err := h.evaluator().Evaluate(ctx, transferRequest("u1"))
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if evaluated.Facts().Len() == 0 {
+		t.Fatal("the evaluation resolved no facts, so this test would pass vacuously")
+	}
+	want := mustJSON(t, evaluated.Facts())
+
+	before := resolver.count()
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if got := resolver.count() - before; got != 1 {
+		t.Fatalf("decide resolved facts %d times, want exactly once", got)
+	}
+
+	stored, err := store.GetDecision(ctx, h.store.Pool(), res.ID)
+	if err != nil {
+		t.Fatalf("read decision: %v", err)
+	}
+	if got := mustJSON(t, stored.FactSnapshot); got != want {
+		t.Errorf("frozen fact snapshot = %s, want the evaluated %s", got, want)
+	}
+
+	// The audit row carries the same snapshot, because that is where a
+	// verifier reads it from.
+	rows := h.auditPayloads(store.AuditKindDecisionCreated, res.ID)
+	if len(rows) != 1 {
+		t.Fatalf("decision.created audit rows = %d, want 1", len(rows))
+	}
+	if got := mustJSON(t, rows[0]["fact_snapshot"]); got != want {
+		t.Errorf("audited fact snapshot = %s, want the evaluated %s", got, want)
 	}
 }
 

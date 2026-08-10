@@ -266,12 +266,12 @@ type Request struct {
 	// Input is the access request to evaluate.
 	Input engine.Input
 
-	// FactSnapshot is the fact set the evaluation rested on, frozen onto the
-	// decision row. The evaluator does not currently hand its resolved facts
-	// back, so the caller that owns the fact plane supplies them; when the
-	// evaluator exposes them this field becomes the override rather than the
-	// source.
-	FactSnapshot any
+	// There is deliberately no fact snapshot field here. R7 requires the
+	// decision to freeze the facts the evaluation rested on, and a snapshot the
+	// caller passed alongside the request is not that — it is a second set that
+	// resembles it. The evaluator hands its resolved batch back on the result,
+	// and Decide reads it from there, so the two cannot diverge and no caller
+	// has to be trusted to keep them together.
 
 	// TTL overrides the service default for this decision. Zero uses it.
 	TTL time.Duration
@@ -341,10 +341,11 @@ func (s *Service) Decide(ctx context.Context, req Request) (Result, error) {
 	}
 	expiresAt := now.Add(ttl)
 
-	factSnapshot := req.FactSnapshot
-	if factSnapshot == nil {
-		factSnapshot = map[string]any{}
-	}
+	// The evidence, taken from the evaluation rather than from the caller. This
+	// is the value the approval binding hash is computed over and the value a
+	// revision re-evaluates against, so it has to be the batch that decided
+	// whether the policy applied at all.
+	factSnapshot := evaluated.Facts()
 	obligationsJSON, err := json.Marshal(obligations)
 	if err != nil {
 		return Result{}, fmt.Errorf("decision: encode obligations: %w", err)

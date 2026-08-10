@@ -122,6 +122,7 @@ type harness struct {
 	writer *store.AuditWriter
 	clock  *clock
 	svc    *decision.Service
+	opts   harnessOptions
 	schema *policy.Schema
 	seeded []engine.PolicyVersion
 }
@@ -131,6 +132,7 @@ type harnessOptions struct {
 	ttl            time.Duration
 	obligations    []decision.Obligation
 	policies       []*policy.Policy
+	resolver       engine.SourceResolver
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -173,8 +175,24 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 
 	h.writer = h.claimWriter("decide-1")
+	h.opts = opts
 	h.svc = h.newService(h.writer, opts)
 	return h
+}
+
+// evaluator builds a second evaluator over the same snapshot and fact plane,
+// so a test can ask what an evaluation resolves without going through the
+// service that is supposed to freeze it.
+func (h *harness) evaluator() *engine.DecideEvaluator {
+	h.t.Helper()
+	snap, err := engine.NewSnapshot("1", *h.schema, h.seeded)
+	if err != nil {
+		h.t.Fatalf("new snapshot: %v", err)
+	}
+	if h.opts.resolver != nil {
+		return engine.NewDecideEvaluator(snap, engine.WithSourceResolver(h.opts.resolver))
+	}
+	return engine.NewDecideEvaluator(snap)
 }
 
 func (h *harness) claimWriter(id string) *store.AuditWriter {
@@ -200,10 +218,14 @@ func (h *harness) newService(writer *store.AuditWriter, opts harnessOptions) *de
 	if err != nil {
 		h.t.Fatalf("new challenge registry: %v", err)
 	}
+	evaluator := engine.NewDecideEvaluator(snap)
+	if opts.resolver != nil {
+		evaluator = engine.NewDecideEvaluator(snap, engine.WithSourceResolver(opts.resolver))
+	}
 	cfg := decision.Config{
 		Store:          h.store,
 		Audit:          writer,
-		Evaluator:      engine.NewDecideEvaluator(snap),
+		Evaluator:      evaluator,
 		Challenges:     registry,
 		TTL:            opts.ttl,
 		MaxOutstanding: opts.maxOutstanding,
@@ -292,7 +314,77 @@ func testSchema() *policy.Schema {
 			{Name: "account", Attributes: []policy.Attribute{{Name: "tier", Type: policy.TypeString}}},
 		},
 		Actions: []policy.Action{{Name: "transfer"}},
+		Sources: []policy.SourceDecl{{
+			Name:    "risk_score",
+			Kind:    policy.SourceHTTP,
+			Params:  []policy.Param{{Name: "role", Type: policy.TypeString}},
+			Returns: policy.TypeInt,
+			OnError: policy.OnErrorDeny,
+		}},
 	}
+}
+
+// factGatedPolicy reaches a fact source from its condition, so that an
+// evaluation of it resolves facts the decision has to freeze.
+func factGatedPolicy(id string, threshold int, approvers ...string) *policy.Policy {
+	return &policy.Policy{
+		ID:       id,
+		Subject:  "user",
+		Resource: "account",
+		Actions:  []string{"transfer"},
+		Condition: policy.Compare{
+			Op:    policy.OpGe,
+			Left:  policy.Source("risk_score", policy.Field(policy.RoleSubject, "role")),
+			Right: policy.Int(50),
+		},
+		Challenges: []policy.Challenge{
+			policy.Quorum{Threshold: threshold, Approvers: policy.ApproverSet{Members: approvers}},
+		},
+	}
+}
+
+// factOpenPolicy is factGatedPolicy without a challenge: it allows outright,
+// and still rests on a resolved fact.
+func factOpenPolicy(id string) *policy.Policy {
+	return &policy.Policy{
+		ID:       id,
+		Subject:  "user",
+		Resource: "account",
+		Actions:  []string{"transfer"},
+		Condition: policy.Compare{
+			Op:    policy.OpGe,
+			Left:  policy.Source("risk_score", policy.Field(policy.RoleSubject, "role")),
+			Right: policy.Int(50),
+		},
+	}
+}
+
+// recordingResolver is the fact plane: it answers every call with one value and
+// counts how often it was asked, so a test can tell a resolved fact from a
+// value that was merely lying around.
+type recordingResolver struct {
+	mu    sync.Mutex
+	value int64
+	calls int
+	seen  []engine.SourceCall
+}
+
+func (r *recordingResolver) ResolveSources(_ context.Context, calls []engine.SourceCall) (*engine.Facts, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	facts := engine.NewFacts()
+	for _, call := range calls {
+		r.seen = append(r.seen, call)
+		facts.Set(call, r.value)
+	}
+	return facts, nil
+}
+
+func (r *recordingResolver) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 // gatedPolicy returns a policy demanding a quorum. Each call builds fresh
