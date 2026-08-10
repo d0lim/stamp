@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -31,6 +33,7 @@ import (
 	"time"
 
 	"github.com/d0lim/stamp/internal/api"
+	"github.com/d0lim/stamp/internal/fact"
 	"github.com/d0lim/stamp/internal/store"
 )
 
@@ -301,7 +304,9 @@ func TestCheckpointConfigRefusesAHalfConfiguredSubsystem(t *testing.T) {
 
 // checkpointApp assembles a process with the given roles and checkpoint
 // configuration, and returns it with whatever it logged on the way up.
-func checkpointApp(t *testing.T, roleSpec string, cp CheckpointConfig) (*App, *bytes.Buffer, context.CancelFunc) {
+func checkpointApp(t *testing.T, roleSpec string, cp CheckpointConfig,
+	mutators ...func(*Config),
+) (*App, *bytes.Buffer, context.CancelFunc) {
 	t.Helper()
 	idp := newMockIdP(t)
 	cfg := Config{
@@ -319,6 +324,9 @@ func checkpointApp(t *testing.T, roleSpec string, cp CheckpointConfig) (*App, *b
 			Algorithms:             []string{"RS256"},
 			AllowInsecureTransport: true,
 		},
+	}
+	for _, mutate := range mutators {
+		mutate(&cfg)
 	}
 	roles, err := ParseRoles(roleSpec)
 	if err != nil {
@@ -470,6 +478,134 @@ func TestConfiguredCheckpointsAreSignedIntoTheSink(t *testing.T) {
 		t.Errorf("the logs never name the signing key's identifier:\n%s", logs.String())
 	}
 	assertNoKeyMaterial(t, logs.String(), priv)
+}
+
+// TestWebhookSinkDeliversAlongsideTheFile covers the optional half of R32's
+// sink: an additional destination, reached through the same egress gate as
+// every other outbound call, and never instead of the file.
+func TestWebhookSinkDeliversAlongsideTheFile(t *testing.T) {
+	delivered := make(chan store.Checkpoint, 4)
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var cp store.Checkpoint
+		if err := json.NewDecoder(r.Body).Decode(&cp); err != nil {
+			t.Errorf("decode the delivered checkpoint: %v", err)
+		}
+		select {
+		case delivered <- cp:
+		default:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(receiver.Close)
+
+	keyPath, priv := writeSigningKey(t)
+	sinkPath := filepath.Join(t.TempDir(), "checkpoints.jsonl")
+	app, logs, _ := checkpointApp(t, "api", CheckpointConfig{
+		KeyFile: keyPath, KeyID: "k1", SinkFile: sinkPath,
+		SinkWebhook: receiver.URL, Interval: 50 * time.Millisecond,
+	}, func(cfg *Config) {
+		cfg.Egress = fact.EgressConfig{Allow: []string{receiver.URL}, AllowLoopback: true}
+	})
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	if err := app.Listen(); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- app.Serve(ctx) }()
+
+	select {
+	case cp := <-delivered:
+		if err := store.NewCheckpointVerifier(map[string]ed25519.PublicKey{
+			"k1": priv.Public().(ed25519.PublicKey),
+		}).Verify(cp); err != nil {
+			t.Errorf("the delivered checkpoint does not verify: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("no checkpoint was delivered to the webhook:\n%s", logs.String())
+	}
+	stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("serve returned %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the process did not stop within 20s of cancellation")
+	}
+
+	// The file still holds it: a webhook is an addition, and the readable copy
+	// is the one verification exists for.
+	sink, err := store.NewFileSink(sinkPath)
+	if err != nil {
+		t.Fatalf("open sink: %v", err)
+	}
+	held, err := sink.Checkpoints(context.Background())
+	if err != nil {
+		t.Fatalf("read sink: %v", err)
+	}
+	if len(held) == 0 {
+		t.Error("the file sink holds nothing while the webhook was delivered to")
+	}
+}
+
+// TestWebhookOnlySinkSaysItCannotBeVerifiedAgainst: delivery is not
+// verification. A deployment whose only sink is write-only has checkpoints and
+// no way to run `stamp audit verify` against them.
+func TestWebhookOnlySinkSaysItCannotBeVerifiedAgainst(t *testing.T) {
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(receiver.Close)
+
+	keyPath, _ := writeSigningKey(t)
+	app, logs, _ := checkpointApp(t, "api", CheckpointConfig{
+		KeyFile: keyPath, KeyID: "k1", SinkWebhook: receiver.URL, Interval: time.Hour,
+	}, func(cfg *Config) {
+		cfg.Egress = fact.EgressConfig{Allow: []string{receiver.URL}, AllowLoopback: true}
+	})
+	if !hasComponent(app, "audit-checkpointer") {
+		t.Error("a webhook-only deployment does not record checkpoints at all")
+	}
+	warning := findLogLine(t, logs, slog.LevelWarn, "the only audit checkpoint sink is a webhook")
+	if warning == nil {
+		t.Fatalf("no warning that the sink cannot be read back:\n%s", logs.String())
+	}
+	if !strings.Contains(fmt.Sprint(warning["effect"]), "cannot verify") {
+		t.Errorf("the warning does not say what is lost: %v", warning)
+	}
+}
+
+// TestAnUnreachableWebhookIsRefusedAtStartup keeps the checkpoint destination
+// inside the same egress rules as every other outbound call.
+func TestAnUnreachableWebhookIsRefusedAtStartup(t *testing.T) {
+	keyPath, _ := writeSigningKey(t)
+	idp := newMockIdP(t)
+	roles, err := ParseRoles("api")
+	if err != nil {
+		t.Fatalf("parse roles: %v", err)
+	}
+	_, err = Assemble(context.Background(), Config{
+		DSN: freshDB(t), MaxConns: 8, Migrate: true,
+		InstanceID: "checkpoint-egress", WriterID: "checkpoint-egress",
+		Addresses: map[api.Surface]string{api.SurfacePEP: "127.0.0.1:0"},
+		Checkpoint: CheckpointConfig{
+			KeyFile: keyPath, KeyID: "k1", SinkWebhook: "https://sink.invalid/checkpoints",
+		},
+		OIDC: OIDCConfig{
+			Issuers:                []IssuerConfig{{Issuer: idp.server.URL, JWKSURL: idp.server.URL + "/jwks"}},
+			Audience:               testAudience,
+			Algorithms:             []string{"RS256"},
+			AllowInsecureTransport: true,
+		},
+	}, roles, nil)
+	if err == nil {
+		t.Fatal("a checkpoint webhook outside the egress allowlist was accepted")
+	}
+	if !strings.Contains(err.Error(), EnvCheckpointSinkWebhook) {
+		t.Errorf("the refusal does not name the variable: %v", err)
+	}
 }
 
 // assertNoKeyMaterial fails if any encoding of the private key appears in text.
