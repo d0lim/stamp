@@ -69,6 +69,16 @@ func sampleSet() *Set {
 					}),
 				),
 			),
+			Challenges: []Challenge{
+				Quorum{Threshold: 2, Approvers: ApproverSet{
+					Source: &SourceRef{Name: "approver_ids", Args: []Operand{String("finance")}},
+				}},
+				MFA{Mode: MFADelegated, ACRValues: []string{"urn:mace:incommon:iap:silver"}},
+				Delay{Duration: 30 * time.Minute, CancellableBy: &ApproverSet{
+					Members: []string{"security-lead"},
+				}},
+				External{Target: "fraud-review"},
+			},
 		}, {
 			ID:       "always-review-rejections",
 			Subject:  "user",
@@ -145,6 +155,13 @@ condition:
       right: 10000.0
     - left: {field: user.department}
       not_in: [contractors]
+challenges:
+  # two of these three have to sign off
+  - type: quorum
+    threshold: 2
+    approvers: {members: [alice, bob, carol]}
+  # mode is omitted: delegated is the only one v1 implements
+  - type: mfa
 `
 
 func TestHandWrittenFileLoads(t *testing.T) {
@@ -181,6 +198,14 @@ func TestHandWrittenFileLoads(t *testing.T) {
 	}
 	if bytes.Contains(data, []byte("on_error")) {
 		t.Fatalf("normalization should omit the default on_error:\n%s", data)
+	}
+	if bytes.Contains(data, []byte("mode:")) {
+		t.Fatalf("normalization should omit the default mfa mode:\n%s", data)
+	}
+	// The hand-written file said nothing about a decision; the challenges it
+	// declares are what make one necessary.
+	if !set.Policies[0].RequiresDecision() {
+		t.Error("a policy declaring challenges must require a decision")
 	}
 	again, err := Load(bytes.NewReader(data))
 	if err != nil {
