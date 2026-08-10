@@ -1,0 +1,71 @@
+/*
+ * The inbox and approval screens.
+ *
+ * No inline styles here either — style-src is 'self' with no 'unsafe-inline',
+ * so a style attribute is a rule the browser drops. Colours come from the
+ * tokens in styles.css, which state their contrast ratios.
+ */
+
+.inbox-list,
+.entry-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.inbox-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.inbox-row__title {
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+}
+
+.entry__summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.entry__title {
+  font-weight: 600;
+}
+
+.entry__meta {
+  color: var(--ink-quiet);
+  font-size: 0.9rem;
+}
+
+/*
+ * The weakening badge is a bordered text label, not a colour swatch. R55 asks
+ * for the distinction to survive without colour, and the word 완화 is the thing
+ * that carries it.
+ */
+.entry__weakening {
+  border: 1px solid var(--warn-line);
+  background: var(--warn-paper);
+  color: var(--warn-ink);
+  border-radius: var(--radius);
+  padding: 0 0.35rem;
+  font-size: 0.85rem;
+}
+
+.binding {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin-bottom: var(--gap);
+}
+
+.binding .document {
+  word-break: break-all;
+}
+
+.summary-list__pair {
+  display: contents;
+}

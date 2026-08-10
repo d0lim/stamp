@@ -11,8 +11,10 @@ import { AuthGate } from './AuthGate'
 import { CallbackScreen } from './CallbackScreen'
 import { Layout } from './Layout'
 import { RequireRole } from './RequireRole'
-import { AuditScreen, InboxScreen, NoAccessScreen, NotFoundScreen } from './screens'
+import { NoAccessScreen, NotFoundScreen } from './screens'
 import { PolicyRoutes } from '../builder/routes'
+import { AuditRoutes } from '../audit/routes'
+import { InboxRoutes } from '../inbox/routes'
 import { useAuth } from '../auth/AuthProvider'
 
 function Landing() {
@@ -48,18 +50,22 @@ export function App() {
           element={
             <AuthGate>
               <RequireRole role="approver">
-                <InboxScreen />
+                <InboxRoutes />
               </RequireRole>
             </AuthGate>
           }
         />
+        {/*
+          The audit subtree guards its own routes rather than being guarded as
+          one. R22 lets a reader without auditor standing open a decision they
+          created or are a target of, so the history is behind the role and one
+          decision is not — see audit/routes.tsx.
+        */}
         <Route
           path="/audit/*"
           element={
             <AuthGate>
-              <RequireRole role="auditor">
-                <AuditScreen />
-              </RequireRole>
+              <AuditRoutes />
             </AuthGate>
           }
         />
