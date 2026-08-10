@@ -1,0 +1,494 @@
+package decision_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/testcontainers/testcontainers-go"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/d0lim/stamp/internal/challenge"
+	"github.com/d0lim/stamp/internal/decision"
+	"github.com/d0lim/stamp/internal/engine"
+	"github.com/d0lim/stamp/internal/identity"
+	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/store"
+)
+
+// The lifecycle tests run against a real Postgres. What this unit promises —
+// that an approval after the deadline does not count, that two sweepers resolve
+// a decision once between them — is a property of row locks and conditional
+// updates, and a fake store would be asserting that the fake behaves.
+
+const postgresImage = "postgres:17-alpine"
+
+var (
+	adminDSN string
+	dbSerial atomic.Int64
+)
+
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	container, err := tcpostgres.Run(ctx, postgresImage,
+		tcpostgres.WithDatabase("stamp"),
+		tcpostgres.WithUsername("stamp"),
+		tcpostgres.WithPassword("stamp"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "decision tests need a working Docker daemon: %v\n", err)
+		os.Exit(1)
+	}
+	adminDSN, err = container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connection string: %v\n", err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	if err := testcontainers.TerminateContainer(container); err != nil {
+		fmt.Fprintf(os.Stderr, "terminate container: %v\n", err)
+	}
+	os.Exit(code)
+}
+
+// testMaxConns sizes the pool. Every claimed audit writer pins one connection
+// for its whole life, so a test with two sweepers needs its two writers plus the
+// connections their transactions and the test's own queries take. Leaving this
+// to the pgxpool default makes the concurrency test pass or hang depending on
+// the machine's core count.
+const testMaxConns = 24
+
+func freshDB(t *testing.T) string {
+	t.Helper()
+	name := fmt.Sprintf("d%d_%d", time.Now().UnixNano()%1e9, dbSerial.Add(1))
+
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		t.Fatalf("connect to admin database: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, `CREATE DATABASE `+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
+	}
+
+	cfg, err := pgxpool.ParseConfig(adminDSN)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=disable",
+		cfg.ConnConfig.User, cfg.ConnConfig.Password, cfg.ConnConfig.Host, cfg.ConnConfig.Port, name)
+}
+
+// clock is the test clock. Deadline behaviour is the subject of most of these
+// tests, so it is driven rather than waited on.
+type clock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func newClock() *clock {
+	return &clock{at: time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+func (c *clock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(d)
+}
+
+// harness is a migrated database, a seeded policy set, an evaluator over it and
+// a decision service wired to all three.
+type harness struct {
+	t      *testing.T
+	store  *store.Store
+	writer *store.AuditWriter
+	clock  *clock
+	svc    *decision.Service
+	schema *policy.Schema
+	seeded []engine.PolicyVersion
+}
+
+type harnessOptions struct {
+	maxOutstanding int
+	ttl            time.Duration
+	obligations    []decision.Obligation
+	policies       []*policy.Policy
+}
+
+func newHarness(t *testing.T, opts harnessOptions) *harness {
+	t.Helper()
+	ctx := context.Background()
+	clk := newClock()
+
+	s, err := store.Open(ctx, store.Config{DSN: freshDB(t), MaxConns: testMaxConns, Now: clk.Now})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(s.Close)
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	h := &harness{t: t, store: s, clock: clk, schema: testSchema()}
+	if _, err := store.PutSchema(ctx, s.Pool(), h.schema, store.OriginForm, "tester"); err != nil {
+		t.Fatalf("put schema: %v", err)
+	}
+	schemaRec, err := store.LatestSchema(ctx, s.Pool())
+	if err != nil {
+		t.Fatalf("latest schema: %v", err)
+	}
+	for _, p := range opts.policies {
+		rec, err := store.PutPolicy(ctx, s.Pool(), store.PolicyInput{
+			Policy: p, SchemaVersion: schemaRec.Version, Origin: store.OriginForm, Author: "tester",
+		})
+		if err != nil {
+			t.Fatalf("put policy %s: %v", p.ID, err)
+		}
+		stored, err := rec.Policy()
+		if err != nil {
+			t.Fatalf("decode stored policy %s: %v", p.ID, err)
+		}
+		h.seeded = append(h.seeded, engine.PolicyVersion{
+			Version: strconv.FormatInt(rec.Version, 10),
+			Policy:  *stored,
+		})
+	}
+
+	h.writer = h.claimWriter("decide-1")
+	h.svc = h.newService(h.writer, opts)
+	return h
+}
+
+func (h *harness) claimWriter(id string) *store.AuditWriter {
+	h.t.Helper()
+	w, err := h.store.ClaimWriter(context.Background(), id, "test")
+	if err != nil {
+		h.t.Fatalf("claim writer %s: %v", id, err)
+	}
+	h.t.Cleanup(func() { _ = w.Close(context.Background()) })
+	return w
+}
+
+func (h *harness) newService(writer *store.AuditWriter, opts harnessOptions) *decision.Service {
+	h.t.Helper()
+	snap, err := engine.NewSnapshot("1", *h.schema, h.seeded)
+	if err != nil {
+		h.t.Fatalf("new snapshot: %v", err)
+	}
+	registry, err := challenge.NewRegistry(
+		&quorumHandler{writer: writer, pool: h.store.Pool()},
+		&delayHandler{},
+	)
+	if err != nil {
+		h.t.Fatalf("new challenge registry: %v", err)
+	}
+	cfg := decision.Config{
+		Store:          h.store,
+		Audit:          writer,
+		Evaluator:      engine.NewDecideEvaluator(snap),
+		Challenges:     registry,
+		TTL:            opts.ttl,
+		MaxOutstanding: opts.maxOutstanding,
+		Now:            h.clock.Now,
+	}
+	if opts.obligations != nil {
+		obligations := opts.obligations
+		cfg.Obligations = decision.ObligationSourceFunc(
+			func(_ context.Context, _ decision.ObligationRequest) ([]decision.Obligation, error) {
+				return obligations, nil
+			})
+	}
+	svc, err := decision.New(cfg)
+	if err != nil {
+		h.t.Fatalf("new service: %v", err)
+	}
+	return svc
+}
+
+// auditPayloads returns the payloads of every audit row of a kind about a
+// subject, oldest first.
+func (h *harness) auditPayloads(kind, subject string) []map[string]any {
+	h.t.Helper()
+	rows, err := h.store.Pool().Query(context.Background(), `
+		SELECT payload::text FROM audit_log
+		WHERE kind = $1 AND subject = $2 ORDER BY writer_id, seq`, kind, subject)
+	if err != nil {
+		h.t.Fatalf("read audit rows: %v", err)
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			h.t.Fatalf("scan audit row: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			h.t.Fatalf("decode audit payload: %v", err)
+		}
+		out = append(out, payload)
+	}
+	return out
+}
+
+// sweepOnce runs one sweep of svc and fails the test if it errors.
+func (h *harness) sweepOnce(svc *decision.Service) decision.SweepReport {
+	h.t.Helper()
+	sweeper, err := decision.NewSweeper(decision.SweeperConfig{Service: svc})
+	if err != nil {
+		h.t.Fatalf("new sweeper: %v", err)
+	}
+	report, err := sweeper.SweepOnce(context.Background())
+	if err != nil {
+		h.t.Fatalf("sweep: %v", err)
+	}
+	return report
+}
+
+func (h *harness) approvalCount(decisionID string, ordinal int) int {
+	h.t.Helper()
+	n, err := store.CountApprovals(context.Background(), h.store.Pool(), decisionID, ordinal, store.VerdictApprove)
+	if err != nil {
+		h.t.Fatalf("count approvals: %v", err)
+	}
+	return n
+}
+
+func (h *harness) decisionState(id string) store.DecisionState {
+	h.t.Helper()
+	d, err := store.GetDecision(context.Background(), h.store.Pool(), id)
+	if err != nil {
+		h.t.Fatalf("read decision %s: %v", id, err)
+	}
+	return d.State
+}
+
+// ---------------------------------------------------------------------------
+// fixtures: schema, policies, callers
+// ---------------------------------------------------------------------------
+
+func testSchema() *policy.Schema {
+	return &policy.Schema{
+		Entities: []policy.EntityType{
+			{Name: "user", Attributes: []policy.Attribute{{Name: "role", Type: policy.TypeString}}},
+			{Name: "account", Attributes: []policy.Attribute{{Name: "tier", Type: policy.TypeString}}},
+		},
+		Actions: []policy.Action{{Name: "transfer"}},
+	}
+}
+
+// gatedPolicy returns a policy demanding a quorum. Each call builds fresh
+// condition values: policy normalization rewrites the condition tree in place,
+// so two policies sharing one condition value would race under -race.
+func gatedPolicy(id string, threshold int, approvers ...string) *policy.Policy {
+	return &policy.Policy{
+		ID:        id,
+		Subject:   "user",
+		Resource:  "account",
+		Actions:   []string{"transfer"},
+		Condition: policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+		Challenges: []policy.Challenge{
+			policy.Quorum{Threshold: threshold, Approvers: policy.ApproverSet{Members: approvers}},
+		},
+	}
+}
+
+func delayedPolicy(id string, d time.Duration) *policy.Policy {
+	return &policy.Policy{
+		ID:         id,
+		Subject:    "user",
+		Resource:   "account",
+		Actions:    []string{"transfer"},
+		Condition:  policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+		Challenges: []policy.Challenge{policy.Delay{Duration: d}},
+	}
+}
+
+func openPolicy(id string) *policy.Policy {
+	return &policy.Policy{
+		ID:        id,
+		Subject:   "user",
+		Resource:  "account",
+		Actions:   []string{"transfer"},
+		Condition: policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+	}
+}
+
+func transferRequest(subject string) engine.Input {
+	return engine.Input{
+		Action:   "transfer",
+		Subject:  engine.Entity{Type: "user", ID: subject, Attributes: map[string]any{"role": "admin"}},
+		Resource: engine.Entity{Type: "account", ID: "acct-1", Attributes: map[string]any{"tier": "gold"}},
+	}
+}
+
+func workload(id string) *identity.Subject {
+	return &identity.Subject{Kind: identity.SubjectWorkload, Issuer: "https://idp.test", ID: id}
+}
+
+func user(id string) *identity.Subject {
+	return &identity.Subject{Kind: identity.SubjectUser, Issuer: "https://idp.test", ID: id}
+}
+
+// ---------------------------------------------------------------------------
+// challenge handlers
+//
+// These are test doubles for the handlers U20 and U11 own. They implement the
+// contract this unit fixes, which is the point: the lifecycle is exercised
+// through the same three verbs a real handler is called through.
+// ---------------------------------------------------------------------------
+
+type quorumDetail struct {
+	Threshold int      `json:"threshold"`
+	Approvers []string `json:"approvers"`
+}
+
+type quorumHandler struct {
+	writer *store.AuditWriter
+	pool   *pgxpool.Pool
+}
+
+func (q *quorumHandler) Kind() policy.ChallengeType { return policy.ChallengeQuorum }
+
+func (q *quorumHandler) Issue(_ context.Context, req challenge.IssueRequest) (challenge.IssueResult, error) {
+	spec, ok := req.Spec.(policy.Quorum)
+	if !ok {
+		return challenge.IssueResult{}, fmt.Errorf("%w: %T", challenge.ErrUnsupportedSpec, req.Spec)
+	}
+	return challenge.IssueResult{
+		State:  challenge.StatePending,
+		Detail: quorumDetail{Threshold: spec.Threshold, Approvers: spec.Approvers.Members},
+	}, nil
+}
+
+func (q *quorumHandler) Submit(ctx context.Context, req challenge.SubmitRequest) (challenge.SubmitResult, error) {
+	detail, err := decodeQuorumDetail(req.Detail)
+	if err != nil {
+		return challenge.SubmitResult{}, err
+	}
+	if !contains(detail.Approvers, req.Submitter.ID) {
+		return challenge.SubmitResult{}, fmt.Errorf("%w: %q", challenge.ErrNotTarget, req.Submitter.ID)
+	}
+	binding := sha256.Sum256(append([]byte(req.Instance.DecisionID), req.Decision.Obligations...))
+	_, err = q.writer.RecordApproval(ctx, store.NewApproval{
+		DecisionID:       req.Instance.DecisionID,
+		ChallengeOrdinal: req.Instance.Ordinal,
+		ApproverID:       req.Submitter.ID,
+		Verdict:          store.VerdictApprove,
+		BindingHash:      binding,
+	})
+	if err != nil && !errorIsConflict(err) {
+		return challenge.SubmitResult{}, err
+	}
+	have, err := q.count(ctx, req.Instance)
+	if err != nil {
+		return challenge.SubmitResult{}, err
+	}
+	return challenge.SubmitResult{State: quorumState(have, detail.Threshold), Have: have, Need: detail.Threshold}, nil
+}
+
+func (q *quorumHandler) Status(ctx context.Context, req challenge.StatusRequest) (challenge.Status, error) {
+	detail, err := decodeQuorumDetail(req.Detail)
+	if err != nil {
+		return challenge.Status{}, err
+	}
+	have, err := q.count(ctx, req.Instance)
+	if err != nil {
+		return challenge.Status{}, err
+	}
+	state := req.Stored
+	if state == challenge.StatePending {
+		state = quorumState(have, detail.Threshold)
+	}
+	return challenge.Status{State: state, Have: have, Need: detail.Threshold, Deadline: req.Deadline}, nil
+}
+
+func (q *quorumHandler) IsTarget(_ context.Context, req challenge.TargetRequest) (bool, error) {
+	detail, err := decodeQuorumDetail(req.Detail)
+	if err != nil {
+		return false, err
+	}
+	return contains(detail.Approvers, req.Subject.ID), nil
+}
+
+func (q *quorumHandler) count(ctx context.Context, in challenge.Instance) (int, error) {
+	return store.CountApprovals(ctx, q.pool, in.DecisionID, in.Ordinal, store.VerdictApprove)
+}
+
+func quorumState(have, need int) challenge.State {
+	if have >= need {
+		return challenge.StateSatisfied
+	}
+	return challenge.StatePending
+}
+
+func decodeQuorumDetail(raw json.RawMessage) (quorumDetail, error) {
+	var detail quorumDetail
+	if err := json.Unmarshal(raw, &detail); err != nil {
+		return quorumDetail{}, fmt.Errorf("%w: %w", challenge.ErrInvalidPayload, err)
+	}
+	return detail, nil
+}
+
+// delayHandler is the shape a delay challenge has: nothing to submit, and a
+// deadline whose passing means satisfied rather than failed. It is here because
+// that distinction is why the contract answers elapsed timers through Status.
+type delayHandler struct{}
+
+func (*delayHandler) Kind() policy.ChallengeType { return policy.ChallengeDelay }
+
+func (*delayHandler) Issue(_ context.Context, req challenge.IssueRequest) (challenge.IssueResult, error) {
+	spec, ok := req.Spec.(policy.Delay)
+	if !ok {
+		return challenge.IssueResult{}, fmt.Errorf("%w: %T", challenge.ErrUnsupportedSpec, req.Spec)
+	}
+	deadline := req.Now.Add(spec.Duration)
+	return challenge.IssueResult{
+		State:    challenge.StatePending,
+		Deadline: &deadline,
+		Detail:   map[string]any{"duration_seconds": spec.Duration.Seconds()},
+	}, nil
+}
+
+func (*delayHandler) Submit(_ context.Context, _ challenge.SubmitRequest) (challenge.SubmitResult, error) {
+	return challenge.SubmitResult{}, challenge.ErrNotSubmittable
+}
+
+func (*delayHandler) Status(_ context.Context, req challenge.StatusRequest) (challenge.Status, error) {
+	state := req.Stored
+	if state == challenge.StatePending && req.Deadline != nil && !req.Now.Before(*req.Deadline) {
+		state = challenge.StateSatisfied
+	}
+	return challenge.Status{State: state, Deadline: req.Deadline}, nil
+}
+
+func contains(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func errorIsConflict(err error) bool {
+	return errors.Is(err, store.ErrConflict)
+}
