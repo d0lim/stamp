@@ -369,6 +369,28 @@ func PreservesCompletion(stored json.RawMessage, dec challenge.DecisionContext) 
 	return strings.EqualFold(hex.EncodeToString(sum[:]), detail.ContextHash), nil
 }
 
+// PreservesRequirement reports whether a challenge issued under stored detail
+// still asks for the classes spec declares.
+//
+// It is the half of the revision question [PreservesCompletion] cannot see. A
+// revision that changes only `acr_values` leaves the decision's content — and
+// therefore its context hash — exactly as it was, so the hash says "unchanged"
+// about a challenge that is now enforcing a requirement nobody declared, or
+// failing to enforce one somebody just did.
+//
+// The comparison runs over the normalized lists so that reordering a
+// declaration, or writing a class twice, is not a change: the frozen side was
+// normalized at issue by the same function.
+//
+// It is fail-closed like its sibling: an unreadable detail answers false.
+func PreservesRequirement(stored json.RawMessage, spec policy.MFA) (bool, error) {
+	detail, err := DecodeDetail(stored)
+	if err != nil {
+		return false, err
+	}
+	return slices.Equal(detail.RequiredACRValues, normalizeACR(spec.ACRValues)), nil
+}
+
 // ReferenceCode derives the display code carried in `binding_message`.
 //
 // It is short, uppercase, space-free and made only of characters U0 saw an IdP

@@ -400,6 +400,21 @@ func (w *AuditWriter) SetChallengeState(ctx context.Context, decisionID string, 
 	})
 }
 
+// RefreshNextDeadline recomputes min(expires_at, unmet challenge timers) inside
+// the caller's transaction.
+//
+// It is exported because the revision effect hook writes challenge rows
+// directly — it has to, since the audit writer holds its append mutex across the
+// whole audited transaction and a store helper that opened its own would
+// deadlock against it — and a challenge timer that moved without this column
+// moving is a sweeper that wakes at the old instant.
+//
+// It takes a [Querier] rather than opening a transaction for exactly that
+// reason: it is a statement the caller runs, never a transaction it starts.
+func RefreshNextDeadline(ctx context.Context, q Querier, decisionID string) error {
+	return refreshNextDeadline(ctx, q, decisionID)
+}
+
 // refreshNextDeadline recomputes min(expires_at, unmet challenge timers).
 //
 // It is computed in SQL so that the invariant the column carries cannot drift

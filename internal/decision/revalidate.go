@@ -28,6 +28,10 @@ package decision
 // revalidated in another would leave a window in which a decision resolves under
 // a policy that is no longer in force — the window D10 rejected git-as-store to
 // avoid.
+//
+// The fourth rule is the one the challenge kinds add: re-issuing a challenge is
+// not a neutral way to bring it up to date. It is neutral for a quorum and for
+// nothing else. See [Revalidator.rebindChallenges].
 
 import (
 	"context"
@@ -42,6 +46,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/d0lim/stamp/internal/challenge"
+	"github.com/d0lim/stamp/internal/challenge/mfa"
 	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/store"
@@ -399,12 +404,23 @@ func (r *Revalidator) revaluate(ctx context.Context, tx pgx.Tx, ap *store.Append
 	}
 	out.Invalidated = invalidated
 
-	settled, err := allChallengesSatisfied(ctx, tx, d.ID)
+	total, satisfied, failed, err := challengeTally(ctx, tx, d.ID)
 	if err != nil {
 		return Outcome{}, err
 	}
 	switch {
-	case settled:
+	case failed > 0:
+		// A challenge the rebinding could not carry forward — an external round
+		// trip a revision pointed somewhere else — denies here rather than
+		// waiting for the sweeper. The sweeper would get there, because a failed
+		// challenge fails the decision on the next advance, but a revision that
+		// left a decision provably doomed sitting pending is a decision whose
+		// caller is still waiting for an answer this transaction already knows.
+		if err := r.resolve(ctx, tx, ap, d, Fail, ReasonChallengeFailed, req.RevisionID); err != nil {
+			return Outcome{}, err
+		}
+		out.Disposition = DispositionDenied
+	case total == satisfied:
 		if err := r.resolve(ctx, tx, ap, d, Satisfy, ReasonChallengeSatisfied, req.RevisionID); err != nil {
 			return Outcome{}, err
 		}
@@ -499,7 +515,19 @@ func (r *Revalidator) resolve(ctx context.Context, tx pgx.Tx, ap *store.Appender
 // or a different number of them — every progress row is rebuilt and every
 // approval goes with it. There is no correspondence to preserve in that case,
 // and inventing one is how an approval collected for a quorum ends up counted
-// toward a challenge nobody approved.
+// toward a challenge nobody approved. A rebuilt list does restart timers, and
+// that is correct: a decision whose challenge list changed is on genuinely
+// different terms.
+//
+// When the shape holds, each kind is re-bound by its own rule, and the rules do
+// not generalize. Only a quorum may be re-issued freely, because issuing one is
+// pure. Re-issuing the other three has a side effect the subject can see: an mfa
+// re-issue rotates a correlator somebody is holding, a delay re-issue restarts a
+// wait that has been partly served, and an external re-issue posts a second
+// webhook — from inside this transaction, while it holds a row lock on every
+// open decision. So the switch below is not a dispatch table over four
+// interchangeable cases; it is four different answers to "what does a revision
+// do to work already in flight".
 func (r *Revalidator) rebindChallenges(ctx context.Context, tx pgx.Tx, ap *store.Appender,
 	d store.Decision, specs []policy.Challenge, req RevalidateRequest, now time.Time,
 ) (bool, int, error) {
@@ -510,88 +538,451 @@ func (r *Revalidator) rebindChallenges(ctx context.Context, tx pgx.Tx, ap *store
 	decisionCtx := contextOf(d)
 
 	if !sameShape(stored, specs) {
-		invalidated, err := countApprovalsOf(ctx, tx, d.ID)
-		if err != nil {
-			return false, 0, err
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM challenge_progress WHERE decision_id = $1`, d.ID); err != nil {
-			return false, 0, fmt.Errorf("%w: clearing challenges of %q: %w", ErrRevalidation, d.ID, err)
-		}
-		for ordinal, spec := range specs {
-			if err := r.issue(ctx, tx, d, decisionCtx, ordinal, spec, now); err != nil {
-				return false, 0, err
-			}
-		}
-		if invalidated > 0 {
-			if err := auditInvalidation(ctx, ap, d.ID, -1, invalidated,
-				"the revision changed which challenges this decision carries", req.RevisionID); err != nil {
-				return false, 0, err
-			}
-		}
-		return true, invalidated, nil
+		return r.reopenChallenges(ctx, tx, ap, d, decisionCtx, specs, req, now)
 	}
 
-	rebound, invalidated := false, 0
+	rebound, invalidated, timerMoved := false, 0, false
 	for ordinal, spec := range specs {
-		if spec.ChallengeType() != policy.ChallengeQuorum {
-			// Only a quorum carries a binding hash in v1. The other kinds arrive
-			// with U10 and U11 and will re-bind here the same way; until then
-			// their progress rows are left exactly as they were rather than
-			// re-issued, because re-issuing a delay would restart its timer.
-			continue
+		in := rebind{
+			decision: d,
+			context:  decisionCtx,
+			ordinal:  ordinal,
+			spec:     spec,
+			stored:   stored[ordinal],
+			revision: req.RevisionID,
+			now:      now,
 		}
-		handler, err := r.challenges.Handler(spec.ChallengeType())
+		var out rebound1
+		switch spec.ChallengeType() {
+		case policy.ChallengeQuorum:
+			out, err = r.rebindQuorum(ctx, tx, ap, in)
+		case policy.ChallengeMFA:
+			out, err = r.rebindMFA(ctx, tx, in)
+		case policy.ChallengeDelay:
+			out, err = r.rebindDelay(ctx, tx, in)
+		case policy.ChallengeExternal:
+			out, err = r.rebindExternal(ctx, tx, in)
+		default:
+			// A kind with no rule here is a kind nobody decided what a revision
+			// does to. Leaving it alone would be a decision made by omission, so
+			// it stops the revision instead.
+			err = fmt.Errorf("%w: %s carries no rebinding rule", ErrRevalidation, in.instance())
+		}
 		if err != nil {
 			return false, 0, err
 		}
-		instance := challenge.Instance{DecisionID: d.ID, Ordinal: ordinal, Kind: spec.ChallengeType()}
-		issued, err := handler.Issue(ctx, challenge.IssueRequest{
-			Instance: instance, Spec: spec, Decision: decisionCtx, Now: now,
-		})
-		if err != nil {
-			return false, 0, fmt.Errorf("%w: re-issuing %s: %w", ErrRevalidation, instance, err)
-		}
-		detail, err := json.Marshal(issued.Detail)
-		if err != nil {
-			return false, 0, fmt.Errorf("%w: encoding re-issued detail for %s: %w", ErrRevalidation, instance, err)
-		}
-		preserved, err := PreservesApprovals(stored[ordinal].Detail, detail)
-		if err != nil {
+		rebound = rebound || out.changed
+		invalidated += out.invalidated
+		timerMoved = timerMoved || out.timerMoved
+	}
+	if timerMoved {
+		if err := store.RefreshNextDeadline(ctx, tx, d.ID); err != nil {
 			return false, 0, err
-		}
-		if preserved && string(stored[ordinal].Detail) == string(detail) {
-			continue
-		}
-		rebound = true
-
-		dropped := 0
-		if !preserved {
-			dropped, err = dropApprovals(ctx, tx, d.ID, ordinal)
-			if err != nil {
-				return false, 0, err
-			}
-			invalidated += dropped
-		}
-		state, err := quorumStateAfter(ctx, tx, d.ID, ordinal, detail)
-		if err != nil {
-			return false, 0, err
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE challenge_progress
-			SET detail = $3, state = $4,
-			    satisfied_at = CASE WHEN $4 = 'satisfied' THEN satisfied_at ELSE NULL END
-			WHERE decision_id = $1 AND ordinal = $2`,
-			d.ID, ordinal, detail, string(state)); err != nil {
-			return false, 0, fmt.Errorf("%w: rebinding %s: %w", ErrRevalidation, instance, err)
-		}
-		if !preserved {
-			if err := auditInvalidation(ctx, ap, d.ID, ordinal, dropped,
-				"the approval binding hash changed", req.RevisionID); err != nil {
-				return false, 0, err
-			}
 		}
 	}
 	return rebound, invalidated, nil
+}
+
+// rebind is one challenge's rebinding input. It is a struct because the four
+// rules take almost the same arguments and a seven-parameter signature repeated
+// four times is four places to get the order wrong.
+type rebind struct {
+	decision store.Decision
+	context  challenge.DecisionContext
+	ordinal  int
+	spec     policy.Challenge
+	stored   store.ChallengeProgress
+	revision string
+	now      time.Time
+}
+
+func (in rebind) instance() challenge.Instance {
+	return challenge.Instance{
+		DecisionID: in.decision.ID, Ordinal: in.ordinal, Kind: in.spec.ChallengeType(),
+	}
+}
+
+// rebound1 is what one rebinding did.
+type rebound1 struct {
+	// changed reports that the stored row moved.
+	changed bool
+	// invalidated counts approvals dropped.
+	invalidated int
+	// timerMoved reports that the row's deadline column was rewritten, so the
+	// decision's scheduler column has to be recomputed.
+	timerMoved bool
+}
+
+// reopenChallenges rebuilds every progress row from scratch.
+func (r *Revalidator) reopenChallenges(ctx context.Context, tx pgx.Tx, ap *store.Appender,
+	d store.Decision, decisionCtx challenge.DecisionContext, specs []policy.Challenge,
+	req RevalidateRequest, now time.Time,
+) (bool, int, error) {
+	invalidated, err := countApprovalsOf(ctx, tx, d.ID)
+	if err != nil {
+		return false, 0, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM challenge_progress WHERE decision_id = $1`, d.ID); err != nil {
+		return false, 0, fmt.Errorf("%w: clearing challenges of %q: %w", ErrRevalidation, d.ID, err)
+	}
+	for ordinal, spec := range specs {
+		if err := r.issue(ctx, tx, d, decisionCtx, ordinal, spec, now); err != nil {
+			return false, 0, err
+		}
+	}
+	// The rebuilt rows carry their own timers, and the decision's scheduler
+	// column summarizes them. Without this the sweeper would wake for the
+	// deadline of a challenge that no longer exists.
+	if err := store.RefreshNextDeadline(ctx, tx, d.ID); err != nil {
+		return false, 0, err
+	}
+	if invalidated > 0 {
+		if err := auditInvalidation(ctx, ap, d.ID, -1, invalidated,
+			"the revision changed which challenges this decision carries", req.RevisionID); err != nil {
+			return false, 0, err
+		}
+	}
+	return true, invalidated, nil
+}
+
+// rebindQuorum re-issues a quorum and keeps the approvals whose binding hash
+// survived (R31).
+//
+// Re-issuing is safe here and nowhere else in this file: opening a quorum
+// resolves an approver set and computes a hash, and does nothing a person or
+// another system can observe.
+func (r *Revalidator) rebindQuorum(ctx context.Context, tx pgx.Tx, ap *store.Appender, in rebind) (rebound1, error) {
+	detail, err := r.reissue(ctx, in)
+	if err != nil {
+		return rebound1{}, err
+	}
+	preserved, err := PreservesApprovals(in.stored.Detail, detail)
+	if err != nil {
+		return rebound1{}, err
+	}
+	if preserved && string(in.stored.Detail) == string(detail) {
+		return rebound1{}, nil
+	}
+
+	dropped := 0
+	if !preserved {
+		dropped, err = dropApprovals(ctx, tx, in.decision.ID, in.ordinal)
+		if err != nil {
+			return rebound1{}, err
+		}
+	}
+	state, err := quorumStateAfter(ctx, tx, in.decision.ID, in.ordinal, detail)
+	if err != nil {
+		return rebound1{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE challenge_progress
+		SET detail = $3, state = $4,
+		    satisfied_at = CASE WHEN $4 = 'satisfied' THEN satisfied_at ELSE NULL END
+		WHERE decision_id = $1 AND ordinal = $2`,
+		in.decision.ID, in.ordinal, detail, string(state)); err != nil {
+		return rebound1{}, fmt.Errorf("%w: rebinding %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	if !preserved {
+		if err := auditInvalidation(ctx, ap, in.decision.ID, in.ordinal, dropped,
+			"the approval binding hash changed", in.revision); err != nil {
+			return rebound1{}, err
+		}
+	}
+	return rebound1{changed: true, invalidated: dropped}, nil
+}
+
+// rebindMFA leaves a step-up alone unless the revision moved what it is asking
+// about.
+//
+// Two questions decide it, and both have to answer yes for the row to be left
+// as it is. Does the decision still hash to what it hashed to at issue — the
+// question U10 exported [mfa.PreservesCompletion] for. And does the policy still
+// ask for the classes the challenge was opened under, which the hash cannot see
+// because `acr_values` is not decision content.
+//
+// The reason for leaving it alone rather than re-issuing on the safe side is
+// that a re-issue is not free: it rotates the correlator, which strands a
+// step-up the subject already has open in another tab, and it moves IssuedAt,
+// which is the lower bound an `auth_time` has to beat — so an authentication
+// already in flight would come back too old to count. A satisfied step-up stays
+// satisfied; a pending one keeps the prompt somebody is looking at.
+//
+// The `acr_values` question is answered by re-issuing rather than by patching
+// the stored detail, and in that direction for both a tightened and a loosened
+// requirement. Tightened, leaving the row would let an authentication the policy
+// no longer accepts satisfy the challenge. Loosened, leaving it would ask the
+// subject for a class nobody declared, which at worst is a challenge that cannot
+// be met at all. The handler's own re-issue suppression is keyed on the class
+// lists as well as the context hash, so a genuinely unchanged requirement inside
+// the suppression window still costs no prompt.
+func (r *Revalidator) rebindMFA(ctx context.Context, tx pgx.Tx, in rebind) (rebound1, error) {
+	spec, ok := in.spec.(policy.MFA)
+	if !ok {
+		return rebound1{}, fmt.Errorf("%w: %s is declared %T", ErrRevalidation, in.instance(), in.spec)
+	}
+	// Fail closed in the same direction PreservesApprovals does: a detail this
+	// build cannot read stops the revision rather than being re-issued over.
+	bound, err := mfa.PreservesCompletion(in.stored.Detail, in.context)
+	if err != nil {
+		return rebound1{}, fmt.Errorf("%w: %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	if bound {
+		asked, rerr := mfa.PreservesRequirement(in.stored.Detail, spec)
+		if rerr != nil {
+			return rebound1{}, fmt.Errorf("%w: %s: %w", ErrRevalidation, in.instance(), rerr)
+		}
+		if asked {
+			return rebound1{}, nil
+		}
+	}
+
+	detail, err := r.reissue(ctx, in)
+	if err != nil {
+		return rebound1{}, err
+	}
+	if string(in.stored.Detail) == string(detail) {
+		return rebound1{}, nil
+	}
+	// A fresh issue carries no consumption, so writing it is what clears the
+	// spent correlator; the state goes back with it, because a satisfaction
+	// recorded against material nobody is being asked about any more is not a
+	// satisfaction.
+	if _, err := tx.Exec(ctx, `
+		UPDATE challenge_progress
+		SET detail = $3, state = 'pending', satisfied_at = NULL
+		WHERE decision_id = $1 AND ordinal = $2`,
+		in.decision.ID, in.ordinal, detail); err != nil {
+		return rebound1{}, fmt.Errorf("%w: rebinding %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	return rebound1{changed: true}, nil
+}
+
+// rebindDelay adjusts a running wait without ever restarting it.
+//
+// [Delay.Issue] computes ReleaseAt as now plus the declared duration, so calling
+// it here would restart a wait the subject has already partly served — on every
+// revaluation, including revisions that had nothing to do with this decision.
+// The wait's start is therefore recovered from what the detail already froze:
+// ReleaseAt minus the duration it was opened under. A revised duration is
+// measured from that instant, never from now. Shortening a two-hour wait to one
+// hour ninety minutes in ends it; `now + newDuration` would have added another
+// hour to a wait that was already over.
+//
+// The cancellation authority is re-resolved and rewritten on its own, leaving
+// the release instant and any recorded cancellation exactly where they are. A
+// revision may change who could have stopped a wait. It may not un-stop one.
+func (r *Revalidator) rebindDelay(ctx context.Context, tx pgx.Tx, in rebind) (rebound1, error) {
+	spec, ok := in.spec.(policy.Delay)
+	if !ok {
+		return rebound1{}, fmt.Errorf("%w: %s is declared %T", ErrRevalidation, in.instance(), in.spec)
+	}
+	if spec.Duration <= 0 {
+		return rebound1{}, fmt.Errorf("%w: %s: a delay of %s is not a wait",
+			ErrRevalidation, in.instance(), spec.Duration)
+	}
+	stored, err := challenge.DecodeDelayDetail(in.stored.Detail)
+	if err != nil {
+		return rebound1{}, fmt.Errorf("%w: %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	opened, err := time.ParseDuration(stored.Duration)
+	if err != nil {
+		// Without the duration it was opened under there is no way to find the
+		// instant the wait started, and every alternative — restarting it,
+		// leaving it, guessing — is a wait of the wrong length.
+		return rebound1{}, fmt.Errorf("%w: %s: the stored wait records duration %q: %w",
+			ErrRevalidation, in.instance(), stored.Duration, err)
+	}
+
+	next := stored
+	timerMoved := false
+	if opened != spec.Duration {
+		issuedAt := stored.ReleaseAt.Add(-opened)
+		next.ReleaseAt = issuedAt.Add(spec.Duration)
+		next.Duration = spec.Duration.String()
+		timerMoved = true
+	}
+	authorityMoved, err := r.rebindCancelAuthority(ctx, &next, spec, in)
+	if err != nil {
+		return rebound1{}, err
+	}
+	if !timerMoved && !authorityMoved {
+		return rebound1{}, nil
+	}
+
+	detail, err := json.Marshal(next)
+	if err != nil {
+		return rebound1{}, fmt.Errorf("%w: encoding the rebound detail for %s: %w",
+			ErrRevalidation, in.instance(), err)
+	}
+	if !timerMoved {
+		// Only the authority moved. The timer column and the state are not
+		// touched at all, so there is nothing here that could end a wait early
+		// or walk a recorded cancellation back.
+		if _, err := tx.Exec(ctx, `
+			UPDATE challenge_progress SET detail = $3 WHERE decision_id = $1 AND ordinal = $2`,
+			in.decision.ID, in.ordinal, detail); err != nil {
+			return rebound1{}, fmt.Errorf("%w: rebinding %s: %w", ErrRevalidation, in.instance(), err)
+		}
+		return rebound1{changed: true}, nil
+	}
+
+	// The state comes from the handler rather than from a comparison here: a
+	// release instant that has arrived means satisfied for a delay and failed
+	// for everything else, and only the handler knows which it is. A recorded
+	// cancellation is terminal and Status does not walk it back.
+	deadline := next.ReleaseAt
+	state, err := r.statusOf(ctx, in, detail, &deadline)
+	if err != nil {
+		return rebound1{}, err
+	}
+	stamped := deadline
+	if stamped.After(in.decision.ExpiresAt) {
+		// A challenge may not outlive the decision it hangs off, and a revision
+		// does not extend a decision's own expiry. The detail keeps the truthful
+		// release instant; the scheduler column keeps the earlier of the two.
+		stamped = in.decision.ExpiresAt
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE challenge_progress
+		SET detail = $3, deadline = $4, state = $5,
+		    satisfied_at = CASE WHEN $5 = 'satisfied' THEN COALESCE(satisfied_at, now()) ELSE NULL END
+		WHERE decision_id = $1 AND ordinal = $2`,
+		in.decision.ID, in.ordinal, detail, stamped, string(storeChallengeState(state))); err != nil {
+		return rebound1{}, fmt.Errorf("%w: rebinding %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	return rebound1{changed: true, timerMoved: true}, nil
+}
+
+// rebindCancelAuthority re-resolves a delay's cancellation authority and reports
+// whether it moved.
+func (r *Revalidator) rebindCancelAuthority(ctx context.Context, detail *challenge.DelayDetail,
+	spec policy.Delay, in rebind,
+) (bool, error) {
+	if spec.CancellableBy == nil {
+		if detail.CancellableBy == nil {
+			return false, nil
+		}
+		detail.CancellableBy = nil
+		return true, nil
+	}
+	handler, err := r.challenges.Handler(policy.ChallengeDelay)
+	if err != nil {
+		return false, err
+	}
+	resolver, ok := handler.(challenge.CancelAuthorityResolver)
+	if !ok {
+		return false, fmt.Errorf("%w: %s: the delay handler cannot re-resolve a cancellation authority",
+			ErrRevalidation, in.instance())
+	}
+	resolved, err := resolver.ResolveCancelAuthority(ctx, *spec.CancellableBy, in.context)
+	if err != nil {
+		return false, fmt.Errorf("%w: re-resolving the cancellation authority of %s: %w",
+			ErrRevalidation, in.instance(), err)
+	}
+	if detail.CancellableBy != nil && detail.CancellableBy.Equal(resolved) {
+		return false, nil
+	}
+	detail.CancellableBy = &resolved
+	return true, nil
+}
+
+// rebindExternal answers for a round trip that is already out.
+//
+// A target the revision left alone is left completely alone, nonce included. The
+// nonce is what binds one answer to one issuance, so rotating it would
+// invalidate a callback the target is already holding — for a revision that did
+// not change the question.
+//
+// A target the revision changed fails the challenge instead of being re-issued.
+// U11 recommends it and the reason is structural rather than stylistic:
+// [External.Issue] performs a network POST, and this runs inside the transaction
+// that is landing the revision, holding a row lock on every open decision. A
+// webhook sent from there is a remote system's latency added to a lock hold.
+// Failing is also the fail-closed answer — the decision denies — and it is what
+// the house does everywhere else a round trip could not be completed.
+func (r *Revalidator) rebindExternal(ctx context.Context, tx pgx.Tx, in rebind) (rebound1, error) {
+	spec, ok := in.spec.(policy.External)
+	if !ok {
+		return rebound1{}, fmt.Errorf("%w: %s is declared %T", ErrRevalidation, in.instance(), in.spec)
+	}
+	stored, err := challenge.DecodeExternalDetail(in.stored.Detail)
+	if err != nil {
+		return rebound1{}, fmt.Errorf("%w: %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	if strings.TrimSpace(spec.Target) == stored.Target {
+		return rebound1{}, nil
+	}
+	if stored.Failure != "" {
+		// Already failed for some other reason. Overwriting why would lose the
+		// operational story the audit trail is for.
+		return rebound1{}, nil
+	}
+
+	next := stored
+	next.Failure = challenge.ExternalFailureRetargeted
+	detail, err := json.Marshal(next)
+	if err != nil {
+		return rebound1{}, fmt.Errorf("%w: encoding the rebound detail for %s: %w",
+			ErrRevalidation, in.instance(), err)
+	}
+	// The timer goes with the wait, as it does at issue: a failed challenge has
+	// nothing to wake up for, and a deadline on it would have the sweeper claim
+	// a decision that is finished.
+	if _, err := tx.Exec(ctx, `
+		UPDATE challenge_progress
+		SET detail = $3, state = 'failed', deadline = NULL, satisfied_at = NULL
+		WHERE decision_id = $1 AND ordinal = $2`,
+		in.decision.ID, in.ordinal, detail); err != nil {
+		return rebound1{}, fmt.Errorf("%w: rebinding %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	return rebound1{changed: true, timerMoved: true}, nil
+}
+
+// reissue opens a challenge again and returns the detail to store. It is only
+// reached from the two paths where issuing has no observable side effect.
+func (r *Revalidator) reissue(ctx context.Context, in rebind) (json.RawMessage, error) {
+	handler, err := r.challenges.Handler(in.spec.ChallengeType())
+	if err != nil {
+		return nil, err
+	}
+	issued, err := handler.Issue(ctx, challenge.IssueRequest{
+		Instance: in.instance(), Spec: in.spec, Decision: in.context, Now: in.now,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: re-issuing %s: %w", ErrRevalidation, in.instance(), err)
+	}
+	detail, err := json.Marshal(issued.Detail)
+	if err != nil {
+		return nil, fmt.Errorf("%w: encoding re-issued detail for %s: %w",
+			ErrRevalidation, in.instance(), err)
+	}
+	return detail, nil
+}
+
+// statusOf asks a handler where a challenge stands under a rewritten detail.
+func (r *Revalidator) statusOf(ctx context.Context, in rebind,
+	detail json.RawMessage, deadline *time.Time,
+) (challenge.State, error) {
+	handler, err := r.challenges.Handler(in.spec.ChallengeType())
+	if err != nil {
+		return "", err
+	}
+	status, err := handler.Status(ctx, challenge.StatusRequest{
+		Instance: in.instance(),
+		Decision: in.context,
+		Detail:   detail,
+		Stored:   challengeState(in.stored.State),
+		Deadline: deadline,
+		Now:      in.now,
+	})
+	if err != nil {
+		return "", fmt.Errorf("%w: reading %s after rebinding: %w", ErrRevalidation, in.instance(), err)
+	}
+	if !status.State.Valid() {
+		return "", fmt.Errorf("%w: %s reports state %q", ErrRevalidation, in.instance(), status.State)
+	}
+	return status.State, nil
 }
 
 func (r *Revalidator) issue(ctx context.Context, tx pgx.Tx, d store.Decision,
@@ -761,15 +1152,20 @@ func quorumStateAfter(ctx context.Context, q store.Querier, decisionID string, o
 	return store.ChallengePending, nil
 }
 
-func allChallengesSatisfied(ctx context.Context, q store.Querier, decisionID string) (bool, error) {
-	var total, satisfied int
-	err := q.QueryRow(ctx, `
-		SELECT count(*), count(*) FILTER (WHERE state = 'satisfied')
-		FROM challenge_progress WHERE decision_id = $1`, decisionID).Scan(&total, &satisfied)
+// challengeTally counts where a decision's challenges stand after rebinding.
+//
+// Failed and cancelled are counted together because they deny alike, which is
+// the same equivalence [Service.advance] makes on the settle path.
+func challengeTally(ctx context.Context, q store.Querier, decisionID string) (total, satisfied, failed int, err error) {
+	err = q.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE state = 'satisfied'),
+		       count(*) FILTER (WHERE state IN ('failed', 'cancelled'))
+		FROM challenge_progress WHERE decision_id = $1`, decisionID).Scan(&total, &satisfied, &failed)
 	if err != nil {
-		return false, fmt.Errorf("%w: reading challenge progress of %q: %w", ErrRevalidation, decisionID, err)
+		return 0, 0, 0, fmt.Errorf("%w: reading challenge progress of %q: %w", ErrRevalidation, decisionID, err)
 	}
-	return total == satisfied, nil
+	return total, satisfied, failed, nil
 }
 
 // ---------------------------------------------------------------------------

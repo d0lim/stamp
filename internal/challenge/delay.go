@@ -30,6 +30,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -64,6 +65,20 @@ type CancelAuthority struct {
 	// Source names the group source a resolved set came from, for the audit
 	// trail; the resolved names are in Members.
 	Source string `json:"source,omitempty"`
+}
+
+// Equal reports whether two resolved authorities admit the same identities.
+//
+// It is a field comparison rather than a document comparison because the
+// revision path asks it of a set it has just re-resolved against the set frozen
+// at issue: two resolutions of the same declaration have to compare equal, and
+// the resolved members are already deduplicated and sorted by
+// [normalizeMembers].
+func (a CancelAuthority) Equal(other CancelAuthority) bool {
+	return a.Mode == other.Mode &&
+		a.Claim == other.Claim &&
+		a.Source == other.Source &&
+		slices.Equal(a.Members, other.Members)
 }
 
 // admits answers whether an identity holds this authority.
@@ -180,6 +195,27 @@ func (d *Delay) Issue(ctx context.Context, req IssueRequest) (IssueResult, error
 		detail.CancellableBy = &authority
 	}
 	return IssueResult{State: StatePending, Detail: detail, Deadline: &release}, nil
+}
+
+// CancelAuthorityResolver turns a declared cancellation authority into the
+// resolved set a delay freezes.
+//
+// It is an optional interface rather than a fourth verb on [Handler] for the
+// reason stated in contract.go: adding a method to Handler is a major change,
+// adding an optional interface is a minor one. The one caller is the revision
+// effect hook, which needs to know whether a revision moved the authority
+// without re-issuing the wait — and comparing a declaration to a frozen
+// resolution is only possible by resolving the declaration again through the
+// handler that resolved it the first time.
+type CancelAuthorityResolver interface {
+	ResolveCancelAuthority(ctx context.Context, set policy.ApproverSet, dec DecisionContext) (CancelAuthority, error)
+}
+
+var _ CancelAuthorityResolver = (*Delay)(nil)
+
+// ResolveCancelAuthority implements [CancelAuthorityResolver].
+func (d *Delay) ResolveCancelAuthority(ctx context.Context, set policy.ApproverSet, dec DecisionContext) (CancelAuthority, error) {
+	return d.resolveAuthority(ctx, set, dec)
 }
 
 // resolveAuthority turns a declaration into the frozen cancellation set.
@@ -313,6 +349,17 @@ func (d *Delay) IsTarget(_ context.Context, req TargetRequest) (bool, error) {
 // ---------------------------------------------------------------------------
 // decoding
 // ---------------------------------------------------------------------------
+
+// DecodeDelayDetail reads a stored delay detail.
+//
+// It is exported for the revision effect hook, which has to read a running
+// wait's release instant and its frozen duration without re-issuing the
+// challenge — re-issuing would restart the wait from now, which is the one
+// thing a revision must never do to a subject who has already served part of
+// it.
+func DecodeDelayDetail(raw json.RawMessage) (DelayDetail, error) {
+	return decodeDelayDetail(raw)
+}
 
 func decodeDelayDetail(raw json.RawMessage) (DelayDetail, error) {
 	var detail DelayDetail
