@@ -30,15 +30,8 @@ function Placeholder({
   )
 }
 
-export function PoliciesScreen() {
-  return (
-    <Placeholder
-      title="정책"
-      owner="U15 (정책 폼 빌더)"
-      description="정책 목록과 폼 기반 저작, 개정 diff와 제출이 여기에 놓입니다."
-    />
-  )
-}
+// The policy seam is filled: `src/builder/` owns /policies/* now, and App.tsx
+// mounts it. The two placeholders below are still seams.
 
 export function InboxScreen() {
   return (
