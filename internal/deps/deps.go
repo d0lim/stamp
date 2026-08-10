@@ -17,6 +17,13 @@ import (
 	// U3 — AST-to-CEL compilation and the evaluation core.
 	_ "github.com/google/cel-go/cel"
 
+	// U2 — the policy exchange format, and the proto expression types the
+	// cel-go entry point for a programmatically built AST goes through. Both
+	// were already in the module graph as indirect requirements; U2 promotes
+	// them to direct ones without touching `go.sum`.
+	_ "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
+	_ "gopkg.in/yaml.v3"
+
 	// U4 — Postgres driver and schema migrations.
 	_ "github.com/golang-migrate/migrate/v4"
 	_ "github.com/jackc/pgx/v5"
