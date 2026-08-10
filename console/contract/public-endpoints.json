@@ -99,6 +99,13 @@
       "path": "/policies/revisions/{id}/withdrawal",
       "auth": "user",
       "group": "api"
+    },
+    {
+      "name": "schema-read",
+      "method": "GET",
+      "path": "/policies/schema",
+      "auth": "user",
+      "group": "api"
     }
   ]
 }

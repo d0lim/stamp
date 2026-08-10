@@ -99,6 +99,11 @@ func (k ChangeKind) Valid() bool {
 // After, a delete has only a Before, and the other two have both. A take-
 // ownership entry may carry an unchanged policy — moving a policy between
 // authoring paths is a change to who owns it, not necessarily to what it says.
+//
+// Before is not the submitter's to state. The governance path replaces it with
+// the policy the store holds before anything reads it (see before.go), so a
+// submission may leave it empty and a submission that fills it in wrongly is
+// corrected rather than believed. After is the proposal; Before is the fact.
 type Change struct {
 	Kind     ChangeKind
 	PolicyID string
@@ -116,6 +121,9 @@ type Change struct {
 // The schema sits alongside the policy changes because a fact source's failure
 // behaviour is declared there, and loosening one from deny to allow is a
 // weakening that no policy-level diff would ever show (R33).
+//
+// SchemaBefore, like [Change.Before], is the server's: the governance path fills
+// it from the schema in force whenever a delta proposes a schema at all.
 type Delta struct {
 	Changes      []Change
 	SchemaBefore *policy.Schema

@@ -356,6 +356,9 @@ func (a *App) build(ctx context.Context) error {
 		Policies: api.PolicyListerFunc(func(ctx context.Context) ([]store.PolicyRecord, error) {
 			return store.EffectivePolicies(ctx, s.Pool())
 		}),
+		Schema: api.SchemaReaderFunc(func(ctx context.Context) (store.SchemaRecord, error) {
+			return store.LatestSchema(ctx, s.Pool())
+		}),
 		Bootstrap: governance.Bootstrap(),
 	})
 	if err != nil {
