@@ -61,7 +61,7 @@ decisions: docs/decisions/stamp-decision-log.md
 
 - **R1.** `check()`는 stateless 단일 요청-응답 평가를 제공하며, 요청/응답 표면은 AuthZEN Access Evaluation 단건 API와 호환된다. 판정은 AuthZEN 정본 boolean으로 반환하고, STAMP 고유 정보는 응답 컨텍스트의 네임스페이스 키(`stamp.reason`, `stamp.obligations`, `stamp.policy_version`)에만 싣는다 — 표준 소비자가 컨텍스트를 무시해도 판정 해석이 동일해야 한다.
 - **R2.** `decide()`는 결정 객체를 생성한다. 결정 객체는 상태(pending / allow / deny / expired), 요구 challenge 목록과 수집 현황, 만료 시각, obligation 목록을 노출한다.
-- **R3.** challenge는 플러그인 계약으로 정의된다. 계약에는 quorum(m-of-n), mfa(위임 모드 — RFC 9470 step-up과 CIBA `binding_message`로 외부 IdP에 위임한 뒤 `acr`·`amr`·`auth_time` 검증 / direct 모드 — WebAuthn에 결정 컨텍스트 바인딩), delay(대기 시간, 지정 권한자의 취소 가능), external(외부 시스템 webhook 왕복)이 포함된다. v1 구현은 quorum·mfa(위임)·delay·external이며 direct 모드는 계약만 정의한다.
+- **R3.** challenge는 플러그인 계약으로 정의된다. 계약에는 quorum(m-of-n), mfa(위임 모드 — RFC 9470 step-up과 CIBA로 외부 IdP에 위임한 뒤 `acr`와 `auth_time`을 검증하고 `amr`은 존재할 때만 대조 / direct 모드 — WebAuthn에 결정 컨텍스트 바인딩), delay(대기 시간, 지정 권한자의 취소 가능), external(외부 시스템 webhook 왕복)이 포함된다. v1 구현은 quorum·mfa(위임)·delay·external이며 direct 모드는 계약만 정의한다.
 - **R4.** 결정 수명주기는 pending에서 allow / deny / expired로 전이하며, 만료 타이머와 승인 수집 API를 포함한다.
 - **R5.** 정책 개정 시 작성자는 즉시 재평가와 grandfather 중 선택하며 기본값은 재평가다. 재평가는 기수집 승인 중 신규 정족수 집합에 유효한 것을 보존하고 부족분만 추가 수집한다. **재평가는 결정 생성 시점에 고정된 사실 스냅샷을 재사용하며 source를 다시 조회하지 않는다.** 신 정책이 스냅샷에 없는 source를 새로 참조하는 경우에만 그 source를 조회해 스냅샷에 추가하며, 이때는 승인 바인딩 해시가 달라져 기존 승인이 전부 무효화되고 재수집된다.
 - **R6.** 정책 생성·수정·삭제는 STAMP 자신의 `decide()` 결정을 통과한다 — 저작 경로와 무관하게 같은 문을 지난다. 개정의 단위는 정책 하나 또는 정책 집합이며, 집합 개정은 단일 결정으로 처리해 부분 승인이 성립하지 않는다. 최초 설치 시 단독 관리자 모드로 시작하고, 명시적 잠금 액션 이후에는 정책 개정이 정족수를 요구한다.
@@ -139,7 +139,7 @@ decisions: docs/decisions/stamp-decision-log.md
 #### 릴리즈
 
 - **R27.** MIT 라이선스로 공개한다.
-- **R28.** 데모 번들을 동봉한다. docker-compose와 CIBA 또는 RFC 9470 step-up을 실제 지원하는 self-hostable IdP, 예제 정책으로 구성하며, 퀵스타트 문서만 따라 하면 설치부터 첫 판정까지 도달하고 F4·F5·F6이 종단 시연 가능하다. 기본 프로파일은 HTTP 인제스트 어댑터를 써서 브로커 없이 구성하고, Kafka 경로는 선택 오버레이로 제공해 어댑터 2종이 모두 시연되게 한다. 예제 정책은 파일 저작 포맷 그대로이며 퀵스타트가 apply로 적재한다.
+- **R28.** 데모 번들을 동봉한다. docker-compose와 Keycloak, 예제 정책으로 구성하며, 퀵스타트 문서만 따라 하면 설치부터 첫 판정까지 도달하고 F4·F5·F6이 종단 시연 가능하다. **데모의 위임 MFA 기본 경로는 RFC 9470 step-up 리다이렉트다** — Keycloak의 CIBA는 별도 decoupled authentication server를 요구하는데 그 서버는 동봉되지 않으므로, CIBA를 데모에 넣으면 인증 승인 UI를 직접 지어야 한다. CIBA는 계약과 클라이언트 구현으로 남기고 모의 OP로 검증한다. 기본 프로파일은 HTTP 인제스트 어댑터를 써서 브로커 없이 구성하고, Kafka 경로는 선택 오버레이로 제공해 어댑터 2종이 모두 시연되게 한다. 예제 정책은 파일 저작 포맷 그대로이며 퀵스타트가 apply로 적재한다.
 - **R29.** 컨테이너 이미지와 Helm 차트를 릴리즈 산출물로 제공하고, 릴리즈는 semver와 체인지로그를 따르며 산출물에 SBOM과 서명을 동반한다.
 
 ### Key Flows
@@ -158,7 +158,7 @@ decisions: docs/decisions/stamp-decision-log.md
   - **Covers:** R5, R7, R31.
 - **F4. 고액 출금 복합 승인** (MFA + quorum)
   - **Trigger:** 한도 초과 출금으로 decide() 호출.
-  - **Steps:** MFA challenge 발급(금액·수취인을 `binding_message`에 실어 IdP step-up 또는 CIBA 요청) → 요청자가 IdP에서 인증 완료 → STAMP가 `acr`·`amr`·`auth_time`과 상관자를 검증 → quorum challenge 병행 수집 → 모두 충족 시 allow.
+  - **Steps:** MFA challenge 발급(상관자에서 파생한 짧은 참조 코드를 `binding_message`에 싣고 IdP step-up 또는 CIBA 요청) → 요청자가 IdP에서 인증 완료 → STAMP가 `acr`·`auth_time`과 상관자를 검증 → quorum challenge 병행 수집 → 모두 충족 시 allow.
   - **Covers:** R2, R3, R4, R38.
 - **F5. 벨로시티 한도 검사** (비동기 source)
   - **Trigger:** 출금 요청으로 check() 또는 decide() 호출.
@@ -191,7 +191,7 @@ stateDiagram-v2
 - **AE3** *(R5, R31)* — 승인 1건이 수집된 pending 결정에 정족수만 3으로 올리는 개정이 기본값으로 발효되면, 임계값은 해시 입력이 아니므로 승인 해시가 동일해 보존되고 결정은 pending(1/3)이 된다.
 - **AE4** *(R6)* — 최초 설치 직후 단독 관리자가 첫 정책을 생성하고 잠금을 실행하면, 이후 모든 정책 개정은 정족수 결정을 통과해야만 발효된다.
 - **AE5** *(R13)* — 화이트리스트 source가 타임아웃하면 check()는 선언된 오류 동작대로 deny를 반환하고 장애 사유를 감사에 남긴다.
-- **AE6** *(R3, R38)* — 위임 MFA challenge의 완료 토큰이 `acr`·`amr`·`auth_time` 요구를 충족하지 않거나, 상관자가 다른 결정의 것이거나, 이미 소비된 토큰의 재제출이면 challenge는 미충족으로 남는다.
+- **AE6** *(R3, R38)* — 위임 MFA challenge의 완료 토큰이 `acr`·`auth_time` 요구를 충족하지 않거나, 존재하는 `amr`이 요구와 어긋나거나, 상관자가 다른 결정의 것이거나, 이미 소비된 토큰의 재제출이면 challenge는 미충족으로 남는다.
 - **AE7** *(R15)* — 24시간 출금 합계가 한도 직전일 때 한도를 넘기는 요청은 deny이며, 집계 상태 조회는 외부 왕복 없이 수행된다.
 - **AE8** *(R10, R19)* — 폼 빌더로 저작한 정책을 파일 포맷으로 내보내 다시 가져오면 의미 손실 없이 동일한 정책으로 로드된다.
 - **AE9** *(R28)* — 새 환경에서 퀵스타트 문서의 절차만 수행하면 데모 번들이 기동되고 예제 정책으로 첫 판정(check 1건, decide 1건, 벨로시티 deny 1건)이 성공하며, 스크립트 시작부터 첫 판정까지 소요 시간이 CI 아티팩트로 기록된다. 초기 목표는 15분이며 성능 목표와 같은 가정 지위다.
@@ -322,7 +322,8 @@ stateDiagram-v2
 - `STRATEGY.md` — 접근, 페르소나, 지표, not-working-on의 원천.
 - `docs/decisions/stamp-decision-log.md` — 되돌리기 비싼 선택의 근거와 기각한 대안.
 - [OpenID AuthZEN](https://openid.github.io/authzen/) — check 표면의 기준 스펙(2026-01 Final). [interop 하네스](https://github.com/openid/authzen)는 CI 적합성 게이트.
-- [RFC 9470 — OAuth 2.0 Step-up Authentication](https://www.rfc-editor.org/rfc/rfc9470), [OIDC CIBA](https://openid.net/specs/openid-client-initiated-backchannel-authentication-core-1_0.html) — 위임 MFA의 표준 경로. CIBA `binding_message`가 거래 컨텍스트 전달 훅.
+- [RFC 9470 — OAuth 2.0 Step-up Authentication](https://www.rfc-editor.org/rfc/rfc9470), [OIDC CIBA](https://openid.net/specs/openid-client-initiated-backchannel-authentication-core-1_0.html) — 위임 MFA의 표준 경로. `binding_message`는 거래 컨텍스트 전달 훅이지만 구현 제약이 크다 — `docs/spike-results.md` S1 참조.
+- `docs/spike-results.md` — U0가 실제로 돌려 확인한 IdP 능력·감사 처리량·적합성 하네스의 관측과 그로 인한 계획 개정.
 - [PSD2 SCA dynamic linking](https://mojoauth.com/blog/passkeys-psd2-sca-dynamic-linking-webauthn) — direct 모드의 규제 근거.
 - [Fireblocks TAP](https://www.fireblocks.com/platforms/governance-and-policies) — 정족수 설정 모델의 선례.
 - [Cerbos: YAML 구조 + CEL 조건](https://docs.cerbos.dev/cerbos/latest/policies/conditions.html) — 같은 분리의 기존 증명. [저장 드라이버](https://docs.cerbos.dev/cerbos/latest/configuration/storage.html)는 파일 소스와 API 관리가 either/or인 선례.
@@ -402,8 +403,8 @@ sequenceDiagram
     PEP->>DEC: decide(출금 250, 수취인 X)
     DEC->>DEC: 정책 평가 → challenge 목록 확정, 사실 스냅샷 고정
     DEC-->>PEP: pending (mfa 0/1, quorum 0/2, 만료 시각)
-    DEC->>IDP: step-up / CIBA 요청 (binding_message: 금액·수취인)
-    IDP-->>DEC: 완료 토큰 → acr·amr·auth_time과 상관자 검증
+    DEC->>IDP: step-up / CIBA 요청 (binding_message: 참조 코드)
+    IDP-->>DEC: 완료 토큰 → acr·auth_time과 상관자 검증
     APR->>DEC: 승인 제출 (Bearer 토큰, JWKS 검증)
     APR->>DEC: 승인 제출 (2/2 충족)
     DEC-->>PEP: allow + obligations (콜백 또는 폴링)
@@ -650,7 +651,7 @@ docs/                     # 퀵스타트, 계약 3종 스펙, 결정 로그
 - **Files:** `internal/store/migrations/`, `internal/store/policies.go`, `internal/store/decisions.go`, `internal/store/audit.go`, `internal/store/buckets.go`, `internal/store/grants.sql`, 대응 `_test.go`.
 - **Approach:** pgx와 golang-migrate로 시작한다(방향 제시이며 교체 가능).
 
-  감사 체인은 `(writer_id, seq, prev_hash)` 세그먼트로 분할해 인스턴스 로컬 append로 만들고, 주기적 체크포인트 행이 그 시점 전 writer의 head 해시를 함께 서명해 세그먼트를 교차 연결한다 — 이 구조가 무상태 수평 확장과 변조 탐지를 동시에 만족시킨다. 체크포인트는 앱 전용 키로 서명해 DB 밖 싱크로 내보내며, **기본 싱크는 append-only 로컬 파일이고 선택적으로 webhook 발신을 지원한다**(발신 대상은 egress 게이트 경유). check 경로는 배치 Merkle 루트 1행으로 append 빈도를 요청 수와 분리한다.
+  감사 체인은 `(writer_id, seq, prev_hash)` 세그먼트로 분할해 인스턴스 로컬 append로 만들고, 주기적 체크포인트 행이 그 시점 전 writer의 head 해시를 함께 서명해 세그먼트를 교차 연결한다 — 이 구조가 무상태 수평 확장과 변조 탐지를 동시에 만족시킨다. U0가 이 전제를 확인했고 — 세그먼트 append와 단일 전역 체인의 처리량이 자릿수로 갈렸다 — 동시에 하나를 못박았다. **`writer_id`는 인스턴스에 독점 귀속되어야 한다.** 두 프로세스가 같은 식별자를 잡으면 `(writer_id, seq)` PK 충돌로 append가 실패하며 이건 성능이 아니라 정확성 문제다. 식별자 획득은 기동 시 배타적 청구로 처리하고, 충돌은 재시도로 덮지 말고 기동 실패로 다룬다. 체크포인트는 앱 전용 키로 서명해 DB 밖 싱크로 내보내며, **기본 싱크는 append-only 로컬 파일이고 선택적으로 webhook 발신을 지원한다**(발신 대상은 egress 게이트 경유). check 경로는 배치 Merkle 루트 1행으로 append 빈도를 요청 수와 분리한다.
 
   **결정 만료는 `expires_at`으로 분리하고, `next_deadline`은 `min(expires_at, 미충족 challenge 타이머)`를 담는 스케줄러 컬럼과 `next_deadline_kind` 판별자로 정의한다.** 진입 시 마감 검사는 `expires_at`만 참조하고 스위퍼가 종류로 분기한다 — 한 컬럼에 만료와 delay 타이머를 겹치면 delay 시각이 들어간 순간 상태 조회가 그 결정을 만료로 판정한다.
 
@@ -709,7 +710,9 @@ docs/                     # 퀵스타트, 계약 3종 스펙, 결정 로그
 - **Approach:** AuthZEN 평가 요청 → 정책 매칭 → Fact 조회 → 평가 → 판정과 감사 기록. 하네스 시나리오의 데이터 모델을 STAMP 스키마로 이식하는 작업이 이 유닛 범위다. check 프로세스는 인스턴스 상태를 공유하지 않으며 컴파일 캐시는 로컬, 무효화는 정책 버전 폴링이다. 갱신 실패 시 유예 구간 동안은 구 버전으로 판정하되 staleness 메트릭을 노출하고, 유예를 넘긴 인스턴스만 fail-closed로 전환한다. 감사는 비동기이되 내구성 버퍼를 거치고 유실 카운터와 경보 임계를 노출한다. PEP·콘솔·외부 콜백 표면은 별도 리스너로 분리한다.
 
   시험 평가는 미저장 정책 문서와 샘플 입력을 받아 컴파일 캐시를 거치지 않고 1회성으로 평가하며, 매칭 여부·조건별 참/거짓·발동될 challenge를 반환하고 아무것도 저장하지 않는다.
-- **Execution note:** 착수 첫 작업으로 `openid/authzen` 하네스를 실제 실행해 CI 재현 가능성과 프로파일 선택 가능 여부를 확인하고 픽스처 규모를 확정한다. 재현 불가하거나 부분 적합성을 허용하지 않으면 적합성 범위 결정을 개정한다. 그다음 하네스를 실패 상태로 CI에 물리고 통과를 완료 증거로 삼는다.
+- **Execution note:** U0가 하네스를 실제로 돌려 확인했다 — 외부 서비스 의존이 없어 CI 재현 가능하고, 프로파일은 스펙 버전 인자로 고른다. 적합성 목표는 `authorization-api-1_0-01`의 Access Evaluation 40케이스이며 픽스처 이식 규모도 그만큼이다. 상류 픽스처가 갱신되므로 하네스 커밋을 벤더링이나 서브모듈로 고정한다.
+
+  **하네스는 그 자체로 게이트가 되지 않는다.** 러너가 결과와 무관하게 종료 코드 0으로 끝나며, 전 케이스가 ERROR인 실행도 0이었다. `conformance.yml`은 출력을 파싱해 PASS 아닌 줄이 하나라도 있으면 실패시키는 래퍼를 거쳐야 한다 — 없으면 CI는 항상 그린이고 게이트는 조용히 비어 있다. U1의 `branches:` 필터와 같은 종류의 실패다. 래퍼를 먼저 실패 상태로 물리고 통과를 완료 증거로 삼는다.
 - **Test scenarios:**
   - 화이트리스트 히트와 미스가 allow/deny로 즉시 반환된다.
   - challenge 보유 정책의 check 응답이 `requires_decision` deny로 나온다.
@@ -788,11 +791,17 @@ docs/                     # 퀵스타트, 계약 3종 스펙, 결정 로그
 
 ### U10. MFA challenge (위임)
 
-- **Goal:** step-up과 CIBA 기반 위임 MFA challenge, `acr`·`amr`·`auth_time` 검증. direct 모드는 계약 정의만.
+- **Goal:** step-up과 CIBA 기반 위임 MFA challenge, `acr`·`auth_time` 검증(`amr`은 선택 대조). direct 모드는 계약 정의만.
 - **Requirements:** R3(mfa), R38, R43.
 - **Dependencies:** U8, U20.
 - **Files:** `internal/challenge/mfa/delegated.go`, `internal/challenge/mfa/contract.go`, `internal/identity/stepup.go`, 대응 `_test.go`.
-- **Approach:** challenge 발급 시 결정 컨텍스트를 `binding_message`로 직렬화해 IdP에 전달하고, 서버가 개시한 상관자를 challenge에 저장한다. `binding_message`는 표시용일 뿐 암호학적 결속이 아니므로 결속은 상관자가 담당한다. 완료 검증은 상관자의 정확 일치와 1회 소비, 발급자·client_id·audience 일치, `acr`가 운영자 허용목록에 속하며 정책 요구를 충족, `auth_time`이 challenge 발급 이후, 발급 시점 컨텍스트 해시와 현재 결정 컨텍스트 일치를 모두 요구한다. IdP가 CIBA를 지원하지 않으면 step-up 리다이렉트 플로로 폴백한다.
+- **Approach:** challenge 발급 시 **상관자에서 파생한 짧은 참조 코드**를 `binding_message`에 싣고, 서버가 개시한 상관자를 challenge에 저장한다. 결정 컨텍스트를 그대로 직렬화하지 않는 이유는 IdP가 `binding_message`에 50자 상한과 공백 금지를 걸기 때문이다 — 사람이 읽을 금액·수취인은 승인 화면이 결정 조회로 가져온다. `binding_message`는 표시용일 뿐 암호학적 결속이 아니므로 결속은 상관자가 담당한다는 원래 성질은 그대로다.
+
+  완료 검증은 상관자의 정확 일치와 1회 소비, 발급자·client_id·audience 일치, `acr`가 운영자 허용목록에 속하며 정책 요구를 충족, `auth_time`이 challenge 발급 이후, 발급 시점 컨텍스트 해시와 현재 결정 컨텍스트 일치를 모두 요구한다. **`amr`은 존재할 때만 대조하는 선택 조건이다** — 기본 구성의 IdP가 빈 배열을 내주므로 필수로 두면 challenge가 구조적으로 충족 불가능해진다.
+
+  `acr` 검증은 편의가 아니라 유일한 방어선이다. 충족되지 않은 `acr` 요청은 오류가 아니라 **침묵 강등**으로 돌아오며, OIDC 필수 클레임 형태로 요청해도 마찬가지다. 응답을 검증하지 않으면 저수준 인증이 그대로 challenge를 충족시킨다.
+
+  IdP가 CIBA를 지원하지 않으면 step-up 리다이렉트 플로로 폴백한다. 데모 번들의 기본 경로가 이 폴백이다(R28).
 - **Test scenarios:**
   - 결정 A용으로 발급된 유효 토큰이 결정 B에서 거부되고, 동일 토큰 2회 제출이 최대 1회만 충족시킨다.
   - `acr` 미충족·허용목록 외 `acr`·발급 전 `auth_time`·컨텍스트 해시 불일치가 각각 미충족으로 남는다.
