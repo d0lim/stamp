@@ -92,6 +92,40 @@ func TestNormalizeSortsAndFillsDefaults(t *testing.T) {
 	}
 }
 
+// TestNormalizeCollapsesEquivalentSpellings pins the property that makes
+// structural comparison of two policies meaningful: after normalization, a
+// value that means one thing has one shape.
+func TestNormalizeCollapsesEquivalentSpellings(t *testing.T) {
+	set := &Set{Policies: []Policy{{
+		ID: "x",
+		Condition: All(
+			Compare{
+				Left:  SourceRef{Name: "kill_switch", Args: []Operand{}},
+				Op:    OpEq,
+				Right: Bool(true),
+			},
+			In(Field(RoleSubject, "id"), Literal{Type: ListOf(TypeString)}),
+		),
+		Challenges: []Challenge{
+			Quorum{Threshold: 1, Approvers: ApproverSet{
+				Source: &SourceRef{Name: "everyone", Args: []Operand{}},
+			}},
+		},
+	}}}
+	set.Normalize()
+
+	logic := set.Policies[0].Condition.(Logic)
+	if args := logic.Operands[0].(Compare).Left.(SourceRef).Args; args != nil {
+		t.Errorf("an empty argument list should normalize to none, got %#v", args)
+	}
+	if data := logic.Operands[1].(Member).Collection.(Literal).Data; data == nil {
+		t.Error("a list literal should always carry a slice, even an empty one")
+	}
+	if args := set.Policies[0].Challenges[0].(Quorum).Approvers.Source.Args; args != nil {
+		t.Errorf("an approver source's empty argument list should normalize to none, got %#v", args)
+	}
+}
+
 func TestNormalizeIsIdempotent(t *testing.T) {
 	once := sampleSet()
 	twice := sampleSet()
@@ -134,6 +168,85 @@ func TestPolicyEntityForUnboundContext(t *testing.T) {
 	}
 	if _, bound := p.EntityFor("nonsense"); bound {
 		t.Error("an unknown role should never be bound")
+	}
+}
+
+// TestRequiresDecision pins the predicate U3 asks for. The invariant that a
+// policy carrying challenges can never be allowed on the check path has to read
+// "does this policy require a decision" from one place; if each caller derived
+// it separately, one of them would eventually derive it differently.
+func TestRequiresDecision(t *testing.T) {
+	set := sampleSet()
+	plain, ok := set.Policy("always-review-rejections")
+	if !ok {
+		t.Fatal("missing policy")
+	}
+	if plain.RequiresDecision() {
+		t.Error("a policy with no challenges must not require a decision")
+	}
+	guarded, ok := set.Policy("high-value-transfer")
+	if !ok {
+		t.Fatal("missing policy")
+	}
+	if !guarded.RequiresDecision() {
+		t.Error("a policy carrying challenges must require a decision")
+	}
+	// Every challenge kind on its own is enough.
+	for _, c := range []Challenge{
+		Quorum{}, MFA{}, Delay{}, External{},
+	} {
+		p := &Policy{Challenges: []Challenge{c}}
+		if !p.RequiresDecision() {
+			t.Errorf("a %s challenge must require a decision", c.ChallengeType())
+		}
+	}
+}
+
+// TestChallengeSetIsClosed pins the challenge inventory to the four kinds v1
+// fixes. Adding a fifth is a change to the public challenge contract, not an
+// implementation detail.
+func TestChallengeSetIsClosed(t *testing.T) {
+	kinds := ChallengeTypes()
+	if len(kinds) != 4 {
+		t.Fatalf("the challenge inventory changed: %v", kinds)
+	}
+	implementations := []Challenge{Quorum{}, MFA{}, Delay{}, External{}}
+	for i, c := range implementations {
+		if c.ChallengeType() != kinds[i] {
+			t.Errorf("%T reports %q, expected %q", c, c.ChallengeType(), kinds[i])
+		}
+		if !c.ChallengeType().Valid() {
+			t.Errorf("%q should be a valid challenge type", c.ChallengeType())
+		}
+	}
+	if ChallengeType("webauthn").Valid() {
+		t.Error("an invented challenge type should not be valid")
+	}
+}
+
+func TestNormalizeSortsChallengesAndFillsMFAMode(t *testing.T) {
+	p := Policy{ID: "x", Challenges: []Challenge{
+		External{Target: "b"},
+		MFA{},
+		External{Target: "a"},
+		Quorum{Threshold: 1},
+	}}
+	set := &Set{Policies: []Policy{p}}
+	set.Normalize()
+
+	got := set.Policies[0].Challenges
+	want := []ChallengeType{ChallengeQuorum, ChallengeMFA, ChallengeExternal, ChallengeExternal}
+	for i, kind := range want {
+		if got[i].ChallengeType() != kind {
+			t.Fatalf("challenge %d: want %q, got %q", i, kind, got[i].ChallengeType())
+		}
+	}
+	// Sorting is stable, so two declarations of the same kind keep their order.
+	if got[2].(External).Target != "b" || got[3].(External).Target != "a" {
+		t.Errorf("same-kind challenges were reordered: %v", got)
+	}
+	if mode := got[1].(MFA).Mode; mode != DefaultMFAMode {
+		t.Errorf("mfa mode default: want %q, got %q", DefaultMFAMode, mode)
 	}
 }
 

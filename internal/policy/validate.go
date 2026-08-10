@@ -39,6 +39,8 @@ const (
 	CodeInvalidOperand    Code = "invalid_operand"
 	CodeInvalidOperator   Code = "invalid_operator"
 	CodeLimitExceeded     Code = "limit_exceeded"
+	CodeUnknownChallenge  Code = "unknown_challenge"
+	CodeUnsupported       Code = "unsupported"
 	CodeCELCompile        Code = "cel_compile"
 )
 
@@ -308,6 +310,8 @@ func (v *validator) policy(s *Schema, p *Policy, ptr string) {
 		}
 	}
 
+	v.challenges(s, p, ptr)
+
 	if p.Condition == nil {
 		return
 	}
@@ -323,6 +327,132 @@ func (v *validator) policy(s *Schema, p *Policy, ptr string) {
 		return
 	}
 	v.condition(s, p, p.Condition, cptr)
+}
+
+// challenges checks each declaration's parameters. Nothing here issues or
+// resolves a challenge — this unit only decides whether a declaration is
+// well-formed enough to be stored.
+func (v *validator) challenges(s *Schema, p *Policy, ptr string) {
+	for i, c := range p.Challenges {
+		cptr := jptr(ptr, "challenges", i)
+		switch ch := c.(type) {
+		case Quorum:
+			if ch.Threshold < 1 {
+				v.add(jptr(cptr, "threshold"), CodeInvalidValue,
+					fmt.Sprintf("a quorum needs a threshold of at least 1, got %d", ch.Threshold))
+			}
+			v.approverSet(s, p, ch.Approvers, jptr(cptr, "approvers"), ch.Threshold)
+		case MFA:
+			switch {
+			case !ch.Mode.Valid():
+				v.add(jptr(cptr, "mode"), CodeInvalidValue,
+					fmt.Sprintf("mfa mode must be %q or %q, got %q", MFADelegated, MFADirect, ch.Mode))
+			case ch.Mode == MFADirect:
+				v.add(jptr(cptr, "mode"), CodeUnsupported,
+					"the direct mfa mode is defined by the challenge contract but not implemented in v1; use the delegated mode")
+			}
+			seen := map[string]bool{}
+			for j, acr := range ch.ACRValues {
+				aptr := jptr(cptr, "acr_values", j)
+				if strings.TrimSpace(acr) == "" {
+					v.add(aptr, CodeInvalidValue, "an acr value cannot be blank")
+				}
+				if seen[acr] {
+					v.add(aptr, CodeDuplicate, fmt.Sprintf("acr value %q is listed twice", acr))
+				}
+				seen[acr] = true
+			}
+		case Delay:
+			if ch.Duration <= 0 {
+				v.add(jptr(cptr, "duration"), CodeInvalidValue,
+					fmt.Sprintf("a delay needs a positive duration, got %s", ch.Duration))
+			}
+			if ch.CancellableBy != nil {
+				v.approverSet(s, p, *ch.CancellableBy, jptr(cptr, "cancellable_by"), 0)
+			}
+		case External:
+			switch {
+			case ch.Target == "":
+				v.add(jptr(cptr, "target"), CodeMissingField,
+					"an external challenge needs a target from the operator's egress allowlist")
+			case !ValidName(ch.Target):
+				v.add(jptr(cptr, "target"), CodeInvalidName,
+					fmt.Sprintf("target %q must match [a-z0-9][a-z0-9._-]*", ch.Target))
+			}
+		case nil:
+			v.add(cptr, CodeMissingField, "challenge declaration is empty")
+		default:
+			v.add(cptr, CodeUnknownChallenge, fmt.Sprintf("unsupported challenge %T", c))
+		}
+	}
+}
+
+// approverSet checks one identity resolution. threshold is the quorum the set
+// has to be able to meet, or 0 when the set is not gating a quorum.
+func (v *validator) approverSet(s *Schema, p *Policy, a ApproverSet, ptr string, threshold int) {
+	declared := 0
+	for _, set := range []bool{len(a.Members) > 0, a.Claim != "", a.Source != nil} {
+		if set {
+			declared++
+		}
+	}
+	switch {
+	case declared == 0:
+		v.add(ptr, CodeMissingField,
+			"an approver set resolves from exactly one of members, claim, or source")
+		return
+	case declared > 1:
+		v.add(ptr, CodeInvalidValue,
+			"an approver set resolves from exactly one of members, claim, or source, not several")
+		return
+	}
+
+	switch {
+	case len(a.Members) > 0:
+		seen := map[string]bool{}
+		for i, member := range a.Members {
+			mptr := jptr(ptr, "members", i)
+			if strings.TrimSpace(member) == "" {
+				v.add(mptr, CodeInvalidValue, "an approver identifier cannot be blank")
+			}
+			if seen[member] {
+				v.add(mptr, CodeDuplicate, fmt.Sprintf("approver %q is listed twice", member))
+			}
+			seen[member] = true
+		}
+		// An approver set smaller than the quorum it gates can never be
+		// satisfied, and a decision that can never resolve is worse than one
+		// that is refused at authoring time.
+		if threshold > 0 && len(seen) < threshold {
+			v.add(ptr, CodeInvalidValue,
+				fmt.Sprintf("a quorum of %d cannot be met by %d distinct approver(s)", threshold, len(seen)))
+		}
+	case a.Claim != "":
+		if strings.TrimSpace(a.Claim) != a.Claim {
+			v.add(jptr(ptr, "claim"), CodeInvalidValue,
+				fmt.Sprintf("claim name %q has surrounding whitespace", a.Claim))
+		}
+	case a.Source != nil:
+		if a.Source.Name == "" {
+			v.add(jptr(ptr, "source"), CodeMissingField, "approver source has no name")
+			return
+		}
+		resolved, ok := v.operandType(s, p, *a.Source, ptr, false)
+		if !ok {
+			return
+		}
+		if resolved != ListOf(TypeString) {
+			v.add(ptr, CodeTypeMismatch,
+				fmt.Sprintf("an approver source must return %s, but %q returns %s",
+					ListOf(TypeString), a.Source.Name, resolved))
+			return
+		}
+		if decl, found := s.Source(a.Source.Name); found && decl.Kind != SourceIdPGroup {
+			v.add(ptr, CodeInvalidValue,
+				fmt.Sprintf("approvers resolve from an %s source, but %q is %s",
+					SourceIdPGroup, a.Source.Name, decl.Kind))
+		}
+	}
 }
 
 func (v *validator) condition(s *Schema, p *Policy, n Node, ptr string) {

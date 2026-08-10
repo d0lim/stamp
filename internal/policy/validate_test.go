@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"math/rand/v2"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,200 @@ func TestCompiledConditionEvaluates(t *testing.T) {
 	}
 }
 
+func TestChallengeDeclarationsAreValidated(t *testing.T) {
+	cases := map[string]struct {
+		challenge Challenge
+		pointer   string
+		code      Code
+	}{
+		"quorum without a threshold": {
+			Quorum{Approvers: ApproverSet{Members: []string{"a"}}},
+			"/policies/1/challenges/0/threshold", CodeInvalidValue,
+		},
+		"quorum larger than its approver set": {
+			Quorum{Threshold: 3, Approvers: ApproverSet{Members: []string{"a", "b"}}},
+			"/policies/1/challenges/0/approvers", CodeInvalidValue,
+		},
+		"quorum with duplicate approvers": {
+			Quorum{Threshold: 1, Approvers: ApproverSet{Members: []string{"a", "a"}}},
+			"/policies/1/challenges/0/approvers/members/1", CodeDuplicate,
+		},
+		"approver set with no resolution": {
+			Quorum{Threshold: 1},
+			"/policies/1/challenges/0/approvers", CodeMissingField,
+		},
+		"approver set with two resolutions": {
+			Quorum{Threshold: 1, Approvers: ApproverSet{Members: []string{"a"}, Claim: "groups"}},
+			"/policies/1/challenges/0/approvers", CodeInvalidValue,
+		},
+		"approvers from an undeclared source": {
+			Quorum{Threshold: 1, Approvers: ApproverSet{
+				Source: &SourceRef{Name: "nobody", Args: []Operand{String("x")}},
+			}},
+			"/policies/1/challenges/0/approvers", CodeUnknownSource,
+		},
+		"approvers from a source with the wrong arity": {
+			Quorum{Threshold: 1, Approvers: ApproverSet{Source: &SourceRef{Name: "approver_ids"}}},
+			"/policies/1/challenges/0/approvers", CodeArityMismatch,
+		},
+		"approvers from a source of the wrong type": {
+			Quorum{Threshold: 1, Approvers: ApproverSet{
+				Source: &SourceRef{Name: "daily_total", Args: []Operand{String("x")}},
+			}},
+			"/policies/1/challenges/0/approvers", CodeTypeMismatch,
+		},
+		"approvers from a source of the wrong kind": {
+			Quorum{Threshold: 1, Approvers: ApproverSet{
+				Source: &SourceRef{Name: "team_names", Args: []Operand{String("x")}},
+			}},
+			"/policies/1/challenges/0/approvers", CodeInvalidValue,
+		},
+		"mfa in the unimplemented direct mode": {
+			MFA{Mode: MFADirect},
+			"/policies/1/challenges/0/mode", CodeUnsupported,
+		},
+		"mfa in an invented mode": {
+			MFA{Mode: "telepathy"},
+			"/policies/1/challenges/0/mode", CodeInvalidValue,
+		},
+		"mfa with a blank acr value": {
+			MFA{Mode: MFADelegated, ACRValues: []string{"  "}},
+			"/policies/1/challenges/0/acr_values/0", CodeInvalidValue,
+		},
+		"delay with no duration": {
+			Delay{},
+			"/policies/1/challenges/0/duration", CodeInvalidValue,
+		},
+		"delay running backwards": {
+			Delay{Duration: -time.Minute},
+			"/policies/1/challenges/0/duration", CodeInvalidValue,
+		},
+		"delay with an unresolvable canceller": {
+			Delay{Duration: time.Minute, CancellableBy: &ApproverSet{}},
+			"/policies/1/challenges/0/cancellable_by", CodeMissingField,
+		},
+		"external without a target": {
+			External{},
+			"/policies/1/challenges/0/target", CodeMissingField,
+		},
+		"external with a malformed target": {
+			External{Target: "Fraud Review"},
+			"/policies/1/challenges/0/target", CodeInvalidName,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			set := sampleSet()
+			// A source that returns approver-shaped data but is not a group
+			// lookup, so the kind check has something to catch.
+			set.Schema.Sources = append(set.Schema.Sources, SourceDecl{
+				Name: "team_names", Kind: SourceHTTP,
+				Params:  []Param{{Name: "team", Type: TypeString}},
+				Returns: ListOf(TypeString), OnError: OnErrorDeny,
+			})
+			set.Normalize()
+			set.Policies[1].Challenges = []Challenge{tc.challenge}
+
+			diags := Validate(set)
+			at := diags.At(tc.pointer)
+			if len(at) == 0 {
+				t.Fatalf("no diagnostic at %s; got %v", tc.pointer, diags)
+			}
+			if at[0].Code != tc.code {
+				t.Fatalf("code at %s: want %q, got %q (%s)", tc.pointer, tc.code, at[0].Code, at[0].Message)
+			}
+			if at[0].Message == "" {
+				t.Fatal("a diagnostic must carry a human-readable message")
+			}
+		})
+	}
+}
+
+func TestUnknownChallengeTypeIsRejectedAtLoad(t *testing.T) {
+	doc := `apiVersion: stamp/v1
+kind: Schema
+entities:
+  - name: user
+    attributes: {id: string}
+  - name: doc
+    attributes: {level: int}
+actions: [read]
+---
+apiVersion: stamp/v1
+kind: Policy
+id: exotic
+subject: user
+resource: doc
+actions: [read]
+challenges:
+  - type: webauthn
+    threshold: 2
+`
+	_, err := Load(strings.NewReader(doc))
+	var diags Diagnostics
+	if !errors.As(err, &diags) {
+		t.Fatalf("expected diagnostics, got %v", err)
+	}
+	at := diags.At("/policies/0/challenges/0/type")
+	if len(at) == 0 || at[0].Code != CodeUnknownChallenge {
+		t.Fatalf("expected an unknown-challenge diagnostic, got %v", diags)
+	}
+	if !strings.Contains(at[0].Message, "quorum") {
+		t.Errorf("the message should list the kinds that are allowed, got %q", at[0].Message)
+	}
+}
+
+func TestChallengeKeysAreScopedToTheirType(t *testing.T) {
+	doc := `apiVersion: stamp/v1
+kind: Schema
+entities:
+  - name: user
+    attributes: {id: string}
+  - name: doc
+    attributes: {level: int}
+actions: [read]
+---
+apiVersion: stamp/v1
+kind: Policy
+id: confused
+subject: user
+resource: doc
+actions: [read]
+challenges:
+  - type: delay
+    duration: 5m
+    threshold: 2
+`
+	_, err := Load(strings.NewReader(doc))
+	var diags Diagnostics
+	if !errors.As(err, &diags) {
+		t.Fatalf("expected diagnostics, got %v", err)
+	}
+	at := diags.At("/policies/0/challenges/0/threshold")
+	if len(at) == 0 || at[0].Code != CodeUnknownKey {
+		t.Fatalf("a quorum key on a delay should be an unknown key, got %v", diags)
+	}
+}
+
+func TestChallengeCarryingPolicyStillCompiles(t *testing.T) {
+	// Challenges are declarations, not condition nodes: they never reach the
+	// compiler and never change what a condition means.
+	set := sampleSet()
+	guarded, _ := set.Policy("high-value-transfer")
+	_, withChallenges, err := Compile(&set.Schema, guarded)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	guarded.Challenges = nil
+	_, withoutChallenges, err := Compile(&set.Schema, guarded)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if withChallenges.OutputType() != withoutChallenges.OutputType() {
+		t.Error("challenges changed the compiled condition")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // properties
 // ---------------------------------------------------------------------------
@@ -295,11 +490,12 @@ func TestValidSetsRoundTrip(t *testing.T) {
 	for i := 0; i < 300; i++ {
 		g := &generator{rng: rng, schema: &base.Schema}
 		set := &Set{Schema: base.Schema, Policies: []Policy{{
-			ID:        "generated",
-			Subject:   "user",
-			Resource:  "transfer",
-			Actions:   []string{"approve"},
-			Condition: g.condition(3),
+			ID:         "generated",
+			Subject:    "user",
+			Resource:   "transfer",
+			Actions:    []string{"approve"},
+			Condition:  g.condition(3),
+			Challenges: g.challenges(),
 		}}}
 		set.Normalize()
 		if diags := Validate(set); len(diags) > 0 {
@@ -314,9 +510,11 @@ func TestValidSetsRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("load:\n%s\n%v", data, err)
 		}
-		if !equalSets(set, got) {
-			t.Fatalf("round trip changed the set\n%s\nwant %#v\ngot  %#v",
-				data, set.Policies[0].Condition, got.Policies[0].Condition)
+		// Compared structurally rather than by re-serializing, so that anything
+		// the encoder silently drops shows up here instead of cancelling out on
+		// both sides.
+		if !reflect.DeepEqual(set, got) {
+			t.Fatalf("round trip changed the set\n%s\nwant %#v\ngot  %#v", data, set, got)
 		}
 		again, err := Marshal(got)
 		if err != nil {
@@ -328,12 +526,6 @@ func TestValidSetsRoundTrip(t *testing.T) {
 	}
 }
 
-func equalSets(a, b *Set) bool {
-	x, errA := Marshal(a)
-	y, errB := Marshal(b)
-	return errA == nil && errB == nil && string(x) == string(y)
-}
-
 // generator builds condition ASTs. With sloppy set it invents names and mixes
 // types freely; otherwise it only produces well-typed conditions against the
 // schema it is given.
@@ -341,6 +533,51 @@ type generator struct {
 	rng    *rand.Rand
 	schema *Schema
 	sloppy bool
+}
+
+// challenges produces a well-formed challenge list so that the round-trip
+// property covers declarations as well as conditions.
+func (g *generator) challenges() []Challenge {
+	n := g.rng.IntN(5)
+	if n == 0 {
+		return nil
+	}
+	out := make([]Challenge, 0, n)
+	for i := 0; i < n; i++ {
+		switch g.rng.IntN(4) {
+		case 0:
+			members := []string{"alice", "bob", "carol", "dave"}[:1+g.rng.IntN(4)]
+			approvers := ApproverSet{Members: members}
+			threshold := 1 + g.rng.IntN(len(members))
+			if g.rng.IntN(3) == 0 {
+				approvers = ApproverSet{Claim: "groups"}
+				threshold = 1 + g.rng.IntN(3)
+			} else if g.rng.IntN(3) == 0 {
+				approvers = ApproverSet{Source: &SourceRef{
+					Name: "approver_ids",
+					Args: []Operand{g.operandOfType(TypeString)},
+				}}
+				threshold = 1 + g.rng.IntN(3)
+			}
+			out = append(out, Quorum{Threshold: threshold, Approvers: approvers})
+		case 1:
+			acr := []string{"urn:a", "urn:b", "urn:c"}[:g.rng.IntN(4)]
+			if len(acr) == 0 {
+				acr = nil
+			}
+			out = append(out, MFA{Mode: MFADelegated, ACRValues: acr})
+		case 2:
+			c := Delay{Duration: time.Duration(1+g.rng.Int64N(86_400)) * time.Second}
+			if g.rng.IntN(2) == 0 {
+				c.CancellableBy = &ApproverSet{Members: []string{"security-lead"}}
+			}
+			out = append(out, c)
+		default:
+			targets := []string{"fraud-review", "risk.desk", "compliance_bot"}
+			out = append(out, External{Target: targets[g.rng.IntN(len(targets))]})
+		}
+	}
+	return out
 }
 
 func (g *generator) condition(depth int) Node {

@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Type names a value type in the policy type system.
@@ -256,8 +257,126 @@ func (s *Schema) HasAction(name string) bool {
 	return false
 }
 
+// ChallengeType names a challenge kind. The set is closed and fixed for v1.
+type ChallengeType string
+
+// The v1 challenge kinds.
+const (
+	ChallengeQuorum   ChallengeType = "quorum"
+	ChallengeMFA      ChallengeType = "mfa"
+	ChallengeDelay    ChallengeType = "delay"
+	ChallengeExternal ChallengeType = "external"
+)
+
+// ChallengeTypes returns every challenge kind, in the order normalization
+// sorts them.
+func ChallengeTypes() []ChallengeType {
+	return []ChallengeType{ChallengeQuorum, ChallengeMFA, ChallengeDelay, ChallengeExternal}
+}
+
+// Valid reports whether t is one of the declared challenge kinds.
+func (t ChallengeType) Valid() bool {
+	for _, k := range ChallengeTypes() {
+		if t == k {
+			return true
+		}
+	}
+	return false
+}
+
+// Challenge is one requirement a policy attaches to a decision before it can
+// resolve to allow.
+//
+// This package declares challenges and validates their parameters. It issues
+// nothing, collects nothing, and holds no state — resolution belongs to the
+// units that own each challenge's runtime. The set of implementations is closed
+// at the four kinds v1 fixes.
+type Challenge interface {
+	// ChallengeType reports which kind of challenge this is.
+	ChallengeType() ChallengeType
+	challenge()
+}
+
+// MFAMode selects how a multi-factor challenge is satisfied.
+type MFAMode string
+
+// The multi-factor modes. v1 implements the delegated mode, where an external
+// IdP performs the step-up and STAMP verifies the resulting claims. The direct
+// mode is named by the contract but not implemented, so a policy declaring it
+// is rejected at load rather than accepted and then failed at evaluation.
+const (
+	MFADelegated MFAMode = "delegated"
+	MFADirect    MFAMode = "direct"
+)
+
+// DefaultMFAMode is the mode a declaration gets when it says nothing.
+// Normalization writes it in on load and omits it again on export.
+const DefaultMFAMode = MFADelegated
+
+// Valid reports whether m is one of the declared modes.
+func (m MFAMode) Valid() bool { return m == MFADelegated || m == MFADirect }
+
+// ApproverSet resolves which identities may satisfy a challenge. Exactly one of
+// the three fields is set, matching the three resolutions the requirements
+// allow: an explicit list, a token claim, or a declared IdP group source.
+//
+// The source form reuses the condition language's fact source reference, so an
+// approver set resolved from a group lookup is type-checked by the same code
+// that checks a condition — it must name a declared idp_group source returning
+// a list of strings, with arguments matching its signature.
+type ApproverSet struct {
+	Members []string
+	Claim   string
+	Source  *SourceRef
+}
+
+// Quorum requires Threshold distinct approvals from the resolved approver set.
+type Quorum struct {
+	Threshold int
+	Approvers ApproverSet
+}
+
+// ChallengeType reports which kind of challenge this is.
+func (Quorum) ChallengeType() ChallengeType { return ChallengeQuorum }
+func (Quorum) challenge()                   {}
+
+// MFA requires the subject to complete a step-up authentication. ACRValues
+// names the authentication context classes the policy will accept; the
+// operator's allowlist constrains which of those are honoured.
+type MFA struct {
+	Mode      MFAMode
+	ACRValues []string
+}
+
+// ChallengeType reports which kind of challenge this is.
+func (MFA) ChallengeType() ChallengeType { return ChallengeMFA }
+func (MFA) challenge()                   {}
+
+// Delay holds a decision open for a fixed period. CancellableBy, when set,
+// names the identities that may cancel during the wait.
+type Delay struct {
+	Duration      time.Duration
+	CancellableBy *ApproverSet
+}
+
+// ChallengeType reports which kind of challenge this is.
+func (Delay) ChallengeType() ChallengeType { return ChallengeDelay }
+func (Delay) challenge()                   {}
+
+// External defers to an outside system. Target names an entry in the
+// operator's configured egress allowlist rather than a URL — a policy author
+// selects a destination the operator already permits, and cannot name one that
+// is not on the list.
+type External struct {
+	Target string
+}
+
+// ChallengeType reports which kind of challenge this is.
+func (External) ChallengeType() ChallengeType { return ChallengeExternal }
+func (External) challenge()                   {}
+
 // Policy is one governed rule: which entity types and actions it applies to,
-// and the condition under which it applies.
+// the condition under which it applies, and the challenges it attaches.
 //
 // ID is the policy's identity and comes from the document, never from a
 // filename. Context is optional; a policy that does not bind it cannot
@@ -270,7 +389,18 @@ type Policy struct {
 	Context     string
 	Actions     []string
 	Condition   Node
+	Challenges  []Challenge
 }
+
+// RequiresDecision reports whether the policy carries any challenge, and so
+// whether it can ever be satisfied by the stateless check path.
+//
+// This is the single source of truth for the evaluator invariant that a policy
+// carrying challenges is never allowed on the check path. Deriving it at each
+// call site instead would let one caller's idea of "has challenges" drift from
+// another's, and the invariant is exactly the kind that must not depend on
+// agreement between callers.
+func (p *Policy) RequiresDecision() bool { return len(p.Challenges) > 0 }
 
 // EntityFor returns the entity type name bound to a role, and whether the
 // policy binds that role at all.
@@ -331,9 +461,112 @@ func (s *Set) Normalize() {
 	}
 	sort.Slice(s.Schema.Sources, func(a, b int) bool { return s.Schema.Sources[a].Name < s.Schema.Sources[b].Name })
 	for i := range s.Policies {
-		sort.Strings(s.Policies[i].Actions)
+		p := &s.Policies[i]
+		sort.Strings(p.Actions)
+		p.Condition = normalizeNode(p.Condition)
+		for j, c := range p.Challenges {
+			switch ch := c.(type) {
+			case MFA:
+				if ch.Mode == "" {
+					ch.Mode = DefaultMFAMode
+				}
+				p.Challenges[j] = ch
+			case Quorum:
+				normalizeApproverSet(&ch.Approvers)
+				p.Challenges[j] = ch
+			case Delay:
+				if ch.CancellableBy != nil {
+					normalizeApproverSet(ch.CancellableBy)
+				}
+				p.Challenges[j] = ch
+			}
+		}
+		// Challenges sort by kind, stably, so two declarations of the same kind
+		// keep the order they were written in. Their order carries no meaning
+		// to the engine, but a canonical order is what makes export idempotent.
+		sort.SliceStable(p.Challenges, func(a, b int) bool {
+			return challengeRank(p.Challenges[a]) < challengeRank(p.Challenges[b])
+		})
 	}
 	sort.Slice(s.Policies, func(a, b int) bool { return s.Policies[a].ID < s.Policies[b].ID })
+}
+
+// normalizeNode collapses the representations that mean the same thing, so that
+// after normalization a value has exactly one shape. Without it a fact source
+// call with no arguments has two spellings — a nil argument slice and an empty
+// one — and only one of them survives a round trip, which would make structural
+// comparison of two equal policies report a difference.
+func normalizeNode(n Node) Node {
+	switch v := n.(type) {
+	case Logic:
+		for i := range v.Operands {
+			v.Operands[i] = normalizeNode(v.Operands[i])
+		}
+		return v
+	case Compare:
+		v.Left = normalizeReference(v.Left)
+		v.Right = normalizeOperand(v.Right)
+		return v
+	case Member:
+		v.Left = normalizeReference(v.Left)
+		v.Collection = normalizeOperand(v.Collection)
+		return v
+	default:
+		return n
+	}
+}
+
+func normalizeOperand(o Operand) Operand {
+	switch v := o.(type) {
+	case SourceRef:
+		if len(v.Args) == 0 {
+			v.Args = nil
+			return v
+		}
+		for i := range v.Args {
+			v.Args[i] = normalizeOperand(v.Args[i])
+		}
+		return v
+	case Literal:
+		if v.Type.IsList() && v.Data == nil {
+			v.Data = []any{}
+		}
+		return v
+	default:
+		return o
+	}
+}
+
+func normalizeReference(r Reference) Reference {
+	if r == nil {
+		return nil
+	}
+	if normalized, ok := normalizeOperand(r).(Reference); ok {
+		return normalized
+	}
+	return r
+}
+
+func normalizeApproverSet(a *ApproverSet) {
+	if a.Source == nil {
+		return
+	}
+	normalized, ok := normalizeOperand(*a.Source).(SourceRef)
+	if !ok {
+		return
+	}
+	*a.Source = normalized
+}
+
+// challengeRank orders challenge kinds for normalization. An unknown kind sorts
+// last so that a set which fails validation still encodes deterministically.
+func challengeRank(c Challenge) int {
+	for i, kind := range ChallengeTypes() {
+		if c.ChallengeType() == kind {
+			return i
+		}
+	}
+	return len(ChallengeTypes())
 }
 
 // identPattern is the syntax shared by entity, attribute, and source names.

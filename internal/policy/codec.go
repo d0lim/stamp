@@ -312,15 +312,65 @@ func policyDocumentNode(p *Policy) *yaml.Node {
 	m.putString("subject", p.Subject)
 	m.putString("resource", p.Resource)
 	m.putStringIf("context", p.Context, "")
-	actions := make([]*yaml.Node, len(p.Actions))
-	for i, a := range p.Actions {
-		actions[i] = str(a)
-	}
-	m.put("actions", sequence(yaml.FlowStyle, actions...))
+	m.put("actions", stringSequenceNode(p.Actions))
 	if p.Condition != nil {
 		m.put("condition", conditionNode(p.Condition))
 	}
+	if len(p.Challenges) > 0 {
+		items := make([]*yaml.Node, len(p.Challenges))
+		for i, c := range p.Challenges {
+			items[i] = challengeNode(c)
+		}
+		m.put("challenges", sequence(0, items...))
+	}
 	return documentOf(m.node)
+}
+
+func stringSequenceNode(values []string) *yaml.Node {
+	items := make([]*yaml.Node, len(values))
+	for i, v := range values {
+		items[i] = str(v)
+	}
+	return sequence(yaml.FlowStyle, items...)
+}
+
+func challengeNode(c Challenge) *yaml.Node {
+	if c == nil {
+		return newMapping(0).node
+	}
+	m := newMapping(0).putString("type", string(c.ChallengeType()))
+	switch v := c.(type) {
+	case Quorum:
+		m.put("threshold", scalar("!!int", strconv.Itoa(v.Threshold)))
+		m.put("approvers", approverSetNode(v.Approvers))
+	case MFA:
+		m.putStringIf("mode", string(v.Mode), string(DefaultMFAMode))
+		if len(v.ACRValues) > 0 {
+			m.put("acr_values", stringSequenceNode(v.ACRValues))
+		}
+	case Delay:
+		m.putString("duration", v.Duration.String())
+		if v.CancellableBy != nil {
+			m.put("cancellable_by", approverSetNode(*v.CancellableBy))
+		}
+	case External:
+		m.putString("target", v.Target)
+	}
+	return m.node
+}
+
+// approverSetNode writes the one resolution the set carries. The source form is
+// rendered by the operand encoder, so an approver lookup and a condition's fact
+// source call are spelled identically.
+func approverSetNode(a ApproverSet) *yaml.Node {
+	switch {
+	case a.Source != nil:
+		return operandNode(*a.Source)
+	case a.Claim != "":
+		return newMapping(yaml.FlowStyle).putString("claim", a.Claim).node
+	default:
+		return newMapping(yaml.FlowStyle).put("members", stringSequenceNode(a.Members)).node
+	}
 }
 
 func documentOf(root *yaml.Node) *yaml.Node {
@@ -670,8 +720,160 @@ func (d *decoder) policyDocument(root *yaml.Node) {
 		"context":     func(n *yaml.Node) { p.Context = d.scalarString(n, jptr(ptr, "context")) },
 		"actions":     func(n *yaml.Node) { p.Actions = d.stringSequence(n, jptr(ptr, "actions")) },
 		"condition":   func(n *yaml.Node) { p.Condition = d.condition(n, jptr(ptr, "condition")) },
+		"challenges":  func(n *yaml.Node) { p.Challenges = d.challenges(n, jptr(ptr, "challenges")) },
 	})
 	d.set.Policies = append(d.set.Policies, p)
+}
+
+func (d *decoder) challenges(node *yaml.Node, ptr string) []Challenge {
+	if node.Kind != yaml.SequenceNode {
+		d.add(ptr, CodeInvalidValue, node, "challenges must be a sequence")
+		return nil
+	}
+	out := make([]Challenge, 0, len(node.Content))
+	for i, item := range node.Content {
+		if c := d.challenge(item, jptr(ptr, i)); c != nil {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// challenge decodes one challenge declaration. The type key selects which other
+// keys are allowed, so a threshold on a delay is reported as an unknown key
+// rather than quietly ignored.
+func (d *decoder) challenge(node *yaml.Node, ptr string) Challenge {
+	if node.Kind != yaml.MappingNode {
+		d.add(ptr, CodeInvalidValue, node, "a challenge is a mapping with a type")
+		return nil
+	}
+	kind := ChallengeType("")
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == "type" {
+			kind = ChallengeType(node.Content[i+1].Value)
+		}
+	}
+	skip := func(*yaml.Node) {}
+	switch kind {
+	case ChallengeQuorum:
+		c := Quorum{}
+		d.walk(node, ptr, map[string]func(*yaml.Node){
+			"type":      skip,
+			"threshold": func(n *yaml.Node) { c.Threshold = d.scalarInt(n, jptr(ptr, "threshold")) },
+			"approvers": func(n *yaml.Node) {
+				if set := d.approverSet(n, jptr(ptr, "approvers")); set != nil {
+					c.Approvers = *set
+				}
+			},
+		})
+		return c
+	case ChallengeMFA:
+		c := MFA{Mode: DefaultMFAMode}
+		d.walk(node, ptr, map[string]func(*yaml.Node){
+			"type": skip,
+			"mode": func(n *yaml.Node) { c.Mode = MFAMode(d.scalarString(n, jptr(ptr, "mode"))) },
+			"acr_values": func(n *yaml.Node) {
+				c.ACRValues = d.stringSequence(n, jptr(ptr, "acr_values"))
+			},
+		})
+		return c
+	case ChallengeDelay:
+		c := Delay{}
+		d.walk(node, ptr, map[string]func(*yaml.Node){
+			"type":     skip,
+			"duration": func(n *yaml.Node) { c.Duration = d.scalarDuration(n, jptr(ptr, "duration")) },
+			"cancellable_by": func(n *yaml.Node) {
+				c.CancellableBy = d.approverSet(n, jptr(ptr, "cancellable_by"))
+			},
+		})
+		return c
+	case ChallengeExternal:
+		c := External{}
+		d.walk(node, ptr, map[string]func(*yaml.Node){
+			"type":   skip,
+			"target": func(n *yaml.Node) { c.Target = d.scalarString(n, jptr(ptr, "target")) },
+		})
+		return c
+	default:
+		names := make([]string, 0, len(ChallengeTypes()))
+		for _, k := range ChallengeTypes() {
+			names = append(names, string(k))
+		}
+		d.add(jptr(ptr, "type"), CodeUnknownChallenge, node,
+			"challenge type must be one of %s, got %q", strings.Join(names, ", "), kind)
+		return nil
+	}
+}
+
+func (d *decoder) approverSet(node *yaml.Node, ptr string) *ApproverSet {
+	if node.Kind != yaml.MappingNode {
+		d.add(ptr, CodeInvalidValue, node,
+			"an approver set is a mapping with members, claim, or source")
+		return nil
+	}
+	set := &ApproverSet{}
+	var source *SourceRef
+	ok := true
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		switch key {
+		case "members":
+			set.Members = d.stringSequence(value, jptr(ptr, "members"))
+		case "claim":
+			set.Claim = d.scalarString(value, jptr(ptr, "claim"))
+		case "source":
+			if source == nil {
+				source = &SourceRef{}
+			}
+			source.Name = d.scalarString(value, jptr(ptr, "source"))
+		case "args":
+			if source == nil {
+				source = &SourceRef{}
+			}
+			if value.Kind != yaml.SequenceNode {
+				d.add(jptr(ptr, "args"), CodeInvalidValue, value, "args must be a sequence")
+				ok = false
+				continue
+			}
+			for j, item := range value.Content {
+				arg := d.operand(item, jptr(ptr, "args", j))
+				if arg == nil {
+					ok = false
+					continue
+				}
+				source.Args = append(source.Args, arg)
+			}
+		default:
+			d.add(jptr(ptr, key), CodeUnknownKey, node.Content[i],
+				"unknown key %q in an approver set", key)
+			ok = false
+		}
+	}
+	set.Source = source
+	if !ok {
+		return nil
+	}
+	return set
+}
+
+func (d *decoder) scalarInt(node *yaml.Node, ptr string) int {
+	raw := d.scalarString(node, ptr)
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		d.add(ptr, CodeInvalidValue, node, "%q is not a whole number", raw)
+		return 0
+	}
+	return value
+}
+
+func (d *decoder) scalarDuration(node *yaml.Node, ptr string) time.Duration {
+	raw := d.scalarString(node, ptr)
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		d.add(ptr, CodeInvalidValue, node, "%q is not a duration such as 1h30m", raw)
+		return 0
+	}
+	return value
 }
 
 func (d *decoder) stringSequence(node *yaml.Node, ptr string) []string {
