@@ -1,0 +1,9 @@
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+.idea/
+.vscode/
+# The rendered snapshots live beside the chart and are inputs to a test, not
+# part of the packaged artifact.
+../snapshots/

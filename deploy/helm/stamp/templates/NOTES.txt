@@ -1,0 +1,86 @@
+{{- $ctx := . -}}
+{{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
+{{- $apiTier := "" -}}
+{{- range $tier := $tiers }}{{- if or (eq $tier.name "all") (eq $tier.name "api") }}{{- $apiTier = include "stamp.tierName" (dict "ctx" $ctx "tier" $tier) }}{{- end }}{{- end }}
+stamp {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in {{ .Release.Namespace }},
+topology {{ .Values.topology }}, authoring mode {{ .Values.authoring.mode }}.
+
+Tiers:
+{{- range $tier := $tiers }}
+  {{ printf "%-28s" (include "stamp.tierName" (dict "ctx" $ctx "tier" $tier)) }} --roles={{ $tier.roles }}  listeners: {{ join ", " $tier.surfaces }}  replicas: {{ $tier.tier.replicas }}
+{{- end }}
+
+{{ if $apiTier -}}
+GOVERNANCE IS NOT LOCKED YET. Two steps, in this order.
+
+1. Take the bootstrap token.
+
+   On its first start the tier holding the api role installs the reserved
+   governance policy and prints a one-time bootstrap token. It is shown once,
+   on stdout, and stored only as a digest — no later start reprints it, and no
+   API returns it.
+
+     kubectl -n {{ .Release.Namespace }} logs deploy/{{ $apiTier }} | grep -A2 'bootstrap token'
+
+   If the pod has already restarted and the log has rotated away, the token is
+   gone. Recovery is `stamp breakglass`, which refuses to run while the service
+   is up — see docs/break-glass.md.
+
+   Until governance is locked the deployment is in solo-admin mode: whoever
+   holds this token can change policy alone. An unused token raises a critical
+   audit warning on a timer for exactly that reason.
+
+2. Lock governance as soon as the approver set is known.
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $apiTier }} {{ .Values.listeners.console.port }}:{{ .Values.listeners.console.port }}
+
+     stamp policy lock \
+       --api http://localhost:{{ .Values.listeners.console.port }} \
+       --token "$YOUR_OIDC_ACCESS_TOKEN" \
+       --bootstrap-token "$BOOTSTRAP_TOKEN" \
+       --threshold 2 --approvers alice,bob
+
+   The console does the same thing from Governance -> Lock. The lock survives
+   every authoring mode: `{{ .Values.authoring.mode }}` does not close it, because an operator
+   who closed the console's authoring must still be able to leave solo-admin.
+
+   After the lock, a governance revision needs {{ default "the configured" .Values.governance.minApprovers }} approvals or more.
+   A threshold larger than the approver set is refused before it is sent — a
+   quorum nobody can satisfy is a permanent lockout, not a strict policy.
+
+{{ end -}}
+{{- if eq .Values.topology "split" }}
+The split topology has one thing left to wire by hand: the console tier has to
+be told where the api tier is, because the bundle reads its API base address
+from the operator and from nowhere else (R50). Set
+
+  console.apiBaseUrl: https://<the address your api tier is published at>
+
+to the address a *browser* can reach, not the in-cluster Service name — the
+call is made by the approver's browser, and the CSP on every console response
+names that origin and the IdP and nothing else.
+{{- end }}
+
+Health: every bound listener answers GET /healthz. It is a liveness signal
+only — it does not consult the database — so a pod that is Ready is a process
+that is running, not a deployment whose database is reachable.
+
+{{- if not .Values.egress.allow }}
+
+WARNING: egress.allow is empty. No remote fact source, IdP group directory or
+external challenge target can be dialled. A policy that declares one will not
+load. If that is not what you meant, list the origins (scheme://host[:port],
+exact match, no wildcards).
+{{- end }}
+{{- if .Values.audit.failClosed }}
+{{- else }}
+
+WARNING: audit.failClosed is off. While the check-path audit buffer is
+saturated, decisions are allowed to proceed unrecorded and the gap is marked in
+the chain rather than refused.
+{{- end }}
+
+R32's signed audit checkpoint sink has no configuration in this chart because
+the binary reads none yet: the signer and the file and webhook sinks exist in
+internal/store, but nothing wires them from the environment. Until that lands,
+checkpoints are not being exported anywhere, whatever this chart is set to.

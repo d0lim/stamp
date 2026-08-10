@@ -1,0 +1,30 @@
+{{- $ctx := . -}}
+{{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
+{{- range $tier := $tiers }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stamp.tierName" (dict "ctx" $ctx "tier" $tier) }}
+  labels:
+    {{- include "stamp.labels" $ctx | nindent 4 }}
+    app.kubernetes.io/component: {{ $tier.name }}
+  {{- with $ctx.Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $ctx.Values.service.type }}
+  # A Service publishes exactly the surfaces its tier binds. A check tier has no
+  # console port to reach even by mistake, which is the point of splitting the
+  # listeners rather than the paths.
+  ports:
+    {{- range $surface := $tier.surfaces }}
+    - name: {{ $surface }}
+      port: {{ (index $ctx.Values.listeners $surface).port }}
+      targetPort: {{ $surface }}
+      protocol: TCP
+    {{- end }}
+  selector:
+    {{- include "stamp.selectorLabels" (dict "ctx" $ctx "tier" $tier) | nindent 4 }}
+{{- end }}

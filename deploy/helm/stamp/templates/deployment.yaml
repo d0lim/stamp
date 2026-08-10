@@ -1,0 +1,157 @@
+{{- $ctx := . -}}
+{{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
+{{/* The configuration documents this release actually mounts. */}}
+{{- $mounted := dict -}}
+{{- range $name, $doc := .Values.documents -}}
+{{- if not (has $name (list "factSources" "streamSources" "ingestCredentials" "externalTargets" "idpGroupSources" "kafkaTopics")) -}}
+{{- fail (printf "documents.%s is not a setting this chart knows" $name) -}}
+{{- end -}}
+{{- if $doc.secretName -}}
+{{- $_ := set $mounted $name $doc -}}
+{{- end -}}
+{{- end -}}
+{{- range $tier := $tiers }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "stamp.tierName" (dict "ctx" $ctx "tier" $tier) }}
+  labels:
+    {{- include "stamp.labels" $ctx | nindent 4 }}
+    app.kubernetes.io/component: {{ $tier.name }}
+    stamp.dev/roles: {{ $tier.roles | quote }}
+spec:
+  replicas: {{ $tier.tier.replicas }}
+  selector:
+    matchLabels:
+      {{- include "stamp.selectorLabels" (dict "ctx" $ctx "tier" $tier) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "stamp.labels" $ctx | nindent 8 }}
+        app.kubernetes.io/component: {{ $tier.name }}
+        {{- with $ctx.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $ctx.Template.BasePath "/configmap.yaml") $ctx | sha256sum }}
+        {{- with $ctx.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $tier.tier.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "stamp.serviceAccountName" $ctx }}
+      {{- with $ctx.Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml $ctx.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: stamp
+          image: {{ include "stamp.image" $ctx | quote }}
+          imagePullPolicy: {{ $ctx.Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml $ctx.Values.securityContext | nindent 12 }}
+          # One image, one flag. This is the only argument that differs between
+          # the all-in-one topology and the split one.
+          args:
+            - --roles={{ $tier.roles }}
+          ports:
+            {{- range $surface := $tier.surfaces }}
+            - name: {{ $surface }}
+              containerPort: {{ (index $ctx.Values.listeners $surface).port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            # R42: the connection string is a credential and arrives by
+            # reference. Each tier reads its own Secret, which is how per-role
+            # database privileges reach the process (R39) — the grant lives on
+            # the login, not in the manifest.
+            - name: STAMP_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $tier.credential.secretName | quote }}
+                  key: {{ $tier.credential.key | quote }}
+            # An empty address unbinds a surface; an absent variable would bind
+            # it to its default. A tier says what it does not serve.
+            - name: STAMP_PEP_ADDR
+              value: {{ include "stamp.addr" (dict "ctx" $ctx "tier" $tier "surface" "pep") | quote }}
+            - name: STAMP_CONSOLE_ADDR
+              value: {{ include "stamp.addr" (dict "ctx" $ctx "tier" $tier "surface" "console") | quote }}
+            - name: STAMP_CALLBACK_ADDR
+              value: {{ include "stamp.addr" (dict "ctx" $ctx "tier" $tier "surface" "callback") | quote }}
+            - name: STAMP_DB_MIGRATE
+              value: {{ $tier.migrate | quote }}
+            - name: STAMP_DB_APPLY_GRANTS
+              value: {{ $tier.applyGrants | quote }}
+            {{- if $ctx.Values.mfa.ciba.clientSecret.secretName }}
+            - name: STAMP_MFA_CIBA_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ctx.Values.mfa.ciba.clientSecret.secretName | quote }}
+                  key: {{ $ctx.Values.mfa.ciba.clientSecret.key | quote }}
+            {{- end }}
+            {{- with $ctx.Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            # STAMP_AUDIT_WRITER_ID is deliberately unset: exactly one live
+            # process may hold a writer identifier, and the default derives one
+            # from the pod's hostname. Setting it to a literal here would make
+            # the second replica fail to boot.
+          envFrom:
+            - configMapRef:
+                name: {{ include "stamp.fullname" $ctx }}-env
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ index $tier.surfaces 0 }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ index $tier.surfaces 0 }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          {{- with $tier.tier.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $mounted }}
+          volumeMounts:
+            {{- range $name, $doc := $mounted }}
+            - name: {{ printf "doc-%s" (kebabcase $name) }}
+              mountPath: {{ include "stamp.documentPath" $doc | quote }}
+              subPath: {{ $doc.key | quote }}
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if $mounted }}
+      # The documents are mounted, not templated: three of the six may carry a
+      # credential and none of them may appear in a manifest.
+      volumes:
+        {{- range $name, $doc := $mounted }}
+        - name: {{ printf "doc-%s" (kebabcase $name) }}
+          secret:
+            secretName: {{ $doc.secretName | quote }}
+            items:
+              - key: {{ $doc.key | quote }}
+                path: {{ $doc.key | quote }}
+        {{- end }}
+      {{- end }}
+      {{- with $tier.tier.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tier.tier.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tier.tier.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

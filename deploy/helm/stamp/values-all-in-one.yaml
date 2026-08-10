@@ -1,0 +1,49 @@
+# The all-in-one topology (R25): one Deployment, one database login, the PEP and
+# console listeners on one pod. This is values.yaml plus the settings that have
+# no safe default — the trust boundary and the egress allowlist.
+#
+# It is also the input to deploy/helm/snapshots/all-in-one.yaml, so a change
+# here shows up as a diff in the rendered manifest under test.
+topology: all-in-one
+
+image:
+  repository: ghcr.io/d0lim/stamp
+  tag: ""
+
+oidc:
+  issuer: https://idp.example
+  jwksUrl: https://idp.example/.well-known/jwks.json
+  audience: stamp
+  workloadClients:
+    - pep-1
+
+database:
+  credentials:
+    allInOne:
+      secretName: stamp-db
+      key: dsn
+
+egress:
+  allow:
+    - https://risk.internal.example
+
+authoring:
+  mode: both
+
+console:
+  # Empty: the bundle and the API are the same origin here, which is what makes
+  # this the single-container install.
+  apiBaseUrl: ""
+  oidc:
+    clientId: stamp-console
+    authorizationEndpoint: https://idp.example/authorize
+    tokenEndpoint: https://idp.example/token
+
+allInOne:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      memory: 1Gi

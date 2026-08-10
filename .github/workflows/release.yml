@@ -1,0 +1,229 @@
+name: release
+
+# A tag releases; a manual run rehearses. The dispatch path runs every step that
+# can run without publishing anything, so the first time a real tag is pushed is
+# not the first time the workflow has been executed.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to rehearse, without the leading v"
+        required: true
+        default: "0.1.0"
+      unreleased:
+        description: "take the release notes from the Unreleased section"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+
+jobs:
+  # Everything that decides whether this commit may be released at all. It runs
+  # first and alone: a release that fails halfway has already pushed an image.
+  gates:
+    name: release gates
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: resolve the version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+          else
+            version="${{ inputs.version }}"
+            publish=false
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "releasing ${version} (publish=${publish})"
+
+      # R11. The three public contracts are documented with a semver version,
+      # and each stated version still matches the constant the code ships.
+      - name: the three public contracts are versioned
+        run: scripts/check-contract-versions.sh
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt, vet and the test suite
+        run: |
+          make fmt-check
+          make vet
+          make test
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      # The chart is asserted against committed snapshots, so the snapshots have
+      # to be what the chart renders. Without this step a chart change could
+      # land with the assertions still passing against a stale rendering.
+      - name: the chart snapshots are current
+        run: deploy/helm/render.sh --check
+
+  image:
+    name: image
+    needs: gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: log in to the registry
+        if: needs.gates.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: image reference
+        id: ref
+        run: |
+          ref="${REGISTRY}/${IMAGE_NAME}:${{ needs.gates.outputs.version }}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "${ref}"
+            if [ "${{ needs.gates.outputs.publish }}" = "true" ]; then
+              echo "${REGISTRY}/${IMAGE_NAME}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # A rehearsal builds for the runner's architecture and keeps the image
+          # locally; a release builds both and pushes.
+          platforms: ${{ needs.gates.outputs.publish == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ needs.gates.outputs.publish == 'true' }}
+          load: ${{ needs.gates.outputs.publish != 'true' }}
+          build-args: |
+            VERSION=${{ needs.gates.outputs.version }}
+          tags: ${{ steps.ref.outputs.tags }}
+
+      - name: install cosign
+        if: needs.gates.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@v3
+      - name: sign the image by digest
+        if: needs.gates.outputs.publish == 'true'
+        # Keyless: the signature is bound to this workflow's OIDC identity, so
+        # there is no key to rotate and no key to leak.
+        run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+
+  artifacts:
+    name: chart, sbom and notes
+    needs: [gates, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - uses: anchore/sbom-action/download-syft@v0
+
+      # The same script a contributor can run locally. Its output is the whole
+      # artifact set: the packaged chart, the SBOM, the release notes taken from
+      # CHANGELOG.md, the checksums, and the manifest of what gets signed.
+      - name: build the artifacts
+        run: |
+          args=(--version "${{ needs.gates.outputs.version }}")
+          if [ "${{ needs.gates.outputs.publish }}" = "true" ]; then
+            args+=(--image "${{ needs.image.outputs.ref }}")
+          elif [ "${{ inputs.unreleased }}" = "true" ]; then
+            args+=(--unreleased)
+          fi
+          scripts/release-artifacts.sh "${args[@]}"
+
+      - name: upload the artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.gates.outputs.version }}
+          path: dist/
+          retention-days: 14
+
+      - uses: sigstore/cosign-installer@v3
+        if: needs.gates.outputs.publish == 'true'
+
+      - name: sign every file in the manifest
+        if: needs.gates.outputs.publish == 'true'
+        run: |
+          cd dist
+          while IFS= read -r entry; do
+            case "${entry}" in
+              file:*)
+                f="${entry#file:}"
+                cosign sign-blob --yes \
+                  --bundle "${f}.cosign.bundle" \
+                  --output-signature "${f}.sig" \
+                  --output-certificate "${f}.pem" \
+                  "${f}"
+                ;;
+            esac
+          done < sign-manifest.txt
+
+      - name: publish the chart
+        if: needs.gates.outputs.publish == 'true'
+        run: |
+          helm registry login ${{ env.REGISTRY }} \
+            --username ${{ github.actor }} --password ${{ secrets.GITHUB_TOKEN }}
+          helm push "dist/stamp-${{ needs.gates.outputs.version }}.tgz" "${CHART_REPO}"
+
+      - name: publish the release
+        if: needs.gates.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "dist/RELEASE-NOTES-${{ needs.gates.outputs.version }}.md" \
+            dist/*
+
+      - name: rehearsal summary
+        if: needs.gates.outputs.publish != 'true'
+        run: |
+          {
+            echo "### release rehearsal ${{ needs.gates.outputs.version }}"
+            echo
+            echo "Built, not published:"
+            echo '```'
+            ls -1 dist
+            echo '```'
+            echo "To sign on a real tag:"
+            echo '```'
+            cat dist/sign-manifest.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

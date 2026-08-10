@@ -1,0 +1,353 @@
+# Default values for the stamp chart: the all-in-one topology (R25).
+#
+# `topology` is the one setting that changes the shape of the release rather
+# than its size. Everything else here is the same in both topologies.
+#
+#   all-in-one  one Deployment running --roles=all, one database login, the PEP
+#               and console listeners on one pod.
+#   split       one Deployment per role, each with its own database login and
+#               only the listeners its role actually serves bound. See
+#               values-split.yaml for a worked example.
+topology: all-in-one
+
+image:
+  repository: ghcr.io/d0lim/stamp
+  # Empty selects the chart's appVersion, which the release workflow stamps from
+  # the git tag. Pinning it here is for a deployment that lags the chart.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Applied to every tier. Per-tier overrides live under `allInOne` and `roles`.
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# --- listeners ------------------------------------------------------------
+#
+# The three surfaces are three listeners, not three path prefixes on one, and
+# which of them a tier binds is a property of the roles it runs, not an operator
+# choice: a check tier that bound the console listener would answer nothing on
+# it, and a console tier that bound the PEP listener would expose a port with no
+# routes. The chart derives the binding and writes the unbound ones as an
+# explicit empty address, which is how the binary is told to leave a surface
+# down (an absent variable takes the default instead).
+#
+#   pep       AuthZEN check. Callers are workloads holding client credentials.
+#   console   the console bundle and every operator/approver route. The `api`
+#             and `console` roles are separable but both serve here (R51).
+#   callback  external challenge completion, MFA step-up return, HTTP velocity
+#             ingest. Unbound by default because it is the one surface a
+#             deployment may have to expose beyond its perimeter (R39).
+listeners:
+  pep:
+    port: 8080
+  console:
+    port: 8081
+  callback:
+    enabled: false
+    port: 8082
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+# --- database -------------------------------------------------------------
+database:
+  # STAMP_DSN is the only connection setting the binary has, so per-role
+  # database credentials (R39) are per-tier *logins*: each tier reads its DSN
+  # from its own Secret, and each of those logins is granted one of the roles
+  # the grants file provisions. A check tier compromised through the PEP surface
+  # then holds a login that cannot write a policy, because the grant says so and
+  # not because the process declines to.
+  #
+  # The chart never templates a DSN. Every entry below names a Secret that
+  # already exists in the namespace (R42).
+  credentials:
+    # topology: all-in-one — one login, holding the admin role.
+    allInOne:
+      secretName: stamp-db
+      key: dsn
+    # topology: split — one login per tier. Grant each of these logins the
+    # database role named beside it.
+    check:
+      secretName: stamp-db-check # grant: stamp_check (select + audit insert)
+      key: dsn
+    decide:
+      secretName: stamp-db-decide # grant: stamp_decide (decision lifecycle)
+      key: dsn
+    consumer:
+      secretName: stamp-db-consumer # grant: stamp_consumer (bucket upsert only)
+      key: dsn
+    api:
+      secretName: stamp-db-api # grant: stamp_admin (authoring and governance)
+      key: dsn
+    console:
+      # The console role serves the bundle and its configuration document and
+      # queries nothing, but every process opens the store at boot. The check
+      # role's grant is the narrowest one that satisfies that.
+      secretName: stamp-db-console # grant: stamp_check
+      key: dsn
+
+  maxConns: 24
+
+  # Migrations and grants are the admin login's work, and they run on exactly
+  # one tier: in the split topology that is `api`, and every other tier has both
+  # switched off. Applying grants needs CREATE ROLE, which a hardened deployment
+  # may withhold; switch it off and run internal/store/grants.sql yourself.
+  migrate: true
+  applyGrants: true
+
+  # Database role names are cluster-global, so a cluster that already has a role
+  # called stamp_check can rename ours. Empty selects the defaults:
+  # stamp_check, stamp_decide, stamp_consumer, stamp_admin.
+  roleNames:
+    check: ""
+    decide: ""
+    consumer: ""
+    admin: ""
+
+# --- identity -------------------------------------------------------------
+oidc:
+  # Required. A release without these fails at boot with the variable named.
+  issuer: ""
+  jwksUrl: ""
+  audience: ""
+  # Client identifiers whose tokens are workload credentials rather than
+  # end-user ones.
+  workloadClients: []
+  # Empty selects RS256,ES256.
+  algorithms: []
+  # Bounds every end-user token's acr. If set it must be a superset of
+  # mfa.acrValues, or boot fails.
+  acrValues: []
+  # Development only: permits a plaintext issuer or JWKS URL.
+  allowInsecureTransport: false
+
+# The IdP a bare approver identifier in a policy belongs to. Must name a pinned
+# issuer.
+approverIssuer: ""
+
+# --- egress (R35) ---------------------------------------------------------
+#
+# Nothing is dialled that is not listed here. Entries are scheme://host[:port]
+# and match exactly — there are no wildcards.
+egress:
+  allow: []
+  allowLoopback: false
+  allowPrivate: false
+
+# Permits source declarations that ask to fail open. Off by default (R36).
+factAllowFailOpen: false
+
+# --- authoring (R49) ------------------------------------------------------
+#
+#   both     (default) both paths write policy, each owning its own policies
+#   file     closes the console's policy authoring
+#   console  closes the file path's apply
+#
+# No mode closes the approval inbox, the audit views, the dry run or the lock —
+# an operator who set `file` would otherwise be locked out of governance.
+# An unrecognized value fails the boot rather than falling back to `both`.
+authoring:
+  mode: both
+  # The verified token claim policy.author and audit.read are read from. Empty
+  # selects stamp_capabilities.
+  capabilityClaim: ""
+
+# --- governance -----------------------------------------------------------
+governance:
+  # The operator floor under any revision quorum. Empty selects the default.
+  minApprovers: ""
+  proposerMayApprove: false
+
+# --- audit ----------------------------------------------------------------
+audit:
+  # Deny on the check path while the audit buffer is saturated. On by default.
+  failClosed: true
+  # R32's signed checkpoint sink — the sink path, the signing key and its
+  # identifier — is deliberately NOT exposed here. internal/store carries the
+  # signer, the file sink and the webhook sink, but nothing in
+  # internal/runtime/config.go reads a checkpoint setting from the environment
+  # yet, so there is no variable for this chart to set. A values block here
+  # would render into a manifest the binary ignores, which is worse than its
+  # absence: it would read as a configured control. It arrives with the unit
+  # that wires the checkpointer.
+
+# --- console (D19, R50, R51) ---------------------------------------------
+console:
+  # Where the bundle sends its API calls. Empty means the origin the bundle came
+  # from, which is the all-in-one install. In the split topology this is how the
+  # console tier is pointed at the api tier, and it is the only source of that
+  # address — the browser cannot supply one.
+  apiBaseUrl: ""
+  oidc:
+    # Empty falls back to oidc.issuer.
+    issuer: ""
+    clientId: ""
+    authorizationEndpoint: ""
+    tokenEndpoint: ""
+    endSessionEndpoint: ""
+    scopes: []
+  # The token claim navigation and default landing are derived from. Empty
+  # selects `roles`.
+  roleClaim: ""
+  allowInsecureTransport: false
+
+# --- external challenges and MFA -----------------------------------------
+#
+# This deployment's externally reachable callback base. Told to external targets
+# and used to build the step-up redirect. Distinct from the callback listener's
+# bind address.
+callbackBaseUrl: ""
+
+mfa:
+  # Required to run delegated MFA at all: an IdP downgrades an acr request it
+  # cannot satisfy without saying so.
+  acrValues: []
+  requiredAmr: []
+  authorizationEndpoint: ""
+  clientId: ""
+  redirectUri: ""
+  scopes: []
+  tokenIssuer: ""
+  tokenClientId: ""
+  tokenAudience: ""
+  allowInsecureTransport: false
+  ciba:
+    # A non-empty backchannel endpoint is what enables CIBA.
+    backchannelEndpoint: ""
+    tokenEndpoint: ""
+    clientId: ""
+    scope: ""
+    # The client secret is injected from a Secret, never from a value.
+    clientSecret:
+      secretName: ""
+      key: ""
+
+# --- ingestion ------------------------------------------------------------
+kafka:
+  # A non-empty broker list enables the adapter. Without it the deployment still
+  # ingests over HTTP.
+  brokers: []
+  group: ""
+  adapterName: ""
+  pollRecords: ""
+
+# --- configuration documents ---------------------------------------------
+#
+# Six settings take a JSON document or a path to one. The chart supports the
+# path form only, mounted read-only from a Secret the operator already has:
+# three of the six carry a credential — the webhook signing secret, the
+# directory credential, the ingest grants — and a value that can hold a
+# credential does not belong in a chart value or a ConfigMap (R42). The other
+# three are mounted the same way because a second mechanism would be a second
+# thing to get wrong.
+#
+# An empty secretName leaves the setting unset, which is how a deployment that
+# declares no fact sources runs.
+#
+# Every tier mounts every configured document, including the split topology's
+# check tier, and that is a property of the binary rather than a shortcut here:
+# the composition root builds the fact, stream, ingest, group and external
+# registries before roles are applied (internal/runtime/wiring.go), so a process
+# whose environment names a document it cannot read fails to boot, and one that
+# is missing a declaration refuses to load the policies that use it. Narrowing
+# the credential-bearing documents to the tiers that need them is a runtime
+# change, not a chart change.
+documents:
+  factSources:
+    secretName: ""
+    key: fact-sources.json
+  streamSources:
+    secretName: ""
+    key: stream-sources.json
+  ingestCredentials:
+    secretName: ""
+    key: ingest-credentials.json
+  externalTargets:
+    secretName: ""
+    key: external-targets.json
+  idpGroupSources:
+    secretName: ""
+    key: idp-group-sources.json
+  kafkaTopics:
+    secretName: ""
+    key: kafka-topics.json
+
+# The escape hatch for the settings this chart does not model. The binary reads
+# far more environment than the chart exposes, and a deployment that needs one
+# of them should not have to fork the chart.
+#
+# Literal secrets do not go here. Use valueFrom.secretKeyRef; the rendered
+# manifest is asserted to carry no plaintext credential.
+extraEnv: []
+
+# --- tiers ----------------------------------------------------------------
+#
+# topology: all-in-one reads `allInOne`; topology: split reads `roles`.
+allInOne:
+  replicas: 1
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+roles:
+  check:
+    enabled: true
+    replicas: 3
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+  decide:
+    enabled: true
+    replicas: 1
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+  consumer:
+    enabled: true
+    replicas: 1
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+  api:
+    enabled: true
+    replicas: 2
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}
+  console:
+    enabled: true
+    replicas: 1
+    resources: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    podAnnotations: {}

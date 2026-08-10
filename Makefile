@@ -92,6 +92,24 @@ bench: ## Run the check path benchmark, writing bench/out
 	cd bench && $(GO) test -run '^$$' -bench . -benchtime=1x \
 		-count=$(BENCH_REPEATS) -timeout=$(BENCH_TIMEOUT) .
 
+VERSION ?= 0.1.0
+
+.PHONY: chart
+chart: ## Render both Helm topologies into deploy/helm/snapshots
+	deploy/helm/render.sh
+
+.PHONY: chart-check
+chart-check: ## Fail if the committed Helm snapshots are not what the chart renders
+	deploy/helm/render.sh --check
+
+.PHONY: contracts
+contracts: ## Check that the three public contracts are documented with a semver version
+	scripts/check-contract-versions.sh
+
+.PHONY: release-dryrun
+release-dryrun: ## Build the release artifacts locally, publishing nothing
+	scripts/release-artifacts.sh --version $(VERSION) --unreleased
+
 # `land` is the local stand-in for branch protection. This repository is a
 # private free-plan repo, where required status checks are unavailable, so the
 # merge gates in the plan's landing strategy are convention rather than

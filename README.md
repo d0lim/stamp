@@ -183,10 +183,27 @@ make hooks          # run those gates from a pre-push hook
 make help           # list targets
 ```
 
+## Deploying
+
+`deploy/helm/stamp` installs either topology from one values setting.
+
+```sh
+helm install stamp deploy/helm/stamp -f deploy/helm/stamp/values-all-in-one.yaml
+helm install stamp deploy/helm/stamp -f deploy/helm/stamp/values-split.yaml
+```
+
+`all-in-one` is one Deployment running `--roles=all`. `split` is one Deployment per role, each with its own database login and only the listeners its role serves bound — the check tier has no console listener to reach. No credential is templated: every one arrives as a Secret reference or a mounted file, and the rendered manifests of both topologies are committed under `deploy/helm/snapshots` and asserted in `internal/release`.
+
+The chart's `NOTES` end with the two steps a fresh install still owes: take the one-time bootstrap token out of the api tier's log, and lock governance with it.
+
 ## Development
 
 ```sh
 make test              # go test -race ./...
+make chart             # render both Helm topologies into deploy/helm/snapshots
+make chart-check       # fail if the committed snapshots are stale
+make contracts         # the three public contracts are documented and versioned
+make release-dryrun    # build the release artifacts, publishing nothing
 make lint              # golangci-lint
 make vulncheck         # govulncheck
 make console-test      # typecheck, contract boundary check, vitest
@@ -204,6 +221,16 @@ Contributions follow the landing strategy in the plan: one implementation unit p
 | [`STRATEGY.md`](STRATEGY.md) | Target problem, approach, who it's for, what we're not building |
 | [`docs/plans/2026-08-07-001-feat-stamp-feature-map-plan.md`](docs/plans/2026-08-07-001-feat-stamp-feature-map-plan.md) | What v1 is and how it gets built — requirements, units, verification, landing strategy |
 | [`docs/decisions/stamp-decision-log.md`](docs/decisions/stamp-decision-log.md) | Why it has this shape, and which alternatives were rejected |
+
+## Public contracts
+
+Three contracts are versioned with semver from the first release, and each one's specification states its version. A release is blocked when a document is missing, states no version, or states one the code no longer ships — `scripts/check-contract-versions.sh` is the gate.
+
+| Contract | Specification | Version |
+|---|---|---|
+| Policy schema | [`docs/contracts/policy-schema.md`](docs/contracts/policy-schema.md) | 1.0.0 |
+| challenge interface | [`docs/contracts/challenge-interface.md`](docs/contracts/challenge-interface.md) | 1.0.0 |
+| Decision API | [`docs/contracts/decision-api.md`](docs/contracts/decision-api.md) | 1.0.0 |
 
 ## License
 
