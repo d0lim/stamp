@@ -1,0 +1,623 @@
+package runtime
+
+// wiring_test.go is M1's exit condition: F1 and F2 demonstrated end to end
+// through the assembled process, against a real Postgres.
+//
+// Both flows are driven over HTTP against the process's own listeners, with
+// tokens from a real OIDC issuer, because the point is that the units meet —
+// and every one of them meets the others at a boundary that only exists once
+// the composition root is there.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/d0lim/stamp/internal/api"
+	"github.com/d0lim/stamp/internal/decision"
+	"github.com/d0lim/stamp/internal/engine"
+	"github.com/d0lim/stamp/internal/identity"
+	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/policy/revision"
+	"github.com/d0lim/stamp/internal/store"
+)
+
+// ---------------------------------------------------------------------------
+// F1 — 계좌 화이트리스트 검사 (R1, R7, R13, R14)
+// ---------------------------------------------------------------------------
+
+// TestF1AccountWhitelistCheck walks the whole check path: a PEP presents a
+// workload credential, the request matches a policy, the policy reaches a
+// synchronous fact source over the egress gate, the condition is evaluated, and
+// the caller gets an immediate AuthZEN verdict that lands in the audit chain.
+func TestF1AccountWhitelistCheck(t *testing.T) {
+	h := newHarness(t, harnessOptions{writerID: "f1-writer"})
+	h.seed(tenantSchema(), whitelistPolicy("whitelist-transfer"))
+
+	pep := h.idp.workload(t, "svc-payments")
+
+	t.Run("an unauthenticated request is refused before evaluation", func(t *testing.T) {
+		// R40: the refusal is the credential check, not a deny with a reason.
+		code, _ := h.do(http.MethodPost, api.SurfacePEP, api.EvaluationPath, "",
+			evaluation("1001", "2002", "transfer"), nil)
+		if code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated evaluation = %d, want %d", code, http.StatusUnauthorized)
+		}
+		if h.upstream.count() != 0 {
+			t.Errorf("the fact source was called %d times for a refused request, want 0", h.upstream.count())
+		}
+	})
+
+	t.Run("a whitelisted destination is allowed", func(t *testing.T) {
+		decisionValue, reason, policyID := h.evaluate(t, pep, evaluation("1001", "2002", "transfer"))
+		if !decisionValue {
+			t.Fatalf("transfer to a whitelisted account = deny (%s), want allow", reason)
+		}
+		if reason != string(engine.ReasonPolicyMatched) {
+			t.Errorf("reason = %q, want %q", reason, engine.ReasonPolicyMatched)
+		}
+		if policyID != "whitelist-transfer" {
+			t.Errorf("policy id = %q, want %q", policyID, "whitelist-transfer")
+		}
+		if h.upstream.count() != 1 {
+			t.Fatalf("the fact source was called %d times, want 1", h.upstream.count())
+		}
+	})
+
+	t.Run("a destination off the whitelist is denied", func(t *testing.T) {
+		decisionValue, reason, _ := h.evaluate(t, pep, evaluation("1001", "9999", "transfer"))
+		if decisionValue {
+			t.Fatal("transfer to an account off the whitelist was allowed")
+		}
+		if reason != string(engine.ReasonConditionNotMet) {
+			t.Errorf("reason = %q, want %q", reason, engine.ReasonConditionNotMet)
+		}
+	})
+
+	t.Run("a repeat lookup is served from the declared TTL", func(t *testing.T) {
+		// R14: the freshness bound is the source declaration's TTL, and the
+		// second judgment within it does not reach the network again. The deny
+		// above used the same source argument, so the count is still one.
+		before := h.upstream.count()
+		allowed, reason, _ := h.evaluate(t, pep, evaluation("1001", "2002", "transfer"))
+		if !allowed {
+			t.Fatalf("the repeated transfer was denied (%s)", reason)
+		}
+		if after := h.upstream.count(); after != before {
+			t.Errorf("the fact source was called %d more times inside its TTL, want 0", after-before)
+		}
+	})
+
+	t.Run("an unmatched action denies with no matching policy", func(t *testing.T) {
+		// R53: a request no policy governs is a deny, and the ground says so.
+		decisionValue, reason, _ := h.evaluate(t, pep, evaluation("1001", "2002", "close"))
+		if decisionValue {
+			t.Fatal("an action no policy governs was allowed")
+		}
+		if reason != string(engine.ReasonNoMatchingPolicy) {
+			t.Errorf("reason = %q, want %q", reason, engine.ReasonNoMatchingPolicy)
+		}
+	})
+
+	t.Run("the judgments reach the audit chain", func(t *testing.T) {
+		// R7: the check path batches its judgments into one chain row per
+		// batch, and the chain has to verify with them in it.
+		batches := h.awaitAudit(t, store.AuditKindCheckBatch, 1)
+		var counted float64
+		for _, b := range batches {
+			if n, ok := b["count"].(float64); ok {
+				counted += n
+			}
+		}
+		if counted < 4 {
+			t.Errorf("the chain accounts for %v check events, want at least the 4 this test made", counted)
+		}
+		h.verifyChain()
+	})
+}
+
+// ---------------------------------------------------------------------------
+// F2 — 정책 수정 정족수 승인 (R2, R3, R4, R6, R7, R21, R23)
+// ---------------------------------------------------------------------------
+
+// TestF2RevisionQuorumApproval walks the whole decide path for a policy change:
+// governance is locked with a quorum, an author submits a revision, the
+// revision becomes a pending decision with a quorum challenge, two approvers
+// approve through the console surface, and on the second approval the decision
+// resolves to allow, the revision takes effect, and the chosen application mode
+// runs against the decisions that were already open.
+func TestF2RevisionQuorumApproval(t *testing.T) {
+	h := newHarness(t, harnessOptions{writerID: "f2-writer"})
+	h.seed(tenantSchema(),
+		whitelistPolicy("whitelist-transfer"),
+		closurePolicy("closure-approval", 1, "carol"))
+
+	author := h.idp.user(t, "author")
+	alice := h.idp.user(t, "alice")
+	bob := h.idp.user(t, "bob")
+
+	// A tenant decision that is already open when the revision lands. R5's
+	// application mode is about these, so without one the mode would run over
+	// an empty set and prove nothing.
+	open, err := h.app.Decisions().Decide(context.Background(), decision.Request{
+		Caller: &identity.Subject{Kind: identity.SubjectWorkload, Issuer: h.idp.server.URL, ID: "svc-ops"},
+		Input: engine.Input{
+			Action:   "close",
+			Subject:  engine.Entity{Type: "account", ID: "acct-src", Attributes: map[string]any{"number": "1001"}},
+			Resource: engine.Entity{Type: "account", ID: "acct-dst", Attributes: map[string]any{"amount": int64(5000)}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("open a tenant decision: %v", err)
+	}
+	if !open.Pending() {
+		t.Fatalf("the tenant decision is %s, want it pending on its quorum", open.State)
+	}
+
+	t.Run("governance starts in solo-admin mode with a live bootstrap token", func(t *testing.T) {
+		if h.app.BootstrapToken() == "" {
+			t.Fatal("the first start issued no bootstrap token")
+		}
+		code, body := h.do(http.MethodGet, api.SurfaceConsole, "/governance", author, "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("GET /governance = %d: %s", code, body)
+		}
+		var view api.GovernanceView
+		h.decode(body, &view)
+		if view.Mode != revision.ModeSolo {
+			t.Errorf("mode = %q, want %q", view.Mode, revision.ModeSolo)
+		}
+		if view.Bootstrap == nil || !view.Bootstrap.Issued || view.Bootstrap.Consumed {
+			t.Errorf("bootstrap status = %+v, want issued and unconsumed", view.Bootstrap)
+		}
+	})
+
+	t.Run("the lock installs a quorum and consumes the token", func(t *testing.T) {
+		code, body := h.do(http.MethodPost, api.SurfaceConsole, "/governance/lock",
+			h.idp.user(t, "root"), `{"threshold": 2, "approvers": ["alice", "bob"]}`,
+			map[string]string{api.BootstrapTokenHeader: h.app.BootstrapToken()})
+		if code != http.StatusOK {
+			t.Fatalf("POST /governance/lock = %d: %s", code, body)
+		}
+		mode, err := h.app.Governance().Mode(context.Background())
+		if err != nil {
+			t.Fatalf("read governance mode: %v", err)
+		}
+		if mode != revision.ModeQuorum {
+			t.Fatalf("mode after the lock = %q, want %q", mode, revision.ModeQuorum)
+		}
+	})
+
+	// The revision itself: one added policy. Adding is not a weakening, so the
+	// requirement is the governance quorum in force plus the operator floor.
+	added := whitelistPolicy("whitelist-transfer-audit")
+	added.Description = "a second reading of the same rule, added by revision"
+	delta := revision.Single(nil, added)
+
+	var proposal revision.Proposal
+	t.Run("the revision is refused nothing and becomes a pending decision", func(t *testing.T) {
+		// R23: the author sees the classification and the affected decisions
+		// before submitting.
+		preview := h.preview(t, author, delta)
+		if preview.Weakening {
+			t.Errorf("adding a policy classified as weakening: %+v", preview.Findings)
+		}
+		if preview.Threshold != 2 {
+			t.Errorf("preview threshold = %d, want 2", preview.Threshold)
+		}
+		if preview.AffectedDecisions != 1 {
+			t.Errorf("preview affected decisions = %d, want the one that is open", preview.AffectedDecisions)
+		}
+		if !preview.Admissible() {
+			t.Fatalf("the revision is inadmissible: %v", preview.Violations)
+		}
+
+		// R6: a policy change goes through STAMP's own decide.
+		proposal = h.propose(t, author, delta, decision.ModeRevaluate)
+		if proposal.State != revision.StatePending {
+			t.Fatalf("proposal state = %q, want %q", proposal.State, revision.StatePending)
+		}
+		if proposal.DecisionID == "" {
+			t.Fatal("the proposal carries no decision")
+		}
+		if proposal.Threshold != 2 {
+			t.Errorf("proposal threshold = %d, want 2", proposal.Threshold)
+		}
+		if _, ok := h.effective("whitelist-transfer-audit"); ok {
+			t.Error("the revised policy took effect before the quorum was collected")
+		}
+	})
+
+	t.Run("an approver reads what they are being asked to authorise", func(t *testing.T) {
+		// R21: the approval screen's read, including R31's binding hash.
+		path := fmt.Sprintf("/decisions/%s/challenges/0/approval", proposal.DecisionID)
+		code, body := h.do(http.MethodGet, api.SurfaceConsole, path, alice, "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("GET %s = %d: %s", path, code, body)
+		}
+		var review struct {
+			BindingHash string `json:"binding_hash"`
+			Have        int    `json:"have"`
+			Need        int    `json:"need"`
+		}
+		h.decode(body, &review)
+		if review.BindingHash == "" {
+			t.Error("the review carries no binding hash")
+		}
+		if review.Have != 0 || review.Need != 2 {
+			t.Errorf("progress = %d of %d, want 0 of 2", review.Have, review.Need)
+		}
+	})
+
+	t.Run("the proposer's own approval does not count", func(t *testing.T) {
+		// R33's floor, enforced by the quorum handler rather than arithmetic
+		// after the fact: the proposer was removed from the eligible set.
+		code, _ := h.approve(t, proposal.DecisionID, author)
+		if code == http.StatusOK {
+			t.Fatal("the proposer's approval was accepted")
+		}
+	})
+
+	t.Run("the quorum resolves the decision and the revision takes effect", func(t *testing.T) {
+		if code, body := h.approve(t, proposal.DecisionID, alice); code != http.StatusOK {
+			t.Fatalf("alice's approval = %d: %s", code, body)
+		}
+		if state := h.decisionState(proposal.DecisionID); state != store.DecisionPending {
+			t.Fatalf("the decision is %s after one of two approvals, want pending", state)
+		}
+		if _, ok := h.effective("whitelist-transfer-audit"); ok {
+			t.Fatal("the revision took effect on one of two approvals")
+		}
+
+		if code, body := h.approve(t, proposal.DecisionID, bob); code != http.StatusOK {
+			t.Fatalf("bob's approval = %d: %s", code, body)
+		}
+		// R4: the decision transitions out of pending on the quorum.
+		if state := h.decisionState(proposal.DecisionID); state != store.DecisionAllowed {
+			t.Fatalf("the decision is %s after the quorum, want allowed", state)
+		}
+		// The approval surface reconciles inline, so the revision is in force
+		// by the time the second approval returns.
+		if _, ok := h.effective("whitelist-transfer-audit"); !ok {
+			t.Fatal("the revision did not take effect after the quorum")
+		}
+		if state := h.revisionState(t, author, proposal.ID); state != revision.StateApplied {
+			t.Fatalf("revision state = %q, want %q", state, revision.StateApplied)
+		}
+	})
+
+	t.Run("the chosen application mode ran at effect time", func(t *testing.T) {
+		// R5: revaluation is the default and it ran over the decision that was
+		// open, reusing that decision's frozen fact snapshot.
+		applied := h.auditPayloads(revision.AuditKindRevisionApplied)
+		if len(applied) != 1 {
+			t.Fatalf("%d revision.applied audit rows, want 1", len(applied))
+		}
+		row := applied[0]
+		if row["application_mode"] != string(decision.ModeRevaluate) {
+			t.Errorf("application mode = %v, want %q", row["application_mode"], decision.ModeRevaluate)
+		}
+		if considered, _ := row["decisions_considered"].(float64); considered != 1 {
+			t.Errorf("decisions considered = %v, want 1 (the open tenant decision)", row["decisions_considered"])
+		}
+		if fetched, _ := row["sources_fetched"].(float64); fetched != 0 {
+			t.Errorf("sources fetched = %v, want 0: revaluation reuses the frozen snapshot", row["sources_fetched"])
+		}
+		revalidated := h.auditPayloads(decision.AuditKindRevalidated)
+		if len(revalidated) != 1 {
+			t.Errorf("%d decision.revalidated audit rows, want the one open decision", len(revalidated))
+		}
+		if state := h.decisionState(open.ID); state != store.DecisionPending {
+			t.Errorf("the revalidated decision is %s, want it still pending on its own quorum", state)
+		}
+	})
+
+	t.Run("the check tier serves the revised set", func(t *testing.T) {
+		// R24: the new version reaches the check tier by the refresh poll and
+		// nothing else — no invalidation message, no restart.
+		deadline := time.Now().Add(10 * time.Second)
+		for !contains(policyIDs(h.listPolicies(t, author)), "whitelist-transfer-audit") {
+			if time.Now().After(deadline) {
+				t.Fatal("the revised policy never appeared in the effective set")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err := h.app.Refresh(context.Background()); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		pep := h.idp.workload(t, "svc-payments")
+		allowed, reason, _ := h.evaluate(t, pep, evaluation("1001", "2002", "transfer"))
+		if !allowed {
+			t.Fatalf("the check tier denies (%s) after the revision", reason)
+		}
+	})
+
+	t.Run("the audit chain still verifies", func(t *testing.T) {
+		h.awaitAudit(t, store.AuditKindCheckBatch, 1)
+		h.verifyChain()
+	})
+}
+
+// ---------------------------------------------------------------------------
+// role selection over the real route table
+// ---------------------------------------------------------------------------
+
+// TestRolesDecideWhichRoutesTheProcessHas is U1's guarantee, now asserted over
+// the assembled wiring rather than over placeholders: a role that is not active
+// has no routes on any surface, and the difference is 404 rather than a
+// refusal.
+func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
+	dsn := freshDB(t)
+	approvalPath := "/decisions/d-1/challenges/0/approvals"
+
+	cases := []struct {
+		roles  string
+		writer string
+		want   map[api.Surface]map[string]int
+	}{
+		{
+			roles: "check", writer: "roles-check",
+			want: map[api.Surface]map[string]int{
+				api.SurfacePEP: {
+					"POST " + api.EvaluationPath: http.StatusUnauthorized,
+				},
+				api.SurfaceConsole: {
+					"POST " + approvalPath: http.StatusNotFound,
+					"GET /policies":        http.StatusNotFound,
+					"GET /console/":        http.StatusNotFound,
+				},
+			},
+		},
+		{
+			roles: "decide", writer: "roles-decide",
+			want: map[api.Surface]map[string]int{
+				api.SurfacePEP: {
+					"POST " + api.EvaluationPath: http.StatusNotFound,
+				},
+				api.SurfaceConsole: {
+					"POST " + approvalPath: http.StatusUnauthorized,
+					"GET /policies":        http.StatusNotFound,
+				},
+			},
+		},
+		{
+			roles: "api", writer: "roles-api",
+			want: map[api.Surface]map[string]int{
+				api.SurfaceConsole: {
+					"GET /policies": http.StatusUnauthorized,
+					"GET /console/": http.StatusNotFound,
+				},
+				api.SurfacePEP: {
+					"POST " + api.EvaluationPath: http.StatusNotFound,
+				},
+			},
+		},
+		{
+			roles: "console", writer: "roles-console",
+			want: map[api.Surface]map[string]int{
+				api.SurfaceConsole: {
+					"GET /console/":        http.StatusUnauthorized,
+					"GET /policies":        http.StatusNotFound,
+					"POST " + approvalPath: http.StatusNotFound,
+				},
+				api.SurfacePEP: {
+					"POST " + api.EvaluationPath: http.StatusNotFound,
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run("roles="+tc.roles, func(t *testing.T) {
+			h := newHarness(t, harnessOptions{roles: tc.roles, dsn: dsn, writerID: tc.writer})
+			for surface, expectations := range tc.want {
+				for spec, want := range expectations {
+					method, path, _ := cut(spec)
+					code, _ := h.do(method, surface, path, "", "", nil)
+					if code != want {
+						t.Errorf("%s on the %s surface under --roles=%s = %d, want %d",
+							spec, surface, tc.roles, code, want)
+					}
+				}
+			}
+			// Every process answers its own liveness probe, on every surface it
+			// serves, whatever it runs.
+			for _, surface := range []api.Surface{api.SurfacePEP, api.SurfaceConsole} {
+				if code, _ := h.do(http.MethodGet, surface, "/healthz", "", "", nil); code != http.StatusOK {
+					t.Errorf("GET /healthz on %s under --roles=%s = %d, want 200", surface, tc.roles, code)
+				}
+			}
+		})
+	}
+}
+
+// TestAuditWriterCollisionFailsTheBoot is U4's rule at the composition root: a
+// second process on one writer identifier does not wait its turn.
+func TestAuditWriterCollisionFailsTheBoot(t *testing.T) {
+	dsn := freshDB(t)
+	first := newHarness(t, harnessOptions{dsn: dsn, writerID: "contested"})
+	_ = first
+
+	idp := newMockIdP(t)
+	cfg := Config{
+		DSN: dsn, MaxConns: 8, WriterID: "contested", InstanceID: "second",
+		Addresses: map[api.Surface]string{api.SurfacePEP: "127.0.0.1:0"},
+		OIDC: OIDCConfig{
+			Issuers:                []IssuerConfig{{Issuer: idp.server.URL, JWKSURL: idp.server.URL + "/jwks"}},
+			Audience:               testAudience,
+			Algorithms:             []string{"RS256"},
+			AllowInsecureTransport: true,
+		},
+	}
+	roles, err := ParseRoles("check")
+	if err != nil {
+		t.Fatalf("parse roles: %v", err)
+	}
+	app, err := Assemble(context.Background(), cfg, roles, nil)
+	if err == nil {
+		app.Close()
+		t.Fatal("a second process claimed a held audit writer, want a boot failure")
+	}
+	if !errors.Is(err, store.ErrWriterTaken) {
+		t.Fatalf("collision error = %v, want it to wrap %v", err, store.ErrWriterTaken)
+	}
+}
+
+// TestMissingDSNFailsStartup is the configuration rule: nothing that would be a
+// trust decision gets a default.
+func TestMissingDSNFailsStartup(t *testing.T) {
+	roles, err := ParseRoles("all")
+	if err != nil {
+		t.Fatalf("parse roles: %v", err)
+	}
+	_, err = Assemble(context.Background(), Config{
+		Addresses: map[api.Surface]string{api.SurfacePEP: "127.0.0.1:0"},
+		OIDC: OIDCConfig{
+			Issuers:    []IssuerConfig{{Issuer: "https://idp.invalid", JWKSURL: "https://idp.invalid/jwks"}},
+			Audience:   testAudience,
+			Algorithms: []string{"RS256"},
+		},
+	}, roles, nil)
+	if err == nil {
+		t.Fatal("assembling without a DSN succeeded, want a startup failure")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// harness helpers used by the flows
+// ---------------------------------------------------------------------------
+
+func (h *harness) evaluate(t *testing.T, token, body string) (allowed bool, reason, policyID string) {
+	t.Helper()
+	code, raw := h.do(http.MethodPost, api.SurfacePEP, api.EvaluationPath, token, body, nil)
+	if code != http.StatusOK {
+		t.Fatalf("POST %s = %d: %s", api.EvaluationPath, code, raw)
+	}
+	var resp api.EvaluationResponse
+	h.decode(raw, &resp)
+	reason, _ = resp.Context[api.ContextKeyReason].(string)
+	policyID, _ = resp.Context[api.ContextKeyPolicyID].(string)
+	return resp.Decision, reason, policyID
+}
+
+func (h *harness) preview(t *testing.T, token string, delta revision.Delta) revision.Preview {
+	t.Helper()
+	code, raw := h.do(http.MethodPost, api.SurfaceConsole, "/policies/revisions/preview", token,
+		h.revisionBody(t, delta, ""), nil)
+	if code != http.StatusOK {
+		t.Fatalf("POST /policies/revisions/preview = %d: %s", code, raw)
+	}
+	var out revision.Preview
+	h.decode(raw, &out)
+	return out
+}
+
+func (h *harness) propose(t *testing.T, token string, delta revision.Delta, mode decision.ApplicationMode) revision.Proposal {
+	t.Helper()
+	code, raw := h.do(http.MethodPost, api.SurfaceConsole, "/policies/revisions", token,
+		h.revisionBody(t, delta, mode), nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("POST /policies/revisions = %d: %s", code, raw)
+	}
+	var out revision.Proposal
+	h.decode(raw, &out)
+	return out
+}
+
+func (h *harness) revisionBody(t *testing.T, delta revision.Delta, mode decision.ApplicationMode) string {
+	t.Helper()
+	raw, err := json.Marshal(api.RevisionRequest{Delta: delta, Mode: mode})
+	if err != nil {
+		t.Fatalf("encode revision request: %v", err)
+	}
+	return string(raw)
+}
+
+func (h *harness) approve(t *testing.T, decisionID, token string) (int, []byte) {
+	t.Helper()
+	return h.do(http.MethodPost, api.SurfaceConsole,
+		fmt.Sprintf("/decisions/%s/challenges/0/approvals", decisionID), token, "", nil)
+}
+
+func (h *harness) revisionState(t *testing.T, token, id string) revision.State {
+	t.Helper()
+	code, raw := h.do(http.MethodGet, api.SurfaceConsole, "/policies/revisions/"+id, token, "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /policies/revisions/%s = %d: %s", id, code, raw)
+	}
+	var out revision.Proposal
+	h.decode(raw, &out)
+	return out.State
+}
+
+func (h *harness) listPolicies(t *testing.T, token string) []api.PolicyView {
+	t.Helper()
+	code, raw := h.do(http.MethodGet, api.SurfaceConsole, "/policies", token, "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET /policies = %d: %s", code, raw)
+	}
+	var out api.PolicyListResponse
+	h.decode(raw, &out)
+	return out.Policies
+}
+
+func (h *harness) effective(id string) (*policy.Policy, bool) {
+	rec, err := store.EffectivePolicy(context.Background(), h.app.Store().Pool(), id)
+	if err != nil || rec.Deleted {
+		return nil, false
+	}
+	p, err := rec.Policy()
+	if err != nil {
+		return nil, false
+	}
+	return p, true
+}
+
+func (h *harness) decisionState(id string) store.DecisionState {
+	h.t.Helper()
+	d, err := store.GetDecision(context.Background(), h.app.Store().Pool(), id)
+	if err != nil {
+		h.t.Fatalf("read decision %s: %v", id, err)
+	}
+	return d.State
+}
+
+// awaitAudit waits for the buffered check path to reach the chain. The buffer
+// batches, so a judgment is in the chain a flush interval after it is made
+// rather than in the same call.
+func (h *harness) awaitAudit(t *testing.T, kind string, want int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rows := h.auditPayloads(kind)
+		if len(rows) >= want {
+			return rows
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d %s audit rows after 10s, want at least %d", len(rows), kind, want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func policyIDs(views []api.PolicyView) []string {
+	out := make([]string, len(views))
+	for i, v := range views {
+		out[i] = v.ID
+	}
+	return out
+}
+
+// cut splits "METHOD /path" into its two halves.
+func cut(spec string) (method, path string, ok bool) {
+	for i := 0; i < len(spec); i++ {
+		if spec[i] == ' ' {
+			return spec[:i], spec[i+1:], true
+		}
+	}
+	return http.MethodGet, spec, false
+}

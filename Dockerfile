@@ -18,9 +18,18 @@ FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /
 COPY --from=build /out/stamp /stamp
 USER nonroot:nonroot
-EXPOSE 8080
+
+# The three surfaces are three listeners rather than three path prefixes on
+# one: the PEP surface a workload calls, the console surface an operator calls,
+# and the callback surface, which is unbound unless a deployment asks for it
+# because it is the one a deployment may have to expose beyond its perimeter.
+EXPOSE 8080 8081
 
 # Default to the all-in-one topology. A scaled-out deployment overrides this
 # with its own --roles value; the image is identical either way.
+#
+# Everything else — the database, the OIDC issuer, the egress allowlist — comes
+# from the environment and has no default, so a container started without them
+# fails with a message naming what is missing rather than running on a guess.
 ENTRYPOINT ["/stamp"]
-CMD ["--roles=all", "--addr=:8080"]
+CMD ["--roles=all"]
