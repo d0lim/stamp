@@ -489,9 +489,20 @@ func decodeSubmission(raw json.RawMessage) (Submission, error) {
 	return body, nil
 }
 
+// NormalizeACRValues trims, drops blanks and deduplicates a class list while
+// keeping declaration order: an author's preference order is information, so it
+// is not sorted away.
+//
+// It is exported because two things outside this package have to agree with the
+// handler about when two `acr` requirements are the same one: the revision
+// effect hook, which decides whether a step-up has to be re-opened, and the
+// weakening classifier, which decides what a revised requirement costs to adopt.
+// Three implementations of "the same classes" would be two too many, and the one
+// that drifted would be a bypass rather than a bug.
+func NormalizeACRValues(values []string) []string { return normalizeACR(values) }
+
 // normalizeACR trims, drops blanks and deduplicates a class list while keeping
-// declaration order: an author's preference order is information, so it is not
-// sorted away.
+// declaration order.
 func normalizeACR(values []string) []string {
 	out := make([]string, 0, len(values))
 	for _, v := range values {

@@ -18,6 +18,8 @@ package revision_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -528,4 +530,101 @@ func sameInstant(a, b *time.Time) bool {
 	default:
 		return a.UTC().Truncate(time.Microsecond).Equal(b.UTC().Truncate(time.Microsecond))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// what a relaxed challenge costs to adopt
+// ---------------------------------------------------------------------------
+
+// TestCuttingADelayIsPricedAsAWeakeningRevision is the classifier hole closed
+// end to end, on the case this package already exercised for the rebinding.
+//
+// Before M2 this exact revision — a two-hour hold cut to eighty minutes, the
+// quorum untouched, the challenge list the same length — was classified neutral.
+// The author saw no findings, the approvers were shown none, and the audit row
+// went in at notice severity. Nothing about the wait it was gutting appeared
+// anywhere a human would read.
+func TestCuttingADelayIsPricedAsAWeakeningRevision(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	seed(t, h, delayPolicy("cooling-off", 2*time.Hour))
+	h.lock(2, "a", "b", "c")
+
+	open := h.tenantDecision(transferRequest("u1", 5000))
+	if !open.Pending() {
+		t.Fatalf("decision state = %q, want pending on its wait", open.State)
+	}
+	cut := revision.Single(
+		delayPolicy("cooling-off", 2*time.Hour), delayPolicy("cooling-off", 80*time.Minute))
+
+	// R23: the author is told before submitting, which is the whole point of
+	// classifying at all.
+	preview, err := h.gov.Preview(context.Background(), revision.PreviewRequest{
+		Proposer: user("a"), Delta: revision.Single(
+			delayPolicy("cooling-off", 2*time.Hour), delayPolicy("cooling-off", 80*time.Minute)),
+	})
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if !preview.Weakening {
+		t.Fatalf("cutting a two-hour wait to eighty minutes previewed as neutral: %+v", preview.Findings)
+	}
+	if !preview.ExcludeProposer {
+		t.Error("the proposer is not excluded from their own weakening revision")
+	}
+
+	p := h.propose("a", cut, "")
+	if !p.Weakening {
+		t.Fatalf("the proposal records weakening = false; findings = %v", p.Findings)
+	}
+	var named bool
+	for _, f := range p.Findings {
+		if f.Reason == revision.ReasonDelayShortened {
+			named = true
+		}
+	}
+	if !named {
+		t.Fatalf("findings = %v, want one naming %s", p.Findings, revision.ReasonDelayShortened)
+	}
+
+	t.Run("the proposer's own approval does not count", func(t *testing.T) {
+		if err := h.approve(p, "a"); err == nil {
+			t.Fatal("the proposer's approval was accepted")
+		}
+	})
+
+	t.Run("the record says what was relaxed", func(t *testing.T) {
+		// R33: the audit trail carries the severity a relaxation earns, and the
+		// grounds, so an operator reading the chain afterwards sees the wait that
+		// was cut rather than an unremarkable policy edit.
+		rows := h.auditPayloadsFor(revision.AuditKindRevisionProposed, p.ID)
+		if len(rows) != 1 {
+			t.Fatalf("%d proposal audit rows, want 1", len(rows))
+		}
+		if got := rows[0][revision.SeverityKey]; got != revision.SeverityCritical {
+			t.Errorf("severity = %v, want %q", got, revision.SeverityCritical)
+		}
+		findings, _ := rows[0]["findings"].([]any)
+		if len(findings) == 0 {
+			t.Fatal("the audit row carries no findings")
+		}
+		if !strings.Contains(fmt.Sprint(findings...), string(revision.ReasonDelayShortened)) {
+			t.Errorf("audit findings = %v, want one naming %s", findings, revision.ReasonDelayShortened)
+		}
+	})
+
+	t.Run("two approvers who did not propose it carry it", func(t *testing.T) {
+		if err := h.approve(p, "b"); err != nil {
+			t.Fatalf("b's approval: %v", err)
+		}
+		if err := h.approve(p, "c"); err != nil {
+			t.Fatalf("c's approval: %v", err)
+		}
+		if applied := h.reconcile(); len(applied) != 1 {
+			t.Fatalf("reconcile applied %d revisions, want 1", len(applied))
+		}
+		if got := h.state(p.ID); got != revision.StateApplied {
+			t.Fatalf("revision state = %q, want %q", got, revision.StateApplied)
+		}
+	})
+	h.verifyChain()
 }
