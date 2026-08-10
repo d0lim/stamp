@@ -35,4 +35,21 @@ import (
 
 	// U8 — OIDC relying party and JWKS verification.
 	_ "github.com/coreos/go-oidc/v3/oidc"
+
+	// U12 — the Kafka ingestion adapter.
+	//
+	// franz-go rather than sarama or confluent-kafka-go. confluent-kafka-go
+	// wraps librdkafka and needs cgo, which would cost the static single
+	// binary D14 promises and the scratch image built on it. Between the two
+	// pure-Go clients, franz-go is the one whose consumer group API lets the
+	// offset commit be an explicit call the caller places — U12's whole
+	// correctness argument is that the commit happens after the aggregation
+	// transaction returns, and an autocommit-on-a-timer client would leave
+	// that ordering to a background goroutine. It is also the plan's stated
+	// starting direction.
+	_ "github.com/twmb/franz-go/pkg/kgo"
+
+	// U12 — the Kafka adapter's integration tests. The aggregation suite runs
+	// with no broker at all; this is only for the adapter's own tests.
+	_ "github.com/testcontainers/testcontainers-go/modules/kafka"
 )
