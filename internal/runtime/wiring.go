@@ -26,11 +26,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/d0lim/stamp/internal/api"
 	"github.com/d0lim/stamp/internal/challenge"
+	"github.com/d0lim/stamp/internal/challenge/mfa"
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/fact"
@@ -45,10 +47,11 @@ type App struct {
 	roles  Set
 	logger *slog.Logger
 
-	store  *store.Store
-	writer *store.AuditWriter
-	facts  *fact.Registry
-	buffer *api.AuditBuffer
+	store      *store.Store
+	writer     *store.AuditWriter
+	facts      *fact.Registry
+	buffer     *api.AuditBuffer
+	challenges *challenge.Registry
 
 	check      *engine.CheckService
 	decide     *decidePlane
@@ -193,10 +196,15 @@ func (a *App) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	challenges, err := challenge.NewRegistry(quorum)
+	handlers, err := a.challengeHandlers(quorum)
 	if err != nil {
 		return err
 	}
+	challenges, err := challenge.NewRegistry(handlers...)
+	if err != nil {
+		return err
+	}
+	a.challenges = challenges
 	plane, err := newDecidePlane(ctx, decision.Config{
 		Store:          s,
 		Audit:          writer,
@@ -260,10 +268,24 @@ func (a *App) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	approvals, err := api.NewApprovals(api.ApprovalsConfig{
-		Decisions: &reconciling{inner: plane, governance: governance, logger: a.logger},
-		Reviews:   quorum,
-	})
+	// Every collecting surface submits through the same seam: an approval, an
+	// mfa completion, a delay cancellation and a webhook verdict are one code
+	// path with four doors, and the revision reconcile that has to follow the
+	// last approval has to follow all four for the same reason.
+	submitter := &reconciling{inner: plane, governance: governance, logger: a.logger}
+	approvals, err := api.NewApprovals(api.ApprovalsConfig{Decisions: submitter, Reviews: quorum})
+	if err != nil {
+		return err
+	}
+	cancellations, err := api.NewCancellations(api.CancellationsConfig{Decisions: submitter})
+	if err != nil {
+		return err
+	}
+	callbacks, err := api.NewCallbacks(api.CallbacksConfig{Decisions: submitter})
+	if err != nil {
+		return err
+	}
+	mfaCallback, err := api.NewMFA(api.MFAConfig{Decisions: submitter, Tokens: verifier})
 	if err != nil {
 		return err
 	}
@@ -308,6 +330,29 @@ func (a *App) build(ctx context.Context) error {
 		Name:   "approval-api",
 		Roles:  []Role{RoleDecide},
 		Routes: approvals.Routes(),
+	}); err != nil {
+		return err
+	}
+	if err := registry.Add(Component{
+		// The cancellation is a console action behind an end-user credential:
+		// stopping a wait is a person exercising an authority, and the mount
+		// table admits nothing else there.
+		Name:   "cancellation-api",
+		Roles:  []Role{RoleDecide},
+		Routes: cancellations.Routes(),
+	}); err != nil {
+		return err
+	}
+	if err := registry.Add(Component{
+		// Both callbacks are on the callback listener, which is the one surface
+		// a deployment may have to expose past its perimeter. Neither takes a
+		// header credential: an external target authenticates with a signature
+		// over a server-issued nonce, and an mfa completion carries a verified
+		// token in its body. They are one component because they are one
+		// exposure decision.
+		Name:   "callback-api",
+		Roles:  []Role{RoleDecide},
+		Routes: append(callbacks.Routes(), mfaCallback.Routes()...),
 	}); err != nil {
 		return err
 	}
@@ -379,6 +424,129 @@ func (a *App) build(ctx context.Context) error {
 	}
 	a.server = server
 	return registry.Mount(a.roles, server)
+}
+
+// challengeHandlers builds the challenge kinds this deployment serves.
+//
+// Three of the four are unconditional. A delay owns no configuration at all, an
+// external handler needs only the egress gate — a deployment with no targets
+// configured still registers it, because the refusal a policy naming an unknown
+// target gets from the handler is more useful than the one it would get from an
+// empty registry — and the quorum is built by the caller.
+//
+// The fourth is conditional, and that is the resolution of U10's first trap
+// rather than a shortcut. [mfa.Config].AllowedACRValues is mandatory by design:
+// an IdP downgrades an unsatisfiable `acr` request silently, so a handler with
+// no allowlist is a handler whose only real check does not run, and NewDelegated
+// refuses to exist without one. Making the handler unconditional would therefore
+// mean every deployment — including a check-only tier that never issues a
+// challenge — had to configure an IdP step-up endpoint to start. Leaving the
+// kind unregistered is the fail-closed alternative: a policy declaring an mfa
+// challenge gets [challenge.ErrNoHandler] at issue, and a challenge with no
+// handler cannot be satisfied.
+func (a *App) challengeHandlers(quorum *challenge.Quorum) ([]challenge.Handler, error) {
+	cfg := a.cfg
+	gate, err := fact.NewGate(cfg.Egress)
+	if err != nil {
+		return nil, err
+	}
+	external, err := challenge.NewExternal(challenge.ExternalConfig{
+		Gate:            gate,
+		Targets:         cfg.ExternalTargets,
+		CallbackBaseURL: cfg.CallbackBaseURL,
+	})
+	if err != nil {
+		return nil, err
+	}
+	handlers := []challenge.Handler{quorum, challenge.NewDelay(challenge.DelayConfig{}), external}
+
+	if !cfg.MFA.Configured() {
+		a.logger.Info("delegated mfa is not configured; the mfa challenge kind has no handler",
+			slog.String("configure", EnvMFAACRValues))
+		return handlers, nil
+	}
+	delegated, err := a.delegatedMFA()
+	if err != nil {
+		return nil, err
+	}
+	return append(handlers, delegated), nil
+}
+
+// delegatedMFA builds the step-up handler, with the CIBA client in front of it
+// when one is configured.
+//
+// The chain order is D26's: CIBA is tried first because it is the better
+// experience when it exists, and it falls through to the step-up redirect on
+// [mfa.ErrInitiationUnsupported] alone — which is what a real IdP answers when
+// its CIBA grant surface is present but has no decoupled authentication server
+// behind it. Every other failure stays a failure.
+func (a *App) delegatedMFA() (*mfa.Delegated, error) {
+	cfg := a.cfg
+	requests, err := identity.NewStepUp(identity.StepUpConfig{
+		AuthorizationEndpoint:  cfg.MFA.AuthorizationEndpoint,
+		ClientID:               cfg.MFA.ClientID,
+		RedirectURI:            cfg.MFA.RedirectURI,
+		Scopes:                 cfg.MFA.Scopes,
+		AllowInsecureTransport: cfg.MFA.AllowInsecureTransport,
+	})
+	if err != nil {
+		return nil, err
+	}
+	stepUp, err := mfa.NewStepUp(requests)
+	if err != nil {
+		return nil, err
+	}
+
+	var initiator mfa.Initiator = stepUp
+	if cfg.MFA.CIBA.Configured() {
+		ciba, cerr := mfa.NewCIBA(mfa.CIBAConfig{
+			BackchannelEndpoint:    cfg.MFA.CIBA.BackchannelEndpoint,
+			TokenEndpoint:          cfg.MFA.CIBA.TokenEndpoint,
+			ClientID:               cfg.MFA.CIBA.ClientID,
+			ClientSecret:           cfg.MFA.CIBA.ClientSecret,
+			Scope:                  cfg.MFA.CIBA.Scope,
+			AllowInsecureTransport: cfg.MFA.AllowInsecureTransport,
+		})
+		if cerr != nil {
+			return nil, cerr
+		}
+		if initiator, cerr = mfa.NewFallback(ciba, stepUp); cerr != nil {
+			return nil, cerr
+		}
+	}
+
+	// The three token pins default to the deployment's own issuer, the step-up
+	// client and the check audience, which is what a single-IdP install has.
+	// They are separately settable because a challenge is satisfied by the
+	// authentication it asked for, not by any token this process would accept.
+	issuer := cfg.MFA.Issuer
+	if issuer == "" && len(cfg.OIDC.Issuers) > 0 {
+		issuer = cfg.OIDC.Issuers[0].Issuer
+	}
+	clientID := cfg.MFA.TokenClientID
+	if clientID == "" {
+		clientID = cfg.MFA.ClientID
+	}
+	audience := cfg.MFA.Audience
+	if audience == "" {
+		audience = cfg.OIDC.Audience
+	}
+
+	base := strings.TrimRight(cfg.CallbackBaseURL, "/")
+	return mfa.NewDelegated(mfa.Config{
+		Initiator:        initiator,
+		AllowedACRValues: cfg.MFA.AllowedACRValues,
+		RequiredAMR:      cfg.MFA.RequiredAMR,
+		Issuer:           issuer,
+		ClientID:         clientID,
+		Audience:         audience,
+		CallbackURL: func(in challenge.Instance) string {
+			if base == "" {
+				return ""
+			}
+			return base + api.MFACallbackPath(in.DecisionID, in.Ordinal)
+		},
+	})
 }
 
 // Listen binds every configured surface without serving, so a caller can learn
@@ -502,6 +670,13 @@ func (a *App) Governance() *revision.Service { return a.governance }
 
 // Check exposes the check tier.
 func (a *App) Check() *engine.CheckService { return a.check }
+
+// Challenges exposes the challenge handlers this process registered.
+//
+// It is a read of what the deployment configured: the mfa kind is present only
+// when a step-up is configured, and an operator has to be able to see that
+// without inferring it from a decision that failed to issue.
+func (a *App) Challenges() *challenge.Registry { return a.challenges }
 
 // Refresh reloads the effective policy set on both planes at once, rather than
 // waiting for their polls. A deployment never needs it — the polls are R24's

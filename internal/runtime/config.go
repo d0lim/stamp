@@ -20,11 +20,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/d0lim/stamp/internal/api"
+	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/fact"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/policy/revision"
@@ -125,7 +127,86 @@ type Config struct {
 	// CheckPropertyAliases renames incoming AuthZEN property keys before they
 	// are looked up against the schema.
 	CheckPropertyAliases map[string]string
+
+	// ExternalTargets is the operator's webhook destination list. A policy
+	// naming a target that is not on it is refused at issue (D21): the author
+	// selects a destination, the operator decides what that destination is.
+	ExternalTargets []challenge.ExternalTarget
+	// CallbackBaseURL is this deployment's externally reachable callback base,
+	// told to an external target and used to build the step-up redirect a
+	// completion comes back to. Empty leaves both to out-of-band configuration.
+	CallbackBaseURL string
+
+	// MFA is the delegated step-up configuration. It is optional, and the
+	// consequence of leaving it out is that the mfa challenge kind has no
+	// handler at all — which is fail-closed: a policy declaring one cannot be
+	// satisfied and therefore cannot be issued.
+	MFA MFAConfig
 }
+
+// MFAConfig is the delegated MFA trust boundary and transport.
+//
+// It is separate from [OIDCConfig] on purpose. OIDCConfig says which tokens
+// this deployment accepts at all; this says which authentication satisfies a
+// step-up challenge, and the second is narrower than the first by construction.
+type MFAConfig struct {
+	// AllowedACRValues is the operator allowlist of authentication context
+	// classes. It is what makes the whole handler exist: U0 established that an
+	// IdP silently downgrades an `acr` request it cannot satisfy, so an empty
+	// allowlist is a deployment where a password login satisfies a step-up.
+	// [mfa.NewDelegated] refuses an empty one, and so does this configuration.
+	AllowedACRValues []string
+	// RequiredAMR, when non-empty, is compared against a completion that
+	// reports `amr` at all. U0 found the claim empty by default, so it is never
+	// required to be present.
+	RequiredAMR []string
+
+	// AuthorizationEndpoint, ClientID and RedirectURI are the step-up half
+	// (D26's default demo path). All three are required for the handler to be
+	// built.
+	AuthorizationEndpoint string
+	ClientID              string
+	RedirectURI           string
+	// Scopes overrides what a step-up asks for. Empty asks for `openid` only.
+	Scopes []string
+
+	// Issuer, TokenClientID and Audience pin the party a completion token must
+	// come from. Empty values fall back to the deployment's OIDC issuer, the
+	// step-up client and the OIDC audience, which is the arrangement a
+	// single-IdP install has.
+	Issuer        string
+	TokenClientID string
+	Audience      string
+
+	// CIBA is the backchannel transport. It is optional and tried first when
+	// configured: D26 demoted it to a contract with a client because no
+	// self-hostable IdP ships the decoupled authentication server it needs, and
+	// [mfa.NewFallback] drops through to the step-up on
+	// [mfa.ErrInitiationUnsupported].
+	CIBA CIBAConfig
+
+	// AllowInsecureTransport permits plaintext step-up and CIBA endpoints. It
+	// exists for loopback development and tests.
+	AllowInsecureTransport bool
+}
+
+// Configured reports whether the deployment asked for a delegated MFA handler.
+func (m MFAConfig) Configured() bool {
+	return len(m.AllowedACRValues) > 0 || strings.TrimSpace(m.AuthorizationEndpoint) != "" ||
+		strings.TrimSpace(m.ClientID) != "" || m.CIBA.Configured()
+}
+
+// CIBAConfig is the backchannel authentication client's configuration.
+type CIBAConfig struct {
+	BackchannelEndpoint string
+	TokenEndpoint       string
+	ClientID            string
+	ClientSecret        string
+	Scope               string
+}
+
+// Configured reports whether a CIBA client was asked for.
+func (c CIBAConfig) Configured() bool { return strings.TrimSpace(c.BackchannelEndpoint) != "" }
 
 // OIDCConfig is the token verification trust boundary, read from the
 // environment.
@@ -206,6 +287,26 @@ const (
 
 	EnvCheckContextEntity   = "STAMP_CHECK_CONTEXT_ENTITY"
 	EnvCheckPropertyAliases = "STAMP_CHECK_PROPERTY_ALIASES"
+
+	EnvExternalTargets = "STAMP_EXTERNAL_TARGETS"
+	EnvCallbackBaseURL = "STAMP_CALLBACK_BASE_URL"
+
+	EnvMFAACRValues     = "STAMP_MFA_ACR_VALUES"
+	EnvMFARequiredAMR   = "STAMP_MFA_REQUIRED_AMR"
+	EnvMFAAuthzEndpoint = "STAMP_MFA_AUTHORIZATION_ENDPOINT"
+	EnvMFAClientID      = "STAMP_MFA_CLIENT_ID"
+	EnvMFARedirectURI   = "STAMP_MFA_REDIRECT_URI"
+	EnvMFAScopes        = "STAMP_MFA_SCOPES"
+	EnvMFAIssuer        = "STAMP_MFA_TOKEN_ISSUER"
+	EnvMFATokenClientID = "STAMP_MFA_TOKEN_CLIENT_ID" //nolint:gosec // a variable name, not a credential
+	EnvMFAAudience      = "STAMP_MFA_TOKEN_AUDIENCE"
+	EnvMFAAllowInsecure = "STAMP_MFA_ALLOW_INSECURE_TRANSPORT"
+
+	EnvCIBABackchannel  = "STAMP_MFA_CIBA_BACKCHANNEL_ENDPOINT"
+	EnvCIBATokenURL     = "STAMP_MFA_CIBA_TOKEN_ENDPOINT" //nolint:gosec // a variable name, not a credential
+	EnvCIBAClientID     = "STAMP_MFA_CIBA_CLIENT_ID"
+	EnvCIBAClientSecret = "STAMP_MFA_CIBA_CLIENT_SECRET" //nolint:gosec // a variable name, not a credential
+	EnvCIBAScope        = "STAMP_MFA_CIBA_SCOPE"
 )
 
 // ConfigFromEnv reads the deployment configuration from the process
@@ -308,6 +409,33 @@ func ConfigFromEnv() (Config, error) {
 	}
 	cfg.CheckPropertyAliases = aliases
 
+	targets, err := externalTargetsFrom(os.Getenv(EnvExternalTargets))
+	if err != nil {
+		fail("%s: %w", EnvExternalTargets, err)
+	}
+	cfg.ExternalTargets = targets
+	cfg.CallbackBaseURL = strings.TrimSpace(os.Getenv(EnvCallbackBaseURL))
+
+	cfg.MFA = MFAConfig{
+		AllowedACRValues:       splitList(os.Getenv(EnvMFAACRValues)),
+		RequiredAMR:            splitList(os.Getenv(EnvMFARequiredAMR)),
+		AuthorizationEndpoint:  strings.TrimSpace(os.Getenv(EnvMFAAuthzEndpoint)),
+		ClientID:               strings.TrimSpace(os.Getenv(EnvMFAClientID)),
+		RedirectURI:            strings.TrimSpace(os.Getenv(EnvMFARedirectURI)),
+		Scopes:                 splitList(os.Getenv(EnvMFAScopes)),
+		Issuer:                 strings.TrimSpace(os.Getenv(EnvMFAIssuer)),
+		TokenClientID:          strings.TrimSpace(os.Getenv(EnvMFATokenClientID)),
+		Audience:               strings.TrimSpace(os.Getenv(EnvMFAAudience)),
+		AllowInsecureTransport: envBool(EnvMFAAllowInsecure, false, fail),
+		CIBA: CIBAConfig{
+			BackchannelEndpoint: strings.TrimSpace(os.Getenv(EnvCIBABackchannel)),
+			TokenEndpoint:       strings.TrimSpace(os.Getenv(EnvCIBATokenURL)),
+			ClientID:            strings.TrimSpace(os.Getenv(EnvCIBAClientID)),
+			ClientSecret:        os.Getenv(EnvCIBAClientSecret),
+			Scope:               strings.TrimSpace(os.Getenv(EnvCIBAScope)),
+		},
+	}
+
 	if len(errs) > 0 {
 		return Config{}, errors.Join(errs...)
 	}
@@ -360,7 +488,54 @@ func (c Config) validate() error {
 			errs = append(errs, fmt.Errorf("unknown listener surface %q", surface))
 		}
 	}
+	errs = append(errs, c.MFA.validate(c.OIDC)...)
 	return errors.Join(errs...)
+}
+
+// validate refuses a delegated MFA configuration that would produce a challenge
+// nobody could satisfy.
+//
+// The last check is the one that is easy to get wrong and impossible to debug
+// from the outside. [identity.Config].AllowedACRValues bounds *every* end-user
+// token this deployment accepts, so if it is set at all it has to be a superset
+// of the step-up classes — otherwise the callback's Verify rejects the
+// completion before the mfa handler ever runs, and the operator sees a step-up
+// that completes at the IdP and then bounces with a credential error rather than
+// a challenge error. It has to be a superset of whatever console login returns
+// too, but this side cannot know that value, so the failure is stated in the
+// message rather than checked.
+func (m MFAConfig) validate(oidc OIDCConfig) []error {
+	if !m.Configured() {
+		return nil
+	}
+	var errs []error
+	if len(m.AllowedACRValues) == 0 {
+		errs = append(errs, fmt.Errorf(
+			"a delegated mfa handler needs a non-empty acr allowlist (%s): an idp downgrades an "+
+				"unsatisfiable acr request silently, so an unchecked response is an unchecked authentication",
+			EnvMFAACRValues))
+	}
+	for _, field := range []struct{ env, value string }{
+		{EnvMFAAuthzEndpoint, m.AuthorizationEndpoint},
+		{EnvMFAClientID, m.ClientID},
+		{EnvMFARedirectURI, m.RedirectURI},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			errs = append(errs, fmt.Errorf("delegated mfa is configured but %s is not set", field.env))
+		}
+	}
+	if len(oidc.AllowedACRValues) > 0 {
+		for _, want := range m.AllowedACRValues {
+			if !slices.Contains(oidc.AllowedACRValues, want) {
+				errs = append(errs, fmt.Errorf(
+					"%s admits %q but the process-wide token allowlist %s does not: %s bounds every end-user "+
+						"token, so a completion in that class is rejected by token verification before the mfa "+
+						"handler sees it. %s must be a superset of %s and of whatever class console login returns",
+					EnvMFAACRValues, want, EnvOIDCACRValues, EnvOIDCACRValues, EnvOIDCACRValues, EnvMFAACRValues))
+			}
+		}
+	}
+	return errs
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +607,59 @@ func factSourcesFrom(spec string) ([]fact.Declaration, error) {
 			return nil, fmt.Errorf("source %q: timeout: %w", d.Name, err)
 		}
 		out = append(out, decl)
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// external targets
+//
+// Same split as the fact sources above, for the same reason (D21): a policy
+// author names a target, and the operator decides what that target is, what key
+// it is signed under and how long it may take.
+// ---------------------------------------------------------------------------
+
+type externalTargetJSON struct {
+	Name          string `json:"name"`
+	URL           string `json:"url"`
+	Secret        string `json:"secret"`
+	Timeout       string `json:"timeout,omitempty"`
+	RespondWithin string `json:"respond_within,omitempty"`
+}
+
+// externalTargetsFrom reads the webhook destination list. The value is either a
+// JSON document or a path to one, decided by its first character — a shared
+// secret is not something a deployment should have to put in a manifest inline.
+func externalTargetsFrom(spec string) ([]challenge.ExternalTarget, error) {
+	trimmed := strings.TrimSpace(spec)
+	if trimmed == "" {
+		return nil, nil
+	}
+	raw := []byte(trimmed)
+	if !strings.HasPrefix(trimmed, "[") {
+		data, err := os.ReadFile(trimmed) //nolint:gosec // an operator-supplied configuration path
+		if err != nil {
+			return nil, fmt.Errorf("read external targets: %w", err)
+		}
+		raw = data
+	}
+	var docs []externalTargetJSON
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&docs); err != nil {
+		return nil, fmt.Errorf("decode external targets: %w", err)
+	}
+	out := make([]challenge.ExternalTarget, 0, len(docs))
+	for _, d := range docs {
+		target := challenge.ExternalTarget{Name: d.Name, URL: d.URL, Secret: d.Secret}
+		var err error
+		if target.Timeout, err = parseOptionalDuration(d.Timeout); err != nil {
+			return nil, fmt.Errorf("target %q: timeout: %w", d.Name, err)
+		}
+		if target.RespondWithin, err = parseOptionalDuration(d.RespondWithin); err != nil {
+			return nil, fmt.Errorf("target %q: respond_within: %w", d.Name, err)
+		}
+		out = append(out, target)
 	}
 	return out, nil
 }

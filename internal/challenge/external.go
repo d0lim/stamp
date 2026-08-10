@@ -99,6 +99,14 @@ const (
 	ExternalFailureTransport     = "transport"
 	ExternalFailureRedirect      = "redirect"
 	ExternalFailureStatus        = "status"
+
+	// ExternalFailureRetargeted is a revision that pointed this challenge at a
+	// different target. It is the one word in this vocabulary STAMP writes
+	// about itself rather than about a remote, and it exists because the
+	// alternative — re-issuing — would post a second webhook from inside the
+	// revalidation transaction, while that transaction holds a row lock on
+	// every open decision.
+	ExternalFailureRetargeted = "retargeted"
 )
 
 // Defaults for an operator who configures a target and leaves the timings
@@ -594,6 +602,17 @@ func externalFailure(err error) string {
 // ---------------------------------------------------------------------------
 // decoding
 // ---------------------------------------------------------------------------
+
+// DecodeExternalDetail reads a stored external detail.
+//
+// It is exported for the revision effect hook, which has to know which target a
+// round trip is already out to. That question has to be answerable without
+// calling [External.Issue] again: Issue performs a network POST, and the
+// revision path runs inside a transaction holding a row lock on every open
+// decision.
+func DecodeExternalDetail(raw json.RawMessage) (ExternalDetail, error) {
+	return decodeExternalDetail(raw)
+}
 
 func decodeExternalDetail(raw json.RawMessage) (ExternalDetail, error) {
 	var detail ExternalDetail

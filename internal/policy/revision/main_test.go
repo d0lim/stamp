@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -18,8 +20,10 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/d0lim/stamp/internal/challenge"
+	"github.com/d0lim/stamp/internal/challenge/mfa"
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/engine"
+	"github.com/d0lim/stamp/internal/fact"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/policy/revision"
@@ -143,6 +147,7 @@ type harness struct {
 	writer      *store.AuditWriter
 	clock       *clock
 	registry    *challenge.Registry
+	webhook     *webhookTarget
 	gov         *revision.Service
 	token       string
 	resolver    *countingResolver
@@ -196,11 +201,8 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 	t.Cleanup(func() { _ = writer.Close(context.Background()) })
 
-	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: writer, DB: s.Pool()})
-	if err != nil {
-		t.Fatalf("build quorum handler: %v", err)
-	}
-	registry, err := challenge.NewRegistry(quorum)
+	webhook := newWebhookTarget(t)
+	registry, err := allHandlers(t, writer, s, webhook)
 	if err != nil {
 		t.Fatalf("build challenge registry: %v", err)
 	}
@@ -213,7 +215,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	}
 
 	h := &harness{
-		t: t, dsn: dsn, store: s, writer: writer, clock: clk,
+		t: t, dsn: dsn, store: s, writer: writer, clock: clk, webhook: webhook,
 		registry: registry, resolver: opts.resolver, obligations: obligations,
 	}
 	cfg := revision.Config{
@@ -271,11 +273,7 @@ func (h *harness) reclaimWriter() {
 	h.t.Cleanup(func() { _ = writer.Close(context.Background()) })
 	h.writer = writer
 
-	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: writer, DB: h.store.Pool()})
-	if err != nil {
-		h.t.Fatalf("build quorum handler: %v", err)
-	}
-	registry, err := challenge.NewRegistry(quorum)
+	registry, err := allHandlers(h.t, writer, h.store, h.webhook)
 	if err != nil {
 		h.t.Fatalf("build challenge registry: %v", err)
 	}
@@ -724,4 +722,205 @@ func (r *countingResolver) names() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.sought...)
+}
+
+// ---------------------------------------------------------------------------
+// the four challenge kinds
+//
+// M2's exit condition is that all four run together, so the harness registers
+// all four rather than the quorum alone. The delay and the quorum are the real
+// handlers with no configuration at all; the external handler talks to a real
+// HTTP target through the real egress gate; the mfa handler holds a stub
+// initiator, which is the one double here and is the seam U10 designed for —
+// everything the revision path asks an mfa challenge is downstream of the
+// transport.
+// ---------------------------------------------------------------------------
+
+const (
+	testACR         = "urn:mace:incommon:iap:silver"
+	testStrongACR   = "urn:mace:incommon:iap:gold"
+	testMFAIssuer   = "https://idp.test"
+	testMFAClient   = "stamp-console"
+	testMFAAudience = "stamp"
+)
+
+func allHandlers(t *testing.T, writer *store.AuditWriter, s *store.Store, webhook *webhookTarget) (*challenge.Registry, error) {
+	t.Helper()
+	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{Audit: writer, DB: s.Pool()})
+	if err != nil {
+		return nil, err
+	}
+	gate, err := fact.NewGate(fact.EgressConfig{Allow: webhook.origins(), AllowLoopback: true})
+	if err != nil {
+		return nil, err
+	}
+	external, err := challenge.NewExternal(challenge.ExternalConfig{Gate: gate, Targets: webhook.targets()})
+	if err != nil {
+		return nil, err
+	}
+	delegated, err := mfa.NewDelegated(mfa.Config{
+		Initiator:        stubInitiator{},
+		AllowedACRValues: []string{testACR, testStrongACR},
+		Issuer:           testMFAIssuer,
+		ClientID:         testMFAClient,
+		Audience:         testMFAAudience,
+		// Suppression is disabled so that a re-issue this package asks for is a
+		// re-issue it observes. The suppression window is U10's own property and
+		// is tested there.
+		MinReissueInterval: -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return challenge.NewRegistry(quorum, challenge.NewDelay(challenge.DelayConfig{}), external, delegated)
+}
+
+// stubInitiator stands in for an IdP. It reports the step-up transport, which
+// is D26's default path, and records nothing: what the revision path cares
+// about is whether Issue was called at all, and the correlator in the stored
+// detail answers that.
+type stubInitiator struct{}
+
+func (stubInitiator) Initiate(_ context.Context, req mfa.InitiateRequest) (mfa.InitiateResult, error) {
+	return mfa.InitiateResult{
+		Method:           mfa.MethodStepUp,
+		AuthorizationURL: "https://idp.test/authorize?state=" + req.Correlator,
+	}, nil
+}
+
+// webhookTarget is a real external target: a real listener, reached through the
+// real egress gate, counting the notifications it received. The count is the
+// assertion that matters here — a revision that re-issued an external challenge
+// would show up as a second POST.
+type webhookTarget struct {
+	server *httptest.Server
+
+	mu    sync.Mutex
+	calls int
+}
+
+const (
+	webhookPrimary   = "reviewer"
+	webhookSecondary = "reviewer-b"
+	webhookSecret    = "0123456789abcdef0123456789abcdef"
+)
+
+func newWebhookTarget(t *testing.T) *webhookTarget {
+	t.Helper()
+	w := &webhookTarget{}
+	w.server = httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		w.mu.Lock()
+		w.calls++
+		w.mu.Unlock()
+	}))
+	t.Cleanup(w.server.Close)
+	return w
+}
+
+func (w *webhookTarget) count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.calls
+}
+
+func (w *webhookTarget) origins() []string { return []string{w.server.URL} }
+
+// targets configures two entries pointing at the same listener. Two are needed
+// because the revision case that matters is a policy repointed from one
+// configured target to another, and a target the operator never configured is a
+// different refusal entirely.
+func (w *webhookTarget) targets() []challenge.ExternalTarget {
+	return []challenge.ExternalTarget{
+		{Name: webhookPrimary, URL: w.server.URL + "/a", Secret: webhookSecret},
+		{Name: webhookSecondary, URL: w.server.URL + "/b", Secret: webhookSecret},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// gated-policy fixtures for the three new kinds
+// ---------------------------------------------------------------------------
+
+// gatedPolicy is tenantPolicy with an arbitrary challenge list. Each call builds
+// fresh condition values, for the reason tenantPolicy does.
+func gatedPolicy(id string, challenges ...policy.Challenge) *policy.Policy {
+	return &policy.Policy{
+		ID:       id,
+		Subject:  "user",
+		Resource: "account",
+		Actions:  []string{"transfer"},
+		Condition: policy.Compare{
+			Op: policy.OpGe, Left: policy.Field(policy.RoleResource, "amount"), Right: policy.Int(1000),
+		},
+		Challenges: challenges,
+	}
+}
+
+func delayPolicy(id string, wait time.Duration, cancellers ...string) *policy.Policy {
+	d := policy.Delay{Duration: wait}
+	if len(cancellers) > 0 {
+		d.CancellableBy = &policy.ApproverSet{Members: cancellers}
+	}
+	return gatedPolicy(id, d)
+}
+
+func mfaPolicy(id string, acr ...string) *policy.Policy {
+	return gatedPolicy(id, policy.MFA{Mode: policy.MFADelegated, ACRValues: acr})
+}
+
+func externalPolicy(id, target string) *policy.Policy {
+	return gatedPolicy(id, policy.External{Target: target})
+}
+
+// challengeRow reads one challenge's stored row.
+func (h *harness) challengeRow(decisionID string, ordinal int) store.ChallengeProgress {
+	h.t.Helper()
+	rows, err := store.ChallengeProgressFor(context.Background(), h.store.Pool(), decisionID)
+	if err != nil {
+		h.t.Fatalf("read challenge progress: %v", err)
+	}
+	for _, row := range rows {
+		if row.Ordinal == ordinal {
+			return row
+		}
+	}
+	h.t.Fatalf("decision %s carries no challenge %d", decisionID, ordinal)
+	return store.ChallengeProgress{}
+}
+
+func (h *harness) delayDetail(decisionID string) challenge.DelayDetail {
+	h.t.Helper()
+	detail, err := challenge.DecodeDelayDetail(h.challengeRow(decisionID, 0).Detail)
+	if err != nil {
+		h.t.Fatalf("decode delay detail: %v", err)
+	}
+	return detail
+}
+
+func (h *harness) externalDetail(decisionID string) challenge.ExternalDetail {
+	h.t.Helper()
+	detail, err := challenge.DecodeExternalDetail(h.challengeRow(decisionID, 0).Detail)
+	if err != nil {
+		h.t.Fatalf("decode external detail: %v", err)
+	}
+	return detail
+}
+
+func (h *harness) mfaDetail(decisionID string) mfa.Detail {
+	h.t.Helper()
+	detail, err := mfa.DecodeDetail(h.challengeRow(decisionID, 0).Detail)
+	if err != nil {
+		h.t.Fatalf("decode mfa detail: %v", err)
+	}
+	return detail
+}
+
+// nextDeadline reports the decision's scheduler column, which is what the
+// sweeper wakes for.
+func (h *harness) nextDeadline(decisionID string) *time.Time {
+	h.t.Helper()
+	d, err := store.GetDecision(context.Background(), h.store.Pool(), decisionID)
+	if err != nil {
+		h.t.Fatalf("read decision: %v", err)
+	}
+	return d.NextDeadline
 }
