@@ -6,95 +6,193 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/d0lim/stamp/internal/api"
+	"github.com/d0lim/stamp/internal/identity"
 )
 
-// status issues req against the handler built for spec and returns the code.
+// These tests are about the registry mechanism and nothing else: which
+// components a role spec activates, and what that does to the router. The real
+// wiring's route table is asserted in wiring_test.go, against a real database,
+// because it is only real once every unit is in it.
 //
-// A registered route answers 501 (the placeholder); an unregistered one falls
-// through to the mux's 404. That difference is the whole assertion: role
-// selection must decide whether a route exists at all, not merely whether it
-// works.
-func status(t *testing.T, spec, method, path string) int {
+// The assertion throughout is registered versus absent. A mounted route behind
+// a credential answers 401 to an unauthenticated request; a route that was
+// never mounted answers 404. That difference is the whole point of role
+// selection: an inactive subsystem's endpoints do not exist on this process,
+// they are not merely refused by it.
+
+// testMiddleware builds an identity layer over an issuer that is never
+// contacted. Every request in this file is unauthenticated, and an
+// unauthenticated request is refused before any key set is fetched.
+func testMiddleware(t *testing.T) *identity.Middleware {
+	t.Helper()
+	verifier, err := identity.New(t.Context(), identity.Config{
+		Issuers:    []identity.IssuerConfig{{Issuer: "https://idp.invalid", JWKSURL: "https://idp.invalid/jwks"}},
+		Audience:   "stamp",
+		Algorithms: []string{"RS256"},
+	})
+	if err != nil {
+		t.Fatalf("build verifier: %v", err)
+	}
+	mw, err := identity.NewMiddleware(identity.MiddlewareConfig{
+		Verifier: verifier,
+		Audit:    identity.AuditSinkFunc(func(context.Context, identity.AuthRecord) {}),
+	})
+	if err != nil {
+		t.Fatalf("build middleware: %v", err)
+	}
+	return mw
+}
+
+func testServer(t *testing.T) *api.Server {
+	t.Helper()
+	srv, err := api.New(api.Config{
+		Identity: testMiddleware(t),
+		Addresses: map[api.Surface]string{
+			api.SurfacePEP:     "127.0.0.1:0",
+			api.SurfaceConsole: "127.0.0.1:0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("build server: %v", err)
+	}
+	return srv
+}
+
+func stubRoute(name string, surface api.Surface, pattern string, auth api.Auth) api.Route {
+	return api.Route{
+		Name:    name,
+		Surface: surface,
+		Pattern: pattern,
+		Auth:    auth,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
+	}
+}
+
+// stubRegistry mirrors the shape of the real wiring: a PEP component under
+// check, a console component under decide, and a runner under consumer.
+func stubRegistry(t *testing.T) *Registry {
+	t.Helper()
+	r := NewRegistry()
+	r.MustAdd(Component{
+		Name:   "stub-check",
+		Roles:  []Role{RoleCheck},
+		Routes: []api.Route{stubRoute("stub-check", api.SurfacePEP, "POST /stub/check", api.AuthWorkload)},
+	})
+	r.MustAdd(Component{
+		Name:   "stub-decide",
+		Roles:  []Role{RoleDecide},
+		Routes: []api.Route{stubRoute("stub-decide", api.SurfaceConsole, "POST /stub/decide", api.AuthUser)},
+	})
+	r.MustAdd(Component{
+		Name:  "stub-consumer",
+		Roles: []Role{RoleConsumer},
+		Run:   blockUntilDone,
+	})
+	return r
+}
+
+// status mounts the stub registry for spec and issues one unauthenticated
+// request against a surface.
+func status(t *testing.T, spec string, surface api.Surface, method, path string) int {
 	t.Helper()
 	set, err := ParseRoles(spec)
 	if err != nil {
 		t.Fatalf("ParseRoles(%q) returned error: %v", spec, err)
 	}
+	srv := testServer(t)
+	if err := stubRegistry(t).Mount(set, srv); err != nil {
+		t.Fatalf("mount for --roles=%s: %v", spec, err)
+	}
 	rec := httptest.NewRecorder()
-	Default().Handler(set).ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	srv.Handler(surface).ServeHTTP(rec, httptest.NewRequest(method, path, nil))
 	return rec.Code
 }
 
-func TestAllRolesRegisterEverySubsystem(t *testing.T) {
+func TestAllRolesActivateEveryComponent(t *testing.T) {
 	set, err := ParseRoles("all")
 	if err != nil {
 		t.Fatalf("ParseRoles returned error: %v", err)
 	}
-	reg := Default()
+	reg := stubRegistry(t)
 	if got, want := len(reg.Active(set)), len(reg.components); got != want {
 		t.Errorf("--roles=all activated %d components, want all %d", got, want)
 	}
-	for _, name := range []string{
-		"check-api", "decide-api", "expiry-sweeper",
-		"policy-api", "console", "event-consumer",
-	} {
+	for _, name := range []string{"stub-check", "stub-decide", "stub-consumer"} {
 		if !contains(reg.ActiveNames(set), name) {
 			t.Errorf("component %q not active under --roles=all", name)
 		}
 	}
 }
 
-func TestHealthEndpointRespondsForEveryRoleSpec(t *testing.T) {
-	// Including console-only, which mounts no API surface at all.
+func TestHealthEndpointRespondsOnEverySurfaceForEveryRoleSpec(t *testing.T) {
+	// Including console-only and consumer-only, which mount no API surface at
+	// all: a process that is running must be able to say so.
 	for _, spec := range []string{"all", "check", "decide", "api", "console", "consumer"} {
-		if got := status(t, spec, http.MethodGet, "/healthz"); got != http.StatusOK {
-			t.Errorf("GET /healthz under --roles=%s = %d, want %d", spec, got, http.StatusOK)
+		for _, surface := range api.Surfaces() {
+			if got := status(t, spec, surface, http.MethodGet, "/healthz"); got != http.StatusOK {
+				t.Errorf("GET /healthz on %s under --roles=%s = %d, want %d",
+					surface, spec, got, http.StatusOK)
+			}
 		}
 	}
 }
 
-func TestCheckRoleDoesNotRegisterDecideAPI(t *testing.T) {
-	if got := status(t, "check", http.MethodPost, "/access/v1/evaluation"); got != http.StatusNotImplemented {
-		t.Errorf("check endpoint under --roles=check = %d, want it registered (%d)", got, http.StatusNotImplemented)
+func TestInactiveRoleRoutesAreAbsentRatherThanRefused(t *testing.T) {
+	if got := status(t, "check", api.SurfacePEP, http.MethodPost, "/stub/check"); got != http.StatusUnauthorized {
+		t.Errorf("the check route under --roles=check = %d, want it registered and refusing (%d)",
+			got, http.StatusUnauthorized)
 	}
-	if got := status(t, "check", http.MethodPost, "/decisions"); got != http.StatusNotFound {
-		t.Errorf("POST /decisions under --roles=check = %d, want it unregistered (%d)", got, http.StatusNotFound)
+	if got := status(t, "check", api.SurfaceConsole, http.MethodPost, "/stub/decide"); got != http.StatusNotFound {
+		t.Errorf("the decide route under --roles=check = %d, want it unregistered (%d)",
+			got, http.StatusNotFound)
 	}
-}
-
-func TestAPIRoleDoesNotServeConsoleAssets(t *testing.T) {
-	if got := status(t, "api", http.MethodGet, "/policies"); got != http.StatusNotImplemented {
-		t.Errorf("GET /policies under --roles=api = %d, want it registered (%d)", got, http.StatusNotImplemented)
-	}
-	if got := status(t, "api", http.MethodGet, "/console/"); got != http.StatusNotFound {
-		t.Errorf("console asset under --roles=api = %d, want it unserved (%d)", got, http.StatusNotFound)
+	if got := status(t, "decide", api.SurfacePEP, http.MethodPost, "/stub/check"); got != http.StatusNotFound {
+		t.Errorf("the check route under --roles=decide = %d, want it unregistered (%d)",
+			got, http.StatusNotFound)
 	}
 }
 
-func TestConsoleRoleDoesNotRegisterAPIEndpoints(t *testing.T) {
-	if got := status(t, "console", http.MethodGet, "/console/"); got != http.StatusNotImplemented {
-		t.Errorf("console asset under --roles=console = %d, want it served (%d)", got, http.StatusNotImplemented)
+func TestSurfacesAreSeparateRoutersRatherThanPathPrefixes(t *testing.T) {
+	// A route mounted on the PEP surface is not reachable through the console
+	// listener even when both are active. That is the separation the three
+	// listeners exist for, and it does not depend on a proxy rule elsewhere.
+	if got := status(t, "all", api.SurfaceConsole, http.MethodPost, "/stub/check"); got != http.StatusNotFound {
+		t.Errorf("the PEP route on the console surface = %d, want %d", got, http.StatusNotFound)
 	}
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodGet, "/policies"},
-		{http.MethodPost, "/access/v1/evaluation"},
-		{http.MethodPost, "/decisions"},
-	} {
-		if got := status(t, "console", tc.method, tc.path); got != http.StatusNotFound {
-			t.Errorf("%s %s under --roles=console = %d, want it unregistered (%d)",
-				tc.method, tc.path, got, http.StatusNotFound)
-		}
+	if got := status(t, "all", api.SurfacePEP, http.MethodPost, "/stub/decide"); got != http.StatusNotFound {
+		t.Errorf("the console route on the PEP surface = %d, want %d", got, http.StatusNotFound)
+	}
+}
+
+func TestMountRejectsARouteTheSurfaceDoesNotAdmit(t *testing.T) {
+	set, err := ParseRoles("all")
+	if err != nil {
+		t.Fatalf("ParseRoles returned error: %v", err)
+	}
+	reg := NewRegistry()
+	// R40: the PEP surface admits only a workload credential. A component that
+	// asked for an unauthenticated route there is unmountable, so the mistake
+	// is a startup failure rather than an endpoint review has to catch.
+	reg.MustAdd(Component{
+		Name:   "public-pep",
+		Roles:  []Role{RoleCheck},
+		Routes: []api.Route{stubRoute("public-pep", api.SurfacePEP, "POST /stub/open", api.AuthPublic)},
+	})
+	if err := reg.Mount(set, testServer(t)); err == nil {
+		t.Error("mounting an unauthenticated PEP route succeeded, want an error")
 	}
 }
 
 func TestRunnersFollowRoleSelection(t *testing.T) {
-	decide, err := ParseRoles("decide")
+	consumer, err := ParseRoles("consumer")
 	if err != nil {
 		t.Fatalf("ParseRoles returned error: %v", err)
 	}
-	reg := Default()
-	if got, want := len(reg.Runners(decide)), 1; got != want {
-		t.Errorf("--roles=decide started %d runners, want %d (the sweeper)", got, want)
+	reg := stubRegistry(t)
+	if got, want := len(reg.Runners(consumer)), 1; got != want {
+		t.Errorf("--roles=consumer started %d runners, want %d", got, want)
 	}
 
 	console, err := ParseRoles("console")
@@ -113,7 +211,7 @@ func TestRunnersStopOnContextCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	runners := Default().Runners(set)
+	runners := stubRegistry(t).Runners(set)
 	if len(runners) == 0 {
 		t.Fatal("expected at least one runner under --roles=all")
 	}

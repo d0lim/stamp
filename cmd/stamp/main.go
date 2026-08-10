@@ -5,24 +5,19 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
-	"time"
 
+	"github.com/d0lim/stamp/internal/api"
 	"github.com/d0lim/stamp/internal/runtime"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
 var version = "dev"
-
-const shutdownGrace = 15 * time.Second
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
@@ -42,7 +37,13 @@ func run(args []string, logOut *os.File) error {
 	fs := flag.NewFlagSet("stamp", flag.ContinueOnError)
 	rolesSpec := fs.String("roles", runtime.RoleAll,
 		"comma-separated subsystems to run, or \"all\" (check,decide,consumer,api,console)")
-	addr := fs.String("addr", ":8080", "address the HTTP listener binds to")
+	// The three surfaces are three listeners rather than three path prefixes on
+	// one, so each gets its own address. An empty address means the surface is
+	// not listened on at all, which is how a PEP tier runs with no console
+	// reachable anywhere.
+	pepAddr := fs.String("pep-addr", "", "address the PEP listener binds to (overrides $"+runtime.EnvPEPAddr+")")
+	consoleAddr := fs.String("console-addr", "", "address the console listener binds to (overrides $"+runtime.EnvConsoleAddr+")")
+	callbackAddr := fs.String("callback-addr", "", "address the callback listener binds to (overrides $"+runtime.EnvCallbackAddr+")")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -55,69 +56,61 @@ func run(args []string, logOut *os.File) error {
 
 	// Role parsing happens before anything is started so a bad --roles value
 	// fails startup instead of silently running a subset.
-	set, err := runtime.ParseRoles(*rolesSpec)
+	roles, err := runtime.ParseRoles(*rolesSpec)
 	if err != nil {
 		return err
 	}
 
-	logger := slog.New(slog.NewJSONHandler(logOut, nil))
-	registry := runtime.Default()
-	logger.Info("starting",
-		slog.String("version", version),
-		slog.String("roles", set.String()),
-		slog.Any("components", registry.ActiveNames(set)),
-		slog.String("addr", *addr),
-	)
+	cfg, err := runtime.ConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	overrideAddr(cfg.Addresses, api.SurfacePEP, *pepAddr)
+	overrideAddr(cfg.Addresses, api.SurfaceConsole, *consoleAddr)
+	overrideAddr(cfg.Addresses, api.SurfaceCallback, *callbackAddr)
 
+	logger := slog.New(slog.NewJSONHandler(logOut, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           registry.Handler(set),
-		ReadHeaderTimeout: 10 * time.Second,
+	app, err := runtime.Assemble(ctx, cfg, roles, logger)
+	if err != nil {
+		return err
+	}
+	defer app.Close()
+
+	if err := app.Listen(); err != nil {
+		return err
 	}
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, 1+len(registry.Runners(set)))
+	logger.Info("starting",
+		slog.String("version", version),
+		slog.String("roles", roles.String()),
+		slog.Any("components", app.Components()),
+		slog.String("pep", app.Addr(api.SurfacePEP)),
+		slog.String("console", app.Addr(api.SurfaceConsole)),
+		slog.String("callback", app.Addr(api.SurfaceCallback)),
+	)
 
-	for _, c := range registry.Runners(set) {
-		wg.Add(1)
-		go func(c runtime.Component) {
-			defer wg.Done()
-			logger.Info("runner started", slog.String("component", c.Name))
-			if err := c.Run(ctx); err != nil {
-				errCh <- fmt.Errorf("component %s: %w", c.Name, err)
-			}
-		}(c)
+	// The bootstrap token is printed here and stored nowhere in readable form.
+	// This is its only appearance; a later start returns the empty string.
+	if token := app.BootstrapToken(); token != "" {
+		_, _ = fmt.Fprintf(logOut, "\ngovernance bootstrap token (shown once):\n\n    %s\n\n"+
+			"lock governance with it as soon as the approver set is known; "+
+			"an unused token raises a critical audit warning on a timer.\n\n", token)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("http listener: %w", err)
-		}
-	}()
-
-	var runErr error
-	select {
-	case <-ctx.Done():
-		logger.Info("shutdown signal received")
-	case runErr = <-errCh:
-		logger.Error("subsystem failed", slog.String("error", runErr.Error()))
-		stop()
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("listener shutdown", slog.String("error", err.Error()))
-		if runErr == nil {
-			runErr = err
-		}
-	}
-	wg.Wait()
+	err = app.Serve(ctx)
 	logger.Info("stopped")
-	return runErr
+	return err
+}
+
+// overrideAddr applies a flag over the environment. An explicit empty flag is
+// not an override — the flag is absent, not set to nothing — so unbinding a
+// surface is done by setting its environment variable to the empty string.
+func overrideAddr(addresses map[api.Surface]string, surface api.Surface, addr string) {
+	if addr == "" || addresses == nil {
+		return
+	}
+	addresses[surface] = addr
 }

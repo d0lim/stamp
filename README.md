@@ -30,7 +30,41 @@ stamp --roles=api
 stamp --roles=console
 ```
 
-An unknown role name fails startup rather than quietly running a subset — a typo in a deployment manifest should not silently disable the decide subsystem.
+An unknown role name fails startup rather than quietly running a subset — a typo in a deployment manifest should not silently disable the decide subsystem. A role that is not active has no routes at all: its endpoints answer 404 on this process rather than refusing.
+
+The three surfaces are three listeners, not three path prefixes on one. A route mounted on the PEP listener is not reachable through the console listener, because the other listener's router has never heard of it.
+
+| Surface | Default address | Callers |
+|---|---|---|
+| PEP | `:8080` | workloads holding client credentials |
+| console | `:8081` | operators and approvers holding end-user tokens |
+| callback | unbound | external systems completing a challenge |
+
+Everything else comes from the environment, and nothing that would be a credential or a trust decision has a default — a missing DSN, issuer or audience fails startup with a message naming the variable.
+
+```sh
+STAMP_DSN='postgres://stamp:stamp@localhost:5432/stamp?sslmode=disable' \
+STAMP_OIDC_ISSUER='https://idp.example' \
+STAMP_OIDC_JWKS_URL='https://idp.example/.well-known/jwks.json' \
+STAMP_OIDC_AUDIENCE='stamp' \
+STAMP_OIDC_WORKLOAD_CLIENTS='pep-1' \
+stamp --roles=all
+```
+
+| Variable | Meaning |
+|---|---|
+| `STAMP_DSN` | PostgreSQL connection string. Required. |
+| `STAMP_OIDC_ISSUER`, `STAMP_OIDC_JWKS_URL`, `STAMP_OIDC_AUDIENCE` | The token verification trust boundary. Required. |
+| `STAMP_OIDC_WORKLOAD_CLIENTS` | Client identifiers whose tokens are workload credentials rather than end-user ones. |
+| `STAMP_PEP_ADDR`, `STAMP_CONSOLE_ADDR`, `STAMP_CALLBACK_ADDR` | Listen addresses. Set one to the empty string to leave that surface unbound. |
+| `STAMP_AUDIT_WRITER_ID` | The audit chain segment this process owns. Exactly one live process may hold it; a collision fails the boot. Defaults to the hostname. |
+| `STAMP_FACT_SOURCES` | Fact source transports, as a JSON document or a path to one. |
+| `STAMP_EGRESS_ALLOW` | Origins a fact call may reach, comma-separated. Nothing else is dialled. |
+| `STAMP_FACT_ALLOW_FAIL_OPEN` | Permit source declarations that fail open. Off by default. |
+| `STAMP_AUDIT_FAIL_CLOSED` | Deny while the check-path audit buffer is saturated. On by default. |
+| `STAMP_GOVERNANCE_MIN_APPROVERS` | The operator floor under any revision quorum. |
+
+On its first start with the `api` role the process installs the reserved governance policy and prints a one-time bootstrap token. It is shown once and stored only as a digest; lock governance with it as soon as the approver set is known.
 
 ```sh
 make build          # build ./stamp

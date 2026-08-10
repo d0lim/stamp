@@ -80,18 +80,56 @@ jobs:
           push: false
           load: true
           tags: stamp:ci
+      # The image now boots the whole composition root, so the health check
+      # needs the one operational dependency the product has. A container
+      # started without a DSN is supposed to fail, and the next step asserts
+      # that it does.
+      - name: start postgres
+        run: |
+          docker network create stamp-ci-net
+          docker run -d --name stamp-ci-db --network stamp-ci-net \
+            -e POSTGRES_USER=stamp -e POSTGRES_PASSWORD=stamp -e POSTGRES_DB=stamp \
+            postgres:17-alpine
+          for i in $(seq 1 30); do
+            if docker exec stamp-ci-db pg_isready -U stamp >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+      - name: refuse to start without a database
+        run: |
+          # Redirect rather than pipe: a pipeline's exit status is the last
+          # command's, so `docker run | tee` always reports tee's success and
+          # this assertion would fail no matter how the image behaved.
+          if docker run --rm stamp:ci --roles=all > /tmp/stamp-nodsn.log 2>&1; then
+            echo "the image started with no DSN configured" >&2
+            cat /tmp/stamp-nodsn.log >&2
+            exit 1
+          fi
+          cat /tmp/stamp-nodsn.log
+          grep -q STAMP_DSN /tmp/stamp-nodsn.log
+
       - name: health check the built image
         run: |
-          docker run -d --name stamp-ci -p 18080:8080 stamp:ci --roles=all
+          docker run -d --name stamp-ci --network stamp-ci-net -p 18080:8080 -p 18081:8081 \
+            -e STAMP_DSN='postgres://stamp:stamp@stamp-ci-db:5432/stamp?sslmode=disable' \
+            -e STAMP_OIDC_ISSUER='https://idp.ci.invalid' \
+            -e STAMP_OIDC_JWKS_URL='https://idp.ci.invalid/jwks' \
+            -e STAMP_OIDC_AUDIENCE='stamp' \
+            stamp:ci --roles=all
+          ok=0
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:18080/healthz >/dev/null 2>&1; then
-              echo "healthz responded after ${i}s"
-              docker rm -f stamp-ci
-              exit 0
+            if curl -fsS http://localhost:18080/healthz >/dev/null 2>&1 \
+               && curl -fsS http://localhost:18081/healthz >/dev/null 2>&1; then
+              echo "both surfaces answered healthz after ${i}s"
+              ok=1
+              break
             fi
             sleep 1
           done
-          echo "healthz never responded" >&2
-          docker logs stamp-ci >&2 || true
-          docker rm -f stamp-ci
-          exit 1
+          if [ "$ok" != "1" ]; then
+            echo "healthz never responded" >&2
+            docker logs stamp-ci >&2 || true
+          fi
+          docker rm -f stamp-ci stamp-ci-db >/dev/null 2>&1 || true
+          docker network rm stamp-ci-net >/dev/null 2>&1 || true
+          [ "$ok" = "1" ]
