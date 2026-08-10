@@ -832,6 +832,14 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 			want: map[api.Surface]map[string]int{
 				api.SurfaceConsole: {
 					"GET /policies": http.StatusUnauthorized,
+					// The file authoring pair rides with the authoring tier,
+					// which is where the governance service that owns the
+					// authoring mode, the payload limits and the export
+					// capability lives. Mounted here means an unauthenticated
+					// caller is refused a credential rather than told the route
+					// does not exist.
+					"POST " + api.PolicyApplyPath: http.StatusUnauthorized,
+					"GET " + api.PolicyExportPath: http.StatusUnauthorized,
 					// R51: the API tier serves the API and not one byte of the
 					// bundle, including the document that would tell a bundle
 					// where to point.
@@ -858,6 +866,12 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 					"GET " + api.ConsoleConfigPath: http.StatusOK,
 					"GET /policies":                http.StatusNotFound,
 					"POST " + approvalPath:         http.StatusNotFound,
+					// 404 and not 501: a console tier does not run the
+					// authoring subsystem, and "this process does not serve
+					// that" has to stay distinguishable from "this deployment
+					// serves no file authoring path at all".
+					"POST " + api.PolicyApplyPath: http.StatusNotFound,
+					"GET " + api.PolicyExportPath: http.StatusNotFound,
 				},
 				api.SurfacePEP: {
 					"POST " + api.EvaluationPath: http.StatusNotFound,

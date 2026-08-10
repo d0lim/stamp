@@ -299,6 +299,19 @@ func (a *App) build(ctx context.Context) error {
 		Resolver:    sources,
 		Floor:       cfg.GovernanceFloor,
 		TTL:         cfg.RevisionTTL,
+		WarnEvery:   cfg.BootstrapWarnInterval,
+		Authoring:   cfg.AuthoringMode,
+		Rate:        cfg.RevisionRate,
+		Limits:      cfg.ApplyLimits,
+		// The export gate is fail-closed when it has no capability source, and
+		// an unconfigured deployment refusing every export is the correct
+		// direction but not a usable one: the endpoint would be mounted and
+		// answer nobody. Reading a verified token claim is the implementation
+		// every deployment already has the machinery for, and it keeps the
+		// fail-closed shape where it belongs — per caller. A token without the
+		// claim, or with a claim naming neither capability, still holds
+		// nothing, and its export is still refused and still audited.
+		Capabilities: revision.ClaimCapabilities{Claim: cfg.CapabilityClaim},
 	})
 	if err != nil {
 		return err
@@ -377,6 +390,13 @@ func (a *App) build(ctx context.Context) error {
 			return store.LatestSchema(ctx, s.Pool())
 		}),
 		Bootstrap: governance.Bootstrap(),
+		// The governance service is the file authoring path: it already holds
+		// the authoring mode, the payload limits, the serialization gate and
+		// the export capability, and it satisfies the two-method seam the
+		// surface asks for. Leaving this nil is what a deployment that deferred
+		// R45-R49 looks like from outside — apply and export answering "this
+		// deployment serves no file authoring path" — and this one has not.
+		Files: governance,
 	})
 	if err != nil {
 		return err

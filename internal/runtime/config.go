@@ -207,6 +207,39 @@ type Config struct {
 	// highest-severity warning. Zero selects the governance default.
 	BootstrapWarnInterval time.Duration
 
+	// AuthoringMode is which authoring paths this installation accepts policy
+	// writes from (R49). Empty selects [revision.AuthoringBoth].
+	//
+	// It is validated rather than defaulted: a misspelling that fell back to
+	// the default would open the window an operator wrote this setting down in
+	// order to close, and it would do it silently. `file` closes the console's
+	// policy authoring, `console` closes the file path's apply, and neither
+	// closes the approval inbox, the audit views, the dry run or the lock —
+	// which is why an operator who turns on `file` at install time is not
+	// stuck in solo-admin governance.
+	AuthoringMode revision.AuthoringMode
+
+	// CapabilityClaim is the verified token claim the export gate reads a
+	// caller's entitlements from (R48). Empty selects
+	// [revision.DefaultCapabilityClaim].
+	//
+	// Naming the claim is not the same as granting anything: the gate stays
+	// fail-closed per caller, so a token that carries no such claim — or
+	// carries it without `policy.author` or `audit.read` in it — holds no
+	// capability and its export is refused and audited. A deployment that
+	// points this at a claim its IdP does not issue has configured the refusal
+	// of every export, which is the safe direction to be wrong in.
+	CapabilityClaim string
+
+	// RevisionRate bounds how often one authoring origin may take the
+	// serialization gate. A zero field selects [revision.DefaultRate].
+	RevisionRate revision.Rate
+
+	// ApplyLimits bound a file apply payload (R45). A zero field selects the
+	// governance default for that field, so an operator raises the one limit
+	// their repository outgrew without restating the other five.
+	ApplyLimits revision.PayloadLimits
+
 	// AuditorClaim and AuditorValues are R22's auditor standing rule, enforced
 	// server-side by the audit console.
 	//
@@ -491,6 +524,19 @@ const (
 	EnvReconcileInterval       = "STAMP_REVISION_RECONCILE_INTERVAL"
 	EnvBootstrapWarnInterval   = "STAMP_BOOTSTRAP_WARN_INTERVAL"
 
+	EnvAuthoringMode   = "STAMP_AUTHORING_MODE"
+	EnvCapabilityClaim = "STAMP_CAPABILITY_CLAIM"
+
+	EnvRevisionRateWindow = "STAMP_REVISION_RATE_WINDOW"
+	EnvRevisionRateBurst  = "STAMP_REVISION_RATE_BURST"
+
+	EnvApplyMaxDocuments      = "STAMP_APPLY_MAX_DOCUMENTS"
+	EnvApplyMaxDocumentBytes  = "STAMP_APPLY_MAX_DOCUMENT_BYTES"
+	EnvApplyMaxTotalBytes     = "STAMP_APPLY_MAX_TOTAL_BYTES"
+	EnvApplyMaxPolicies       = "STAMP_APPLY_MAX_POLICIES"
+	EnvApplyMaxConditionNodes = "STAMP_APPLY_MAX_CONDITION_NODES"
+	EnvApplyMaxConditionDepth = "STAMP_APPLY_MAX_CONDITION_DEPTH"
+
 	EnvAuditorClaim  = "STAMP_AUDITOR_CLAIM"
 	EnvAuditorValues = "STAMP_AUDITOR_VALUES"
 
@@ -568,6 +614,19 @@ func ConfigFromEnv() (Config, error) {
 		AuditorClaim:            strings.TrimSpace(os.Getenv(EnvAuditorClaim)),
 		AuditorValues:           splitList(os.Getenv(EnvAuditorValues)),
 		CheckContextEntity:      strings.TrimSpace(os.Getenv(EnvCheckContextEntity)),
+		CapabilityClaim:         strings.TrimSpace(os.Getenv(EnvCapabilityClaim)),
+		RevisionRate: revision.Rate{
+			Window: envDuration(EnvRevisionRateWindow, 0, fail),
+			Burst:  envInt(EnvRevisionRateBurst, 0, fail),
+		},
+		ApplyLimits: revision.PayloadLimits{
+			MaxDocuments:      envInt(EnvApplyMaxDocuments, 0, fail),
+			MaxDocumentBytes:  envInt(EnvApplyMaxDocumentBytes, 0, fail),
+			MaxTotalBytes:     envInt(EnvApplyMaxTotalBytes, 0, fail),
+			MaxPolicies:       envInt(EnvApplyMaxPolicies, 0, fail),
+			MaxConditionNodes: envInt(EnvApplyMaxConditionNodes, 0, fail),
+			MaxConditionDepth: envInt(EnvApplyMaxConditionDepth, 0, fail),
+		},
 		GovernanceFloor: revision.Floor{
 			MinApprovers:       envInt(EnvFloorMinApprovers, revision.DefaultFloor().MinApprovers, fail),
 			ProposerMayApprove: envBool(EnvFloorProposerMayApprove, false, fail),
@@ -668,6 +727,16 @@ func ConfigFromEnv() (Config, error) {
 	cfg.IdPGroupSources = groups
 	cfg.IdPGroupMaxTTL = envDuration(EnvIdPGroupMaxTTL, 0, fail)
 	cfg.ApproverIssuer = strings.TrimSpace(os.Getenv(EnvApproverIssuer))
+
+	// An unreadable authoring mode is a startup failure and never a fallback to
+	// the permissive default: `both` is what an operator who set this variable
+	// was trying not to run, so accepting a misspelling as `both` would open
+	// exactly the window the setting closes, and say nothing while doing it.
+	mode, err := revision.ParseAuthoringMode(strings.TrimSpace(os.Getenv(EnvAuthoringMode)))
+	if err != nil {
+		fail("%s: %w", EnvAuthoringMode, err)
+	}
+	cfg.AuthoringMode = mode
 
 	aliases, err := aliasesFrom(os.Getenv(EnvCheckPropertyAliases))
 	if err != nil {
@@ -803,6 +872,14 @@ func (c Config) validate() error {
 					"tokens from is a quorum nobody can satisfy. pinned issuers: %s",
 				EnvApproverIssuer, designated, EnvOIDCIssuer, strings.Join(pinned, ", ")))
 		}
+	}
+	// Checked here as well as at the environment reader, because a Config built
+	// in code — a test, an embedder — reaches Assemble without passing through
+	// ConfigFromEnv, and the one thing this setting must never do is resolve an
+	// unrecognized value to the permissive mode.
+	if !c.AuthoringMode.OrDefault().Valid() {
+		errs = append(errs, fmt.Errorf("%s is %q, want one of %v",
+			EnvAuthoringMode, c.AuthoringMode, revision.AuthoringModes()))
 	}
 	errs = append(errs, c.Kafka.validate()...)
 	errs = append(errs, c.MFA.validate(c.OIDC)...)
