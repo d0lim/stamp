@@ -110,17 +110,25 @@ type PoliciesConfig struct {
 	// Bootstrap reports the token's status. Optional; without it the governance
 	// read omits the token's state.
 	Bootstrap BootstrapReporter
+	// Files is the file authoring path. Optional; without it the apply and
+	// export routes answer that this deployment serves no such path, which is
+	// what a deployment that has deferred R45-R49 looks like from outside.
+	Files FileApplier
 	// MaxRequestBytes bounds a revision body. Zero selects
 	// [DefaultMaxRevisionBytes].
 	MaxRequestBytes int64
+	// MaxApplyBytes bounds an apply body. Zero selects [DefaultMaxApplyBytes].
+	MaxApplyBytes int64
 }
 
 // Policies serves the authoring endpoints.
 type Policies struct {
-	governance Governor
-	policies   PolicyLister
-	bootstrap  BootstrapReporter
-	maxBytes   int64
+	governance    Governor
+	policies      PolicyLister
+	bootstrap     BootstrapReporter
+	files         FileApplier
+	maxBytes      int64
+	maxApplyBytes int64
 }
 
 var _ Provider = (*Policies)(nil)
@@ -134,13 +142,18 @@ func NewPolicies(cfg PoliciesConfig) (*Policies, error) {
 		return nil, errors.New("api: the policy surface requires a policy reader")
 	}
 	p := &Policies{
-		governance: cfg.Governance,
-		policies:   cfg.Policies,
-		bootstrap:  cfg.Bootstrap,
-		maxBytes:   cfg.MaxRequestBytes,
+		governance:    cfg.Governance,
+		policies:      cfg.Policies,
+		bootstrap:     cfg.Bootstrap,
+		files:         cfg.Files,
+		maxBytes:      cfg.MaxRequestBytes,
+		maxApplyBytes: cfg.MaxApplyBytes,
 	}
 	if p.maxBytes <= 0 {
 		p.maxBytes = DefaultMaxRevisionBytes
+	}
+	if p.maxApplyBytes <= 0 {
+		p.maxApplyBytes = DefaultMaxApplyBytes
 	}
 	return p, nil
 }
@@ -158,6 +171,10 @@ func (p *Policies) Routes() []Route {
 			Auth: AuthUser, Handler: http.HandlerFunc(p.read)},
 		{Name: "revision-withdraw", Surface: SurfaceConsole, Pattern: RevisionWithdrawPattern,
 			Auth: AuthUser, Handler: http.HandlerFunc(p.withdraw)},
+		{Name: "policy-apply", Surface: SurfaceConsole, Pattern: PolicyApplyPattern,
+			Auth: AuthUser, Handler: http.HandlerFunc(p.apply)},
+		{Name: "policy-export", Surface: SurfaceConsole, Pattern: PolicyExportPattern,
+			Auth: AuthUser, Handler: http.HandlerFunc(p.export)},
 		{Name: "governance-read", Surface: SurfaceConsole, Pattern: GovernanceReadPattern,
 			Auth: AuthUser, Handler: http.HandlerFunc(p.readGovernance)},
 		{Name: "governance-lock", Surface: SurfaceConsole, Pattern: GovernanceLockPattern,
@@ -398,6 +415,13 @@ func readRevisionBody(w http.ResponseWriter, r *http.Request, maxBytes int64) (R
 // deciding case by case is how "you are not the proposer" becomes a 500 that
 // pages somebody.
 func writeRevisionError(w http.ResponseWriter, err error) {
+	// The file authoring refusals are consulted first because one of them --
+	// the gate's -- is a richer body than ErrorResponse, and because
+	// PendingError unwraps to ErrRevisionPending, which the table below would
+	// otherwise answer without the collection status R47 requires.
+	if writeAuthoringError(w, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, decision.ErrUnauthenticated):
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "this endpoint requires an end-user credential")

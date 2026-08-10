@@ -155,8 +155,12 @@ type harness struct {
 }
 
 type harnessOptions struct {
-	floor    revision.Floor
-	resolver *countingResolver
+	floor        revision.Floor
+	resolver     *countingResolver
+	authoring    revision.AuthoringMode
+	rate         revision.Rate
+	limits       revision.PayloadLimits
+	capabilities revision.Capabilities
 }
 
 // mutableObligations is the obligation seam, with a setter. A revision that
@@ -219,12 +223,16 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 		registry: registry, resolver: opts.resolver, obligations: obligations,
 	}
 	cfg := revision.Config{
-		Store:       s,
-		Audit:       writer,
-		Challenges:  registry,
-		Revalidator: revalidator,
-		Floor:       opts.floor,
-		Now:         clk.Now,
+		Store:        s,
+		Audit:        writer,
+		Challenges:   registry,
+		Revalidator:  revalidator,
+		Floor:        opts.floor,
+		Authoring:    opts.authoring,
+		Rate:         opts.rate,
+		Limits:       opts.limits,
+		Capabilities: opts.capabilities,
+		Now:          clk.Now,
 	}
 	if opts.resolver != nil {
 		cfg.Resolver = opts.resolver

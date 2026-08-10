@@ -210,8 +210,8 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean migrate")
 	}
-	if version != 5 {
-		t.Fatalf("schema version = %d, want 5", version)
+	if version != 6 {
+		t.Fatalf("schema version = %d, want 6", version)
 	}
 
 	for _, table := range []string{
@@ -234,8 +234,20 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean rollback")
 	}
-	if version != 4 {
-		t.Fatalf("schema version after one rollback = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("schema version after one rollback = %d, want 5", version)
+	}
+	// The newest migration only adds columns to policy_revisions, so rolling it
+	// back leaves the table and takes the column.
+	if !tableExists(t, s, "policy_revisions") {
+		t.Error("policy_revisions was dropped by a rollback of a migration that only altered it")
+	}
+	if columnExists(t, s, "policy_revisions", "origin") {
+		t.Error("policy_revisions.origin survived the rollback of its own migration")
+	}
+
+	if err := s.MigrateDown(ctx, 1); err != nil {
+		t.Fatalf("migrate down 1: %v", err)
 	}
 	if tableExists(t, s, "policy_revisions") {
 		t.Error("policy_revisions survived the rollback of its own migration")
@@ -244,10 +256,10 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 		t.Error("governance_bootstrap survived the rollback of its own migration")
 	}
 	if !tableExists(t, s, "processed_events") {
-		t.Error("processed_events was dropped by a one-step rollback that should not have touched it")
+		t.Error("processed_events was dropped by a rollback that should not have touched it")
 	}
 	if !tableExists(t, s, "audit_log") {
-		t.Error("audit_log was dropped by a one-step rollback that should not have touched it")
+		t.Error("audit_log was dropped by a rollback that should not have touched it")
 	}
 
 	if err := s.Migrate(ctx); err != nil {
@@ -255,6 +267,9 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	}
 	if !tableExists(t, s, "policy_revisions") {
 		t.Error("policy_revisions did not come back after re-migrating")
+	}
+	if !columnExists(t, s, "policy_revisions", "origin") {
+		t.Error("policy_revisions.origin did not come back after re-migrating")
 	}
 }
 
@@ -274,6 +289,20 @@ func tableExists(t *testing.T, s *store.Store, name string) bool {
 		name).Scan(&exists)
 	if err != nil {
 		t.Fatalf("check table %q: %v", name, err)
+	}
+	return exists
+}
+
+func columnExists(t *testing.T, s *store.Store, table, column string) bool {
+	t.Helper()
+	var exists bool
+	err := s.Pool().QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2)`,
+		table, column).Scan(&exists)
+	if err != nil {
+		t.Fatalf("check column %q.%q: %v", table, column, err)
 	}
 	return exists
 }
