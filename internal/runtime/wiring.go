@@ -36,9 +36,12 @@ import (
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/fact"
+	"github.com/d0lim/stamp/internal/fact/idpgroup"
 	"github.com/d0lim/stamp/internal/identity"
+	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/policy/revision"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // App is one assembled stamp process.
@@ -50,6 +53,8 @@ type App struct {
 	store      *store.Store
 	writer     *store.AuditWriter
 	facts      *fact.Registry
+	groups     *idpgroup.Sources
+	events     *ingestPlane
 	buffer     *api.AuditBuffer
 	challenges *challenge.Registry
 
@@ -160,14 +165,27 @@ func (a *App) build(ctx context.Context) error {
 	}
 
 	// --- fact plane --------------------------------------------------------
+	//
+	// One egress gate serves every outbound call this process makes. It is
+	// built here rather than beside each caller because a second gate is a
+	// second place the loopback and private opt-ins can disagree, and a
+	// destination admitted by one rule set and refused by another is a rule set
+	// nobody can read.
+	gate, err := fact.NewGate(cfg.Egress)
+	if err != nil {
+		return err
+	}
+
+	factAudit := fact.AuditorFunc(func(_ context.Context, f *fact.Failure) {
+		a.logger.Warn("fact lookup failed",
+			slog.String("source", f.Source),
+			slog.String("reason", f.AuditReason()),
+			slog.Bool("fails_closed", f.FailsClosed()))
+	})
 	facts, err := fact.NewRegistry(cfg.FactSources, fact.Config{
 		Egress:        cfg.Egress,
 		AllowFailOpen: cfg.AllowFactFailOpen,
-		Audit: fact.AuditorFunc(func(_ context.Context, f *fact.Failure) {
-			a.logger.Warn("fact lookup failed",
-				slog.String("reason", f.AuditReason()),
-				slog.Bool("fails_closed", f.FailsClosed()))
-		}),
+		Audit:         factAudit,
 	})
 	if err != nil {
 		return err
@@ -178,13 +196,55 @@ func (a *App) build(ctx context.Context) error {
 		return err
 	}
 
+	// --- the resolver stack ------------------------------------------------
+	//
+	// The evaluator states one [engine.SourceResolver] and gets one batch
+	// answered. Three planes serve that one statement, so they are chained
+	// rather than registered side by side: each answers the names it owns and
+	// delegates the rest onward in a single batch, which is what keeps the
+	// engine's one-batch-before-evaluation contract — and the timeout and cache
+	// reasoning built on top of it — intact all the way down.
+	//
+	// The order is by narrowness. Group directories own the fewest names,
+	// velocity sources the next fewest, and the synchronous registry is the
+	// terminal plane that either answers or refuses.
+	events, err := a.ingestion(cfg, resolver)
+	if err != nil {
+		return err
+	}
+	a.events = events
+
+	velocityGate := schemaGate(unconfiguredKind{
+		kind: policy.SourceEvent,
+		why:  "this deployment configures no velocity sources",
+	})
+	behindGroups := engine.SourceResolver(resolver)
+	if events != nil {
+		behindGroups = events.sources
+		velocityGate = events.sources
+	}
+
+	groups, err := idpgroup.NewSources(cfg.IdPGroupSources, idpgroup.SourcesConfig{
+		Gate:          gate,
+		Issuers:       issuers,
+		AllowFailOpen: cfg.AllowFactFailOpen,
+		MaxTTL:        cfg.IdPGroupMaxTTL,
+		Fallback:      behindGroups,
+		Audit:         factAudit,
+	})
+	if err != nil {
+		return err
+	}
+	a.groups = groups
+	sources := engine.SourceResolver(groups)
+
 	// --- evaluation --------------------------------------------------------
-	loader := &snapshotSource{store: s, facts: facts}
+	loader := &snapshotSource{store: s, gates: []schemaGate{facts, velocityGate, groups}}
 	check, err := engine.NewCheckService(ctx, engine.CheckConfig{
 		Loader:            loader,
 		RefreshInterval:   cfg.PolicyRefreshInterval,
 		StalenessDeadline: cfg.PolicyStalenessDeadline,
-		Resolver:          resolver,
+		Resolver:          sources,
 	})
 	if err != nil {
 		return err
@@ -193,12 +253,12 @@ func (a *App) build(ctx context.Context) error {
 
 	// --- decisions ---------------------------------------------------------
 	quorum, err := challenge.NewQuorum(challenge.QuorumConfig{
-		Audit: writer, DB: s.Pool(), ApproverIssuer: approverIssuerFor(cfg),
+		Audit: writer, DB: s.Pool(), Groups: groups, ApproverIssuer: approverIssuerFor(cfg),
 	})
 	if err != nil {
 		return err
 	}
-	handlers, err := a.challengeHandlers(quorum)
+	handlers, err := a.challengeHandlers(quorum, gate, groups)
 	if err != nil {
 		return err
 	}
@@ -213,7 +273,7 @@ func (a *App) build(ctx context.Context) error {
 		Challenges:     challenges,
 		TTL:            cfg.DecisionTTL,
 		MaxOutstanding: cfg.MaxOutstanding,
-	}, loader, resolver, cfg.PolicyRefreshInterval)
+	}, loader, sources, cfg.PolicyRefreshInterval)
 	if err != nil {
 		return err
 	}
@@ -236,7 +296,7 @@ func (a *App) build(ctx context.Context) error {
 		Audit:       writer,
 		Challenges:  challenges,
 		Revalidator: revalidator,
-		Resolver:    resolver,
+		Resolver:    sources,
 		Floor:       cfg.GovernanceFloor,
 		TTL:         cfg.RevisionTTL,
 	})
@@ -409,12 +469,49 @@ func (a *App) build(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	if events != nil {
+		ingestAPI, ierr := api.NewIngestAPI(api.IngestConfig{
+			Adapter:         events.ingest,
+			MaxRequestBytes: cfg.IngestMaxRequestBytes,
+		})
+		if ierr != nil {
+			return ierr
+		}
+		if err := registry.Add(Component{
+			// The ingest route is the consumer role's push half. It is mounted
+			// without regard to whether this process runs the consumer loop:
+			// [stream.Ingest.Submit] writes through the aggregator directly, so
+			// a tier that mounts the route and polls no broker still ingests.
+			// The route is on the callback surface behind a workload
+			// credential — an event producer is a population that sits outside
+			// the perimeter and is not the population that asks check
+			// questions.
+			Name:   "ingest-api",
+			Roles:  []Role{RoleConsumer},
+			Routes: ingestAPI.Routes(),
+		}); err != nil {
+			return err
+		}
+	}
 	if err := registry.Add(Component{
-		// The event ingest and bucket aggregation are U12's. The slot exists so
-		// the role is real from the first release rather than appearing later.
+		// The pull half. With a broker configured this is the Kafka consumer
+		// loop; without one it is the HTTP ingest adapter's Run, which has
+		// nothing to poll and waits for shutdown — a port that could not
+		// accommodate both shapes would be a port describing a consumer loop.
 		Name:  "event-consumer",
 		Roles: []Role{RoleConsumer},
-		Run:   blockUntilDone,
+		Run:   a.consumeEvents,
+	}); err != nil {
+		return err
+	}
+	if err := registry.Add(Component{
+		// Correctness does not depend on this loop — the port refuses an event
+		// older than the widest declarable window, so nothing it deletes could
+		// still affect an answer — but the size of two tables that only ever
+		// grow does.
+		Name:  "retention-sweeper",
+		Roles: []Role{RoleConsumer},
+		Run:   a.sweepRetention,
 	}); err != nil {
 		return err
 	}
@@ -437,22 +534,204 @@ func (a *App) build(ctx context.Context) error {
 // name. The challenge handlers refuse a bare set until they are told which
 // issuer is meant, and this is where the deployment says so.
 //
-// It defaults exactly as the MFA token pins below do, and for the same reason:
-// an install that pinned one issuer has already answered the question, and
-// making an operator restate it would be configuration for its own sake. An
-// install that pinned several genuinely has not answered it, and returning
-// empty here is what makes those handlers refuse rather than guess. Guessing —
-// taking the first entry — would be picking which IdP's alice may approve.
+// The explicit designation wins, and [Config.validate] has already refused one
+// that is not in the pinned set — a designated issuer whose tokens this process
+// rejects would open quorums nobody could ever satisfy.
 //
-// A multi-issuer deployment therefore needs an explicit designation of its own,
-// which is a configuration surface this function does not yet have; until then
-// such a deployment can name its approvers through an idp_group source, which
-// carries its own issuer.
+// Absent one, an install that pinned exactly one issuer has already answered
+// the question and restating it would be configuration for its own sake. An
+// install that pinned several and designated none genuinely has not answered
+// it, and returning empty is what makes those handlers refuse rather than
+// guess. Guessing — taking the first entry — would be picking which IdP's alice
+// may approve.
 func approverIssuerFor(cfg Config) string {
+	if designated := strings.TrimSpace(cfg.ApproverIssuer); designated != "" {
+		return designated
+	}
 	if len(cfg.OIDC.Issuers) == 1 {
 		return cfg.OIDC.Issuers[0].Issuer
 	}
 	return ""
+}
+
+// ingestPlane is this process's event ingestion plane: the bucket aggregator,
+// the adapters in front of it, the velocity sources that read back out of it,
+// and the adapter whose loop the consumer role runs.
+//
+// It is nil on a deployment that declares no velocity sources — there is
+// nothing to aggregate, and an aggregator over no metrics is refused by its own
+// constructor rather than tolerated as an empty one.
+type ingestPlane struct {
+	aggregator *stream.Aggregator
+	ingest     *stream.Ingest
+	sources    *stream.Sources
+	// consumer is the adapter the consumer role's loop runs. With a broker
+	// configured it is the Kafka adapter; otherwise it is the HTTP ingest
+	// adapter, whose Run waits for shutdown because its transport is the
+	// request handler.
+	consumer stream.Adapter
+}
+
+// ingestion assembles the event plane.
+//
+// The build order is fixed by the package and worth naming: declarations, then
+// the aggregator, then the adapters, then the sources. Each adapter is
+// constructed against the real declarations and the real sink, so the sources
+// can be resolved against the real adapters rather than against placeholders
+// that would then have to be swapped — which is the dance that ends up copied
+// into production wiring and quietly diverging from the test that proved it.
+func (a *App) ingestion(cfg Config, fallback engine.SourceResolver) (*ingestPlane, error) {
+	if len(cfg.StreamSources) == 0 {
+		return nil, nil
+	}
+
+	aggregator, err := stream.NewAggregator(stream.AggregatorConfig{
+		Store:   a.store,
+		Metrics: stream.MetricSpecsFor(cfg.StreamSources),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ingest, err := stream.NewIngest(stream.IngestConfig{
+		Name:               cfg.IngestAdapterName,
+		Declarations:       cfg.StreamSources,
+		Sink:               aggregator,
+		Credentials:        cfg.IngestCredentials,
+		DefaultRate:        cfg.IngestRate,
+		DefaultSubjectRate: cfg.IngestSubjectRate,
+		MaxBatchEvents:     cfg.IngestMaxBatchEvents,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	plane := &ingestPlane{aggregator: aggregator, ingest: ingest, consumer: ingest}
+	adapters := []stream.Adapter{ingest}
+	if cfg.Kafka.Configured() {
+		kafka, kerr := stream.NewKafka(stream.KafkaConfig{
+			Name:         cfg.Kafka.AdapterName,
+			Brokers:      cfg.Kafka.Brokers,
+			Group:        cfg.Kafka.Group,
+			Topics:       cfg.Kafka.Topics,
+			Declarations: cfg.StreamSources,
+			PollRecords:  cfg.Kafka.PollRecords,
+			OnReject:     a.recordDroppedRecord,
+		})
+		if kerr != nil {
+			return nil, kerr
+		}
+		adapters = append(adapters, kafka)
+		plane.consumer = kafka
+	}
+
+	plane.sources, err = stream.NewSources(cfg.StreamSources, stream.SourcesConfig{
+		Aggregator: aggregator,
+		Adapters:   adapters,
+		Fallback:   fallback,
+		Audit: fact.AuditorFunc(func(_ context.Context, f *fact.Failure) {
+			a.logger.Warn("velocity lookup failed",
+				slog.String("source", f.Source),
+				slog.String("reason", f.AuditReason()),
+				slog.Bool("fails_closed", f.FailsClosed()))
+		}),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return plane, nil
+}
+
+// consumeEvents runs the ingestion adapter behind the consumer role.
+func (a *App) consumeEvents(ctx context.Context) error {
+	if a.events == nil {
+		// A consumer tier on a deployment that declares no velocity sources has
+		// nothing to poll. It stays up rather than exiting, because a component
+		// that returned here would be read as a subsystem failure and would end
+		// the process.
+		a.logger.Info("the consumer role is active but no velocity sources are configured",
+			slog.String("configure", EnvStreamSources))
+		return blockUntilDone(ctx)
+	}
+	return a.events.consumer.Run(ctx, a.events.aggregator)
+}
+
+// recordDroppedRecord audits one ingestion record that can never be accepted.
+//
+// The drop itself is deliberate — a consumer stalled on one poison record stops
+// updating every velocity aggregate in the deployment, which is a cheaper way
+// to switch a limit off than anything in the threat model — and that is exactly
+// why it goes in the audit chain rather than only in a log. An append failure
+// is logged and swallowed: the consumer must not stall on the record it dropped
+// to keep from stalling.
+func (a *App) recordDroppedRecord(topic string, partition int32, offset int64, cause error) {
+	detail := ""
+	if cause != nil {
+		detail = cause.Error()
+	}
+	a.logger.Error("an ingestion record was dropped as permanently unacceptable",
+		slog.String("topic", topic),
+		slog.Int64("partition", int64(partition)),
+		slog.Int64("offset", offset),
+		slog.String("error", detail))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.writer.Append(ctx, store.AuditEntry{
+		Kind:    store.AuditKindEventRejected,
+		Subject: topic,
+		Payload: map[string]any{
+			"topic":     topic,
+			"partition": partition,
+			"offset":    offset,
+			"error":     detail,
+		},
+	}); err != nil {
+		a.logger.Error("recording a dropped ingestion record failed",
+			slog.String("topic", topic), slog.String("error", err.Error()))
+	}
+}
+
+// sweepRetention prunes the dedup index and the bucket table.
+//
+// Both helpers open their own transaction, so this loop must not run inside
+// one: the audit writer holds its append lock across a whole audited
+// transaction, and a store call that opened a second one from inside it would
+// deadlock. This loop is audited nowhere and nests inside nothing, which is
+// what makes it safe to call them directly.
+func (a *App) sweepRetention(ctx context.Context) error {
+	ticker := time.NewTicker(a.cfg.RetentionSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			a.sweepOnce(ctx)
+		}
+	}
+}
+
+func (a *App) sweepOnce(ctx context.Context) {
+	now := time.Now()
+	events, err := a.store.PruneProcessedEvents(ctx, store.DefaultDedupRetention(), now)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			a.logger.Error("pruning processed events failed", slog.String("error", err.Error()))
+		}
+		return
+	}
+	buckets, err := a.store.PruneBuckets(ctx, store.MaxDeclarableWindow, now)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			a.logger.Error("pruning velocity buckets failed", slog.String("error", err.Error()))
+		}
+		return
+	}
+	if events > 0 || buckets > 0 {
+		a.logger.Info("retention sweep",
+			slog.Int64("processed_events", events), slog.Int64("buckets", buckets))
+	}
 }
 
 // consoleShell builds the console serving provider.
@@ -524,12 +803,10 @@ func (a *App) consoleShell() (*api.Console, error) {
 // kind unregistered is the fail-closed alternative: a policy declaring an mfa
 // challenge gets [challenge.ErrNoHandler] at issue, and a challenge with no
 // handler cannot be satisfied.
-func (a *App) challengeHandlers(quorum *challenge.Quorum) ([]challenge.Handler, error) {
+func (a *App) challengeHandlers(quorum *challenge.Quorum, gate *fact.Gate,
+	groups challenge.GroupResolver,
+) ([]challenge.Handler, error) {
 	cfg := a.cfg
-	gate, err := fact.NewGate(cfg.Egress)
-	if err != nil {
-		return nil, err
-	}
 	external, err := challenge.NewExternal(challenge.ExternalConfig{
 		Gate:            gate,
 		Targets:         cfg.ExternalTargets,
@@ -540,7 +817,15 @@ func (a *App) challengeHandlers(quorum *challenge.Quorum) ([]challenge.Handler, 
 	}
 	handlers := []challenge.Handler{
 		quorum,
-		challenge.NewDelay(challenge.DelayConfig{ApproverIssuer: approverIssuerFor(cfg)}),
+		// The delay takes the group resolver for the same reason the quorum
+		// does: a cancellation authority is an approver set in every respect
+		// that matters, and cutting a wait short is an authority somebody
+		// exercises. Leaving it nil would make a group-backed canceller an
+		// issue-time refusal on a deployment that has the directory configured.
+		challenge.NewDelay(challenge.DelayConfig{
+			Groups:         groups,
+			ApproverIssuer: approverIssuerFor(cfg),
+		}),
 		external,
 	}
 
@@ -725,6 +1010,9 @@ func (a *App) Close() {
 		if a.facts != nil {
 			a.facts.Close()
 		}
+		if a.groups != nil {
+			a.groups.Close()
+		}
 		if a.writer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -823,14 +1111,19 @@ func (r *reconciling) Submit(ctx context.Context, sub decision.Submission) (deci
 }
 
 // notImplemented used to be here: the placeholder a slot with a later owner
-// answered with. The console was its last user, and the console now serves the
-// real thing — or, in a build that never ran the console build, a 503 that
-// names the missing command (see [api.Console]). The event consumer, the one
-// remaining unfilled slot, has a runner rather than a route.
+// answered with. It has no users left — the console serves the real thing, and
+// the event consumer, which was the last unfilled slot, now runs an ingestion
+// adapter rather than waiting for one.
 //
 // It is not being kept for the next unit. A dead helper waiting for a use is a
 // helper nobody remembers the rules of.
 
+// blockUntilDone is what a runner with nothing to do waits on.
+//
+// It is not a placeholder any more. A consumer tier on a deployment that
+// declares no velocity sources genuinely has nothing to poll, and it has to
+// stay up: a component that returned would be read as a subsystem failure and
+// would end the process.
 func blockUntilDone(ctx context.Context) error {
 	<-ctx.Done()
 	return nil

@@ -48,6 +48,16 @@ const (
 	// lost. Recording the loss as a chain entry is what makes the hole visible
 	// at verification time instead of invisible.
 	AuditKindCheckGap = "check.gap"
+
+	// AuditKindEventRejected marks one ingestion record that can never be
+	// accepted and was therefore dropped rather than retried forever.
+	//
+	// The drop exists because a consumer stalled on one poison record stops
+	// updating every velocity aggregate in the deployment, which is a cheaper
+	// way to disable a limit than any of the ones the threat model lists. That
+	// makes the drop itself a security-relevant event, so it belongs in the
+	// chain rather than only in a log an operator may not be keeping.
+	AuditKindEventRejected = "ingest.event.rejected"
 )
 
 // hashDomain separates this hash construction from any other in the system, so

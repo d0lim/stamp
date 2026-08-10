@@ -68,6 +68,11 @@ stamp --roles=all
 | `STAMP_MFA_ACR_VALUES` | The operator allowlist of authentication context classes. Required to run delegated MFA at all: an IdP downgrades an `acr` request it cannot satisfy without saying so, so an unchecked response is an unchecked authentication. |
 | `STAMP_MFA_AUTHORIZATION_ENDPOINT`, `STAMP_MFA_CLIENT_ID`, `STAMP_MFA_REDIRECT_URI` | The step-up redirect flow, which is the default delegation path (D26). |
 | `STAMP_MFA_CIBA_*` | The optional CIBA backchannel client, tried ahead of the step-up and falling back to it when the IdP has no decoupled authentication server behind its CIBA grant. |
+| `STAMP_APPROVER_ISSUER` | The IdP a bare approver identifier in a policy belongs to. Defaults to the single pinned issuer; a deployment that pins several has to say which one, because `alice` at one IdP and `alice` at another are different people. It must name a pinned issuer. |
+| `STAMP_STREAM_SOURCES` | Velocity source transports, as a JSON document or a path to one. |
+| `STAMP_INGEST_CREDENTIALS` | HTTP ingest grants, as a JSON document or a path to one. |
+| `STAMP_KAFKA_BROKERS`, `STAMP_KAFKA_GROUP`, `STAMP_KAFKA_TOPICS` | The optional broker ingestion adapter. Without them the deployment still ingests over HTTP. |
+| `STAMP_IDP_GROUP_SOURCES` | Group directory transports, as a JSON document or a path to one. The directory credential lives here and is unreachable from any policy. |
 
 Configure no `STAMP_MFA_*` and the `mfa` challenge kind simply has no handler: a
 policy declaring one cannot issue a decision, which is the fail-closed reading of
@@ -80,6 +85,38 @@ Startup checks the first half of that and says so.
 A policy's `mfa` challenge is completed by the decision's subject, matched on the
 token's `sub`. A decide request that puts anything else in `subject.id` — an
 account number, a resource key — produces a challenge no person can complete.
+
+### Velocity limits and event ingestion
+
+A velocity limit reads a trailing sum over fixed-width buckets in Postgres. Events reach those buckets through a broker-neutral port with two adapters in front of it: HTTP ingest, which every install has, and Kafka, which is optional — with no brokers configured the `consumer` role still serves the ingest route and the limits still work, which is what keeps the broker out of the demo bundle.
+
+The schema half of a velocity source is its name, its one string parameter and its return type. Everything else is deployment configuration, because a policy author who could write it could point a limit at another tenant's metric or widen its window until the limit stopped biting:
+
+```json
+[{"name": "daily_transfer_total", "metric": "transfer_amount", "adapter": "http-ingest",
+  "window": "24h", "bucket_width": "1h", "freshness": "5m",
+  "params": [{"name": "account", "type": "string"}], "returns": "double", "on_error": "deny"}]
+```
+
+`window` must be a whole number of buckets — the bucket width is the precision the storage has — and no wider than 30 days, past which the deduplication rows a replay is caught by are gone. `freshness` is only declarable against an adapter that can report ingestion lag, and a velocity source may not fail open: a limit that switched itself off when ingestion broke would be the cheapest attack on it there is.
+
+An ingest credential is bound to the `(source, metric)` pairs it may write, and permission to send a deduction is granted separately from permission to write the metric at all. `caller_id` is the identifier the identity layer derives from a verified token — `workload:<issuer>#<sub>` — not the bare subject, because a subject identifier is unique only inside its issuer:
+
+```json
+[{"caller_id": "workload:https://idp.example#svc-payments",
+  "scope": [{"source": "daily_transfer_total", "metric": "transfer_amount"}],
+  "rate": {"per_second": 200, "burst": 400}, "subject_rate": {"per_second": 20}}]
+```
+
+The Kafka path has no per-request credential to scope, so the same binding is a property of the topic: an operator maps a topic to a source and to the caller identity the broker's ACLs admit on it. Those ACLs are mandatory rather than advisory — without them the topic is an unauthenticated write to somebody's velocity aggregate. A record that can never be accepted is dropped rather than retried forever, and the drop lands in the audit chain as `ingest.event.rejected`.
+
+A schema that declares an event source this deployment does not serve is refused at load, including on a deployment that configures none at all.
+
+### Approver sets from an IdP group
+
+A quorum can name a group instead of a list of people. The group source is a fact source with a different transport — a TTL, an egress-gated call, the same audit vocabulary — with two rules of its own. The TTL is required and capped, because it is not a latency knob: it is how long after somebody leaves a group they can still be resolved into an approver set. And a directory that cannot answer means the challenge is not issued, whatever the declaration's failure behaviour says, because there is no fail-open shape for "who is permitted to approve this".
+
+The directory's URL and credential are operator configuration and appear in no policy document. A group-resolved set carries its own issuer, so it is also how a deployment names approvers in an IdP other than the one `STAMP_APPROVER_ISSUER` designates.
 
 On its first start with the `api` role the process installs the reserved governance policy and prints a one-time bootstrap token. It is shown once and stored only as a digest; lock governance with it as soon as the approver set is known.
 

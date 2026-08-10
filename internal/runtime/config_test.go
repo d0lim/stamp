@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/d0lim/stamp/internal/api"
 	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // clearEnv unsets every variable the configuration reads, so a test starts from
@@ -34,6 +36,12 @@ func clearEnv(t *testing.T) {
 		EnvMFARedirectURI, EnvMFAScopes, EnvMFAIssuer, EnvMFATokenClientID,
 		EnvMFAAudience, EnvMFAAllowInsecure,
 		EnvCIBABackchannel, EnvCIBATokenURL, EnvCIBAClientID, EnvCIBAClientSecret, EnvCIBAScope,
+		EnvStreamSources, EnvIngestCredentials, EnvIngestAdapterName,
+		EnvIngestRate, EnvIngestBurst, EnvIngestSubjectRate, EnvIngestSubjectBurst,
+		EnvIngestMaxBatch, EnvIngestMaxBytes,
+		EnvKafkaBrokers, EnvKafkaGroup, EnvKafkaTopics, EnvKafkaAdapterName, EnvKafkaPollRecords,
+		EnvRetentionSweepInterval,
+		EnvIdPGroupSources, EnvIdPGroupMaxTTL, EnvApproverIssuer,
 	} {
 		t.Setenv(key, "")
 		_ = os.Unsetenv(key)
@@ -294,4 +302,241 @@ func baseConfig() Config {
 			Audience: "stamp",
 		},
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the M3 ingestion and directory configuration
+// ---------------------------------------------------------------------------
+
+func TestStreamSourcesRead(t *testing.T) {
+	const doc = `[{
+		"name": "daily_transfer_total",
+		"metric": "transfer_amount",
+		"adapter": "kafka",
+		"window": "24h",
+		"bucket_width": "1h",
+		"freshness": "5m",
+		"allow_deduction": true,
+		"params": [{"name": "account", "type": "string"}],
+		"returns": "double",
+		"on_error": "deny"
+	}]`
+
+	path := filepath.Join(t.TempDir(), "stream.json")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write declarations: %v", err)
+	}
+	// A container mounts a file and a laptop pastes a literal; both are read.
+	for name, spec := range map[string]string{"inline": doc, "file": path} {
+		decls, err := streamSourcesFrom(spec)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(decls) != 1 {
+			t.Fatalf("%s: %d declarations, want 1", name, len(decls))
+		}
+		d := decls[0]
+		if d.Name != "daily_transfer_total" || d.Metric != "transfer_amount" || d.Adapter != "kafka" {
+			t.Errorf("%s: declaration = %+v", name, d)
+		}
+		if d.Window != 24*time.Hour || d.BucketWidth != time.Hour || d.Freshness != 5*time.Minute {
+			t.Errorf("%s: window = %v, bucket = %v, freshness = %v", name, d.Window, d.BucketWidth, d.Freshness)
+		}
+		if !d.AllowDeduction || d.Returns != policy.TypeDouble {
+			t.Errorf("%s: deduction = %v, returns = %q", name, d.AllowDeduction, d.Returns)
+		}
+	}
+}
+
+func TestStreamSourcesRejectAnUnknownField(t *testing.T) {
+	// A misspelled `allow_deduction` is a metric that admits negative deltas
+	// while its manifest says it does not, which is a control that reads as
+	// configured and is not.
+	if _, err := streamSourcesFrom(`[{"name":"x","metric":"m","allow_deductions":true}]`); err == nil {
+		t.Fatal("a velocity declaration with an unknown field was accepted")
+	}
+}
+
+func TestAVelocitySourceDefaultsToTheHTTPIngestAdapter(t *testing.T) {
+	// The HTTP adapter is the one every install has — the broker is the
+	// optional dependency D20 keeps optional — so it is the only default that
+	// could be filled in without guessing.
+	cfg := baseConfig()
+	cfg.StreamSources = []stream.Declaration{{Name: "v", Metric: "m"}}
+	cfg = cfg.withDefaults()
+	if got := cfg.StreamSources[0].Adapter; got != DefaultIngestAdapterName {
+		t.Errorf("adapter = %q, want %q", got, DefaultIngestAdapterName)
+	}
+	if cfg.IngestAdapterName != DefaultIngestAdapterName {
+		t.Errorf("ingest adapter name = %q, want %q", cfg.IngestAdapterName, DefaultIngestAdapterName)
+	}
+}
+
+func TestIngestCredentialsAndKafkaTopicsRead(t *testing.T) {
+	creds, err := ingestCredentialsFrom(`[{
+		"caller_id": "workload:https://idp.example#svc-payments",
+		"scope": [{"source": "daily_transfer_total", "metric": "transfer_amount"}],
+		"allow_deduction": true,
+		"rate": {"per_second": 100, "burst": 200},
+		"subject_rate": {"per_second": 5}
+	}]`)
+	if err != nil {
+		t.Fatalf("read ingest credentials: %v", err)
+	}
+	if len(creds) != 1 {
+		t.Fatalf("%d credentials, want 1", len(creds))
+	}
+	c := creds[0]
+	// The grant names the identifier the identity layer derives from a verified
+	// token, not the bare subject: a `sub` is unique only inside its issuer.
+	if c.CallerID != "workload:https://idp.example#svc-payments" || !c.AllowDeduction {
+		t.Errorf("credential = %+v", c)
+	}
+	if len(c.Scope) != 1 || c.Scope[0].Source != "daily_transfer_total" {
+		t.Errorf("scope = %+v", c.Scope)
+	}
+	if c.Rate.PerSecond != 100 || c.Rate.Burst != 200 || c.SubjectRate.PerSecond != 5 {
+		t.Errorf("rates = %+v / %+v", c.Rate, c.SubjectRate)
+	}
+
+	topics, err := kafkaTopicsFrom(`[{"topic":"transfers","source":"daily_transfer_total","caller_id":"producer-1"}]`)
+	if err != nil {
+		t.Fatalf("read kafka topics: %v", err)
+	}
+	if len(topics) != 1 || topics[0].Topic != "transfers" || topics[0].CallerID != "producer-1" {
+		t.Errorf("topics = %+v", topics)
+	}
+}
+
+func TestIdPGroupSourcesRead(t *testing.T) {
+	decls, err := idpGroupSourcesFrom(`[{
+		"name": "approver_group",
+		"issuer": "https://idp.example",
+		"url": "https://idp.example/scim/v2/Groups",
+		"credential": "s3cret",
+		"members_field": "members",
+		"member_id_field": "value",
+		"total_field": "totalResults",
+		"ttl": "1m",
+		"timeout": "2s",
+		"params": [{"name": "group", "type": "string"}],
+		"returns": "list<string>",
+		"on_error": "deny"
+	}]`)
+	if err != nil {
+		t.Fatalf("read group sources: %v", err)
+	}
+	if len(decls) != 1 {
+		t.Fatalf("%d declarations, want 1", len(decls))
+	}
+	d := decls[0]
+	if d.Issuer != "https://idp.example" || d.Credential != "s3cret" {
+		t.Errorf("declaration = %+v", d)
+	}
+	if d.TTL != time.Minute || d.Timeout != 2*time.Second {
+		t.Errorf("ttl = %v, timeout = %v", d.TTL, d.Timeout)
+	}
+	// The directory credential is operator configuration and never crosses into
+	// the schema half a policy is written against (D21).
+	if got := fmt.Sprintf("%+v", d.SourceDecl()); strings.Contains(got, "s3cret") {
+		t.Errorf("the schema half carries the directory credential: %s", got)
+	}
+}
+
+func TestABrokerWithNoGroupOrTopicsIsRefused(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Kafka = KafkaConfig{Brokers: []string{"broker:9092"}}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("a broker with no consumer group and no topics was accepted")
+	}
+	for _, want := range []string{EnvKafkaGroup, EnvKafkaTopics} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %s:\n%v", want, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the approver issuer designation
+// ---------------------------------------------------------------------------
+
+// TestApproverIssuerDesignation is the configuration surface a multi-issuer
+// deployment had no way to reach.
+//
+// A bare approver identifier is an identity only relative to an issuer, so a
+// deployment that pins several has to say which one is meant. Taking the first
+// entry would be picking which IdP's alice may approve, and leaving it empty
+// makes the challenge handlers refuse — which was correct and, until this
+// variable existed, permanent.
+func TestApproverIssuerDesignation(t *testing.T) {
+	two := func() Config {
+		cfg := baseConfig()
+		cfg.OIDC.Issuers = append(cfg.OIDC.Issuers,
+			IssuerConfig{Issuer: "https://other.example", JWKSURL: "https://other.example/jwks"})
+		return cfg
+	}
+
+	t.Run("one pinned issuer needs no designation", func(t *testing.T) {
+		if got := approverIssuerFor(baseConfig()); got != "https://idp.example" {
+			t.Errorf("approver issuer = %q, want the single pinned issuer", got)
+		}
+	})
+
+	t.Run("several pinned issuers and no designation refuses rather than guesses", func(t *testing.T) {
+		if got := approverIssuerFor(two()); got != "" {
+			t.Errorf("approver issuer = %q, want empty: guessing would pick which IdP's alice may approve", got)
+		}
+	})
+
+	t.Run("an explicit designation is used", func(t *testing.T) {
+		cfg := two()
+		cfg.ApproverIssuer = "https://other.example"
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("a designation naming a pinned issuer was refused: %v", err)
+		}
+		if got := approverIssuerFor(cfg); got != "https://other.example" {
+			t.Errorf("approver issuer = %q, want the designated one", got)
+		}
+	})
+
+	t.Run("designating the single pinned issuer is admitted", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.ApproverIssuer = "https://idp.example"
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("designating the one pinned issuer was refused: %v", err)
+		}
+	})
+
+	t.Run("an unpinned issuer is refused at startup", func(t *testing.T) {
+		cfg := two()
+		cfg.ApproverIssuer = "https://elsewhere.example"
+		err := cfg.validate()
+		if err == nil {
+			t.Fatal("an approver issuer this deployment does not pin was accepted")
+		}
+		// A designated issuer whose tokens are rejected is a quorum nobody can
+		// satisfy, which reads as a policy problem and is a configuration one.
+		for _, want := range []string{EnvApproverIssuer, "https://elsewhere.example", EnvOIDCIssuer} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not name %s:\n%v", want, err)
+			}
+		}
+	})
+
+	t.Run("the designation is read from the environment", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvDSN, "postgres://stamp@localhost/stamp")
+		t.Setenv(EnvOIDCIssuer, "https://idp.example")
+		t.Setenv(EnvOIDCJWKSURL, "https://idp.example/jwks")
+		t.Setenv(EnvOIDCAudience, "stamp")
+		t.Setenv(EnvApproverIssuer, "https://idp.example")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("read the environment: %v", err)
+		}
+		if cfg.ApproverIssuer != "https://idp.example" {
+			t.Errorf("approver issuer = %q", cfg.ApproverIssuer)
+		}
+	})
 }
