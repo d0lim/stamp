@@ -335,6 +335,17 @@ func newEgressClient(g *Gate) *http.Client {
 	}
 }
 
+// HTTPClient returns the gated client for callers outside this package.
+//
+// It exists because a fact source is not the only outbound call a deployment
+// makes: an external challenge posts a webhook to an operator-allowlisted
+// target and must reach it through this gate rather than through a client of
+// its own. Handing out the constructed client rather than the pieces is the
+// point — a second caller assembling its own transport is a second place the
+// proxy setting, the redirect policy and the address pin can be got wrong, and
+// the one that is got wrong is the one an audit does not cover.
+func (g *Gate) HTTPClient() *http.Client { return newEgressClient(g) }
+
 func systemResolve(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
