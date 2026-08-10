@@ -217,14 +217,14 @@ func newCore(snap *Snapshot, opts ...Option) *core {
 // matched but none applied". Collapsing the two would make the fail-closed
 // answer for an empty policy set indistinguishable from an ordinary condition
 // miss, and the requirement is specifically about the empty case.
-func (c *core) evaluate(ctx context.Context, in Input) (applicable []Candidate, matched bool, err error) {
+func (c *core) evaluate(ctx context.Context, in Input) (applicable []Candidate, resolved FactSnapshot, matched bool, err error) {
 	entries := c.snapshot.match(in)
 	if len(entries) == 0 {
-		return nil, false, nil
+		return nil, FactSnapshot{}, false, nil
 	}
 	binding, err := bind(&c.snapshot.schema, in)
 	if err != nil {
-		return nil, true, err
+		return nil, FactSnapshot{}, true, err
 	}
 	programs := make([]*Program, len(entries))
 	var calls []SourceCall
@@ -232,12 +232,12 @@ func (c *core) evaluate(ctx context.Context, in Input) (applicable []Candidate, 
 	for i, e := range entries {
 		prg, err := c.cache.Compile(e.version, &c.snapshot.schema, e.candidate.Policy())
 		if err != nil {
-			return nil, true, err
+			return nil, FactSnapshot{}, true, err
 		}
 		programs[i] = prg
 		sites, err := prg.SourceCalls(binding)
 		if err != nil {
-			return nil, true, err
+			return nil, FactSnapshot{}, true, err
 		}
 		for _, call := range sites {
 			if _, dup := seen[call.key()]; dup {
@@ -249,18 +249,23 @@ func (c *core) evaluate(ctx context.Context, in Input) (applicable []Candidate, 
 	}
 	facts, err := c.resolve(ctx, calls)
 	if err != nil {
-		return nil, true, err
+		return nil, FactSnapshot{}, true, err
 	}
+	// The snapshot is frozen here, between resolution and evaluation, because
+	// this is the one moment at which "the facts this evaluation rested on" is
+	// a set rather than a history: the batch is complete, and no condition has
+	// run yet to make some of it look more relevant than the rest.
+	frozen := newFactSnapshot(calls, facts)
 	for i, prg := range programs {
 		holds, err := prg.Evaluate(ctx, binding, facts)
 		if err != nil {
-			return nil, true, err
+			return nil, frozen, true, err
 		}
 		if holds {
 			applicable = append(applicable, entries[i].candidate)
 		}
 	}
-	return applicable, true, nil
+	return applicable, frozen, true, nil
 }
 
 // resolve fetches every fact the matched policies can reach, in one batch,
@@ -306,7 +311,10 @@ func (e *CheckEvaluator) Cache() *Cache { return e.core.cache }
 // exists to prevent: attaching a challenge to a policy must never be weakened by
 // the presence of another policy.
 func (e *CheckEvaluator) Evaluate(ctx context.Context, in Input) (CheckResult, error) {
-	applicable, matched, err := e.core.evaluate(ctx, in)
+	// The check path drops the resolved facts. It creates no decision object,
+	// so it has nothing to freeze them onto and nothing that could later claim
+	// to have rested on them.
+	applicable, _, matched, err := e.core.evaluate(ctx, in)
 	if err != nil {
 		return CheckResult{}, err
 	}
@@ -353,7 +361,7 @@ func (e *DecideEvaluator) Cache() *Cache { return e.core.cache }
 // contributes its challenges, so a request covered by two of them has to satisfy
 // both rather than whichever was evaluated first.
 func (e *DecideEvaluator) Evaluate(ctx context.Context, in Input) (DecideResult, error) {
-	applicable, matched, err := e.core.evaluate(ctx, in)
+	applicable, facts, matched, err := e.core.evaluate(ctx, in)
 	if err != nil {
 		return DecideResult{}, err
 	}
@@ -374,10 +382,10 @@ func (e *DecideEvaluator) Evaluate(ctx context.Context, in Input) (DecideResult,
 		}
 	}
 	if len(gates) > 0 {
-		return decideChallenge(gates), nil
+		return decideChallenge(gates, facts), nil
 	}
 	if allowed == nil {
-		return decideConditionNotMet(), nil
+		return decideConditionNotMet(facts), nil
 	}
-	return allowDecide(*allowed), nil
+	return allowDecide(*allowed, facts), nil
 }
