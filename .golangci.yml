@@ -1,0 +1,40 @@
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags:
+    - m1deps
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+
+  settings:
+    gosec:
+      excludes:
+        # G104 duplicates errcheck, which the standard set already runs.
+        - G104
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+
+  exclusions:
+    rules:
+      # Tests deliberately construct invalid inputs and ignore writer errors.
+      - path: _test\.go
+        linters:
+          - gosec
+          - unparam
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

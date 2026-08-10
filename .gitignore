@@ -1,0 +1,25 @@
+# Build output
+/stamp
+/dist/
+/bin/
+
+# Falsification spikes are throwaway by construction — only their written
+# results land (docs/spike-results.md). Keeping the tree ignored means a
+# spike branch cannot accidentally ship dead-end code.
+/spikes/
+
+# Test and coverage artifacts
+*.out
+*.test
+/coverage/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor and OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
