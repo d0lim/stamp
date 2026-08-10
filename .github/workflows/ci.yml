@@ -1,0 +1,97 @@
+name: CI
+
+# No `branches:` filter on pull_request is deliberate. The landing strategy
+# stacks most pull requests on another unit's branch rather than on main, and a
+# base filter would leave those PRs with no checks at all — silently, with no
+# error to notice. The push trigger covers main so a convention that was
+# bypassed shows up on the very next commit.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: gofmt
+        run: make fmt-check
+      - name: go vet
+        run: make vet
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+  test:
+    name: test
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # Docker is present on ubuntu-latest, which later units rely on for
+      # testcontainers-backed store tests.
+      - name: go test
+        run: make test
+
+  govulncheck:
+    name: govulncheck
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: vulnerability scan
+        run: make vulncheck
+
+  docker:
+    name: docker build
+    needs: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: stamp:ci
+      - name: health check the built image
+        run: |
+          docker run -d --name stamp-ci -p 18080:8080 stamp:ci --roles=all
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:18080/healthz >/dev/null 2>&1; then
+              echo "healthz responded after ${i}s"
+              docker rm -f stamp-ci
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "healthz never responded" >&2
+          docker logs stamp-ci >&2 || true
+          docker rm -f stamp-ci
+          exit 1
