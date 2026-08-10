@@ -1,0 +1,31 @@
+#!/bin/sh
+# Run the landing gates before a push reaches the remote.
+#
+# This repository is private on a free plan, where GitHub's branch-protection
+# and required-status-check APIs are unavailable. The plan's landing strategy
+# therefore describes merge gates as convention rather than enforcement. This
+# hook is the enforcement that is actually available today; when the repo goes
+# public or upgrades, required checks take over and this becomes a fast local
+# pre-check.
+#
+# Enable with: make hooks
+#
+# Bypass with: git push --no-verify
+# Bypassing is a deliberate act, which is the point — a skipped gate should be
+# a decision someone made, not a step nobody noticed.
+
+set -eu
+
+if [ "${STAMP_SKIP_PREPUSH:-}" = "1" ]; then
+	echo "pre-push: skipped via STAMP_SKIP_PREPUSH=1" >&2
+	exit 0
+fi
+
+echo "pre-push: running 'make land' (set STAMP_SKIP_PREPUSH=1 to skip)" >&2
+
+if ! make land; then
+	echo "" >&2
+	echo "pre-push: gates failed — push aborted." >&2
+	echo "Fix the failures, or push with --no-verify if you intend to skip them." >&2
+	exit 1
+fi
