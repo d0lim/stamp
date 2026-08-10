@@ -787,6 +787,12 @@ func (h *harness) completeStepUp(t *testing.T, decisionID string, detail mfa.Det
 // the assembled wiring rather than over placeholders: a role that is not active
 // has no routes on any surface, and the difference is 404 rather than a
 // refusal.
+// statusServed is the expectation "this route is mounted", for a route whose
+// exact status depends on something outside the process — the console shell
+// answers 200 with a built bundle and 503 without one, and both are the
+// opposite of the 404 an unselected role gives.
+const statusServed = -1
+
 func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 	dsn := freshDB(t)
 	approvalPath := "/decisions/d-1/challenges/0/approvals"
@@ -826,7 +832,12 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 			want: map[api.Surface]map[string]int{
 				api.SurfaceConsole: {
 					"GET /policies": http.StatusUnauthorized,
-					"GET /console/": http.StatusNotFound,
+					// R51: the API tier serves the API and not one byte of the
+					// bundle, including the document that would tell a bundle
+					// where to point.
+					"GET /console/":                http.StatusNotFound,
+					"GET " + api.ConsoleConfigPath: http.StatusNotFound,
+					"GET /console/assets/index.js": http.StatusNotFound,
 				},
 				api.SurfacePEP: {
 					"POST " + api.EvaluationPath: http.StatusNotFound,
@@ -837,9 +848,16 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 			roles: "console", writer: "roles-console",
 			want: map[api.Surface]map[string]int{
 				api.SurfaceConsole: {
-					"GET /console/":        http.StatusUnauthorized,
-					"GET /policies":        http.StatusNotFound,
-					"POST " + approvalPath: http.StatusNotFound,
+					// The shell is static: a browser doing a top level
+					// navigation has no bearer token to present, so the
+					// assertion is that the route is here at all. Whether the
+					// answer is the bundle or the "run npm run build" guidance
+					// depends on whether this tree was built, which is not
+					// something a Go test should depend on.
+					"GET /console/":                statusServed,
+					"GET " + api.ConsoleConfigPath: http.StatusOK,
+					"GET /policies":                http.StatusNotFound,
+					"POST " + approvalPath:         http.StatusNotFound,
 				},
 				api.SurfacePEP: {
 					"POST " + api.EvaluationPath: http.StatusNotFound,
@@ -855,6 +873,13 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 				for spec, want := range expectations {
 					method, path, _ := cut(spec)
 					code, _ := h.do(method, surface, path, "", "", nil)
+					if want == statusServed {
+						if code == http.StatusNotFound {
+							t.Errorf("%s on the %s surface under --roles=%s = 404, want the route to be mounted",
+								spec, surface, tc.roles)
+						}
+						continue
+					}
 					if code != want {
 						t.Errorf("%s on the %s surface under --roles=%s = %d, want %d",
 							spec, surface, tc.roles, code, want)

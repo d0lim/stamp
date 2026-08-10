@@ -1,0 +1,17 @@
+# The build context is sent to the daemon in full, and the console's npm tree is
+# by far the largest thing in this repository. It is reinstalled inside the
+# console stage from package-lock.json anyway, so shipping a developer's copy of
+# it would only make the build slower and less reproducible.
+console/node_modules/
+console/dist/
+!console/dist/.gitkeep
+
+.git/
+.github/
+docs/
+spikes/
+stamp
+*.test
+*.out
+coverage/
+.DS_Store

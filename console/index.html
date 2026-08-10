@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" type="image/svg+xml" href="/console/favicon.svg" />
+    <title>STAMP 콘솔</title>
+  </head>
+  <body>
+    <!--
+      The shell renders into this element. There is no inline script and no
+      inline style anywhere in this document: the console's CSP is
+      script-src 'self'; style-src 'self' with no unsafe-inline and no hashes,
+      so anything inline here would be a bundle the server refuses to run.
+    -->
+    <div id="root"></div>
+    <noscript>STAMP 콘솔은 자바스크립트가 필요합니다.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

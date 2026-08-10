@@ -25,11 +25,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/d0lim/stamp/console"
 	"github.com/d0lim/stamp/internal/api"
 	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/challenge/mfa"
@@ -393,19 +393,19 @@ func (a *App) build(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	consoleShell, err := a.consoleShell()
+	if err != nil {
+		return err
+	}
 	if err := registry.Add(Component{
-		// The console shell is U14's. The route is registered so that role
-		// selection is testable and so that a console-only process answers
-		// something other than a 404 at its own path.
-		Name:  "console",
-		Roles: []Role{RoleConsole},
-		Routes: []api.Route{{
-			Name:    "console-shell",
-			Surface: api.SurfaceConsole,
-			Pattern: "GET /console/",
-			Auth:    api.AuthUser,
-			Handler: notImplemented("console"),
-		}},
+		// The console serves static assets and one configuration document, and
+		// nothing else: D19's separability promise is that the console consumes
+		// the public API and has no private endpoints of its own, so the only
+		// thing this role adds to the console surface is the bundle and the
+		// answer to "where is the API".
+		Name:   "console",
+		Roles:  []Role{RoleConsole},
+		Routes: consoleShell.Routes(),
 	}); err != nil {
 		return err
 	}
@@ -453,6 +453,57 @@ func approverIssuerFor(cfg Config) string {
 		return cfg.OIDC.Issuers[0].Issuer
 	}
 	return ""
+}
+
+// consoleShell builds the console serving provider.
+//
+// Two defaults are worth naming. The issuer falls back to the one this process
+// already verifies tokens against, which is not a trust decision being guessed
+// — it is the same issuer, stated once. The API base address does not fall back
+// to anything: empty means same-origin, which is what the single-container
+// install has, and an operator who splits the tiers sets it explicitly.
+//
+// A console with no relying-party configuration does not fail the boot. The
+// bundle is public static content, the missing configuration cannot be
+// mistaken for a permissive one, and `--roles=all` is the image's default
+// command — failing here would mean every quickstart had to configure an IdP
+// login before it could start. The console renders what is missing instead,
+// and the log says it on the way up.
+func (a *App) consoleShell() (*api.Console, error) {
+	cfg := a.cfg.Console
+	issuer := cfg.Issuer
+	if issuer == "" && len(a.cfg.OIDC.Issuers) > 0 {
+		issuer = a.cfg.OIDC.Issuers[0].Issuer
+	}
+
+	assets := console.Assets()
+	if a.roles.Has(RoleConsole) {
+		switch {
+		case !console.Built():
+			a.logger.Warn("this build carries no console bundle; the console role serves guidance instead",
+				slog.String("build", "cd console && npm ci && npm run build"))
+		case cfg.ClientID == "" || cfg.AuthorizationEndpoint == "" || cfg.TokenEndpoint == "":
+			a.logger.Warn("the console has no relying party configured and cannot log anyone in",
+				slog.String("configure", strings.Join([]string{
+					EnvConsoleOIDCClientID, EnvConsoleOIDCAuthz, EnvConsoleOIDCToken,
+				}, ", ")))
+		}
+	}
+
+	return api.NewConsole(api.ConsoleConfig{
+		Assets:     assets,
+		APIBaseURL: cfg.APIBaseURL,
+		OIDC: api.ConsoleOIDC{
+			Issuer:                issuer,
+			AuthorizationEndpoint: cfg.AuthorizationEndpoint,
+			TokenEndpoint:         cfg.TokenEndpoint,
+			EndSessionEndpoint:    cfg.EndSessionEndpoint,
+			ClientID:              cfg.ClientID,
+			Scopes:                cfg.Scopes,
+			RoleClaim:             cfg.RoleClaim,
+		},
+		AllowInsecureTransport: cfg.AllowInsecureTransport,
+	})
 }
 
 // challengeHandlers builds the challenge kinds this deployment serves.
@@ -771,18 +822,14 @@ func (r *reconciling) Submit(ctx context.Context, sub decision.Submission) (deci
 	return result, nil
 }
 
-// notImplemented is the placeholder a slot with a later owner answers with. It
-// is deliberately not a 404: the route is registered here, and an operator has
-// to be able to tell "this build does not serve that yet" from "this process
-// does not run that subsystem".
-func notImplemented(component string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Stamp-Component", component)
-		w.WriteHeader(http.StatusNotImplemented)
-		_, _ = io.WriteString(w, "not implemented\n")
-	})
-}
+// notImplemented used to be here: the placeholder a slot with a later owner
+// answered with. The console was its last user, and the console now serves the
+// real thing — or, in a build that never ran the console build, a 503 that
+// names the missing command (see [api.Console]). The event consumer, the one
+// remaining unfilled slot, has a runner rather than a route.
+//
+// It is not being kept for the next unit. A dead helper waiting for a use is a
+// helper nobody remembers the rules of.
 
 func blockUntilDone(ctx context.Context) error {
 	<-ctx.Done()

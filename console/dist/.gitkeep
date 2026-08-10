@@ -1,0 +1,4 @@
+This directory is where `npm run build` writes the console bundle, and it is
+tracked so that the go:embed directive in embed.go always matches something.
+A build that has not run the console build embeds this file alone, and the
+console role says so at runtime rather than failing to compile.

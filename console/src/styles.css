@@ -1,0 +1,316 @@
+/*
+ * One stylesheet, no inline styles anywhere.
+ *
+ * That is a CSP constraint before it is a taste one: the console is served with
+ * style-src 'self' and no 'unsafe-inline', so a `style={{...}}` attribute in a
+ * component is a rule the browser drops. Keeping every rule here means the
+ * bundle the server serves is the bundle the browser renders.
+ *
+ * Colour choices are contrast choices. Every foreground/background pair below
+ * clears 4.5:1 in both schemes, which R19 requires of the authoring flow and
+ * R55 extends to the inbox and the audit console.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --ink: #14181f; /* on --paper: 15.8:1 */
+  --ink-quiet: #444d59; /* on --paper: 8.6:1 */
+  --paper: #ffffff;
+  --paper-sunk: #f2f4f7;
+  --line: #c3cad4;
+  --accent: #0b5cab; /* on --paper: 6.9:1 */
+  --accent-ink: #ffffff;
+  --warn-paper: #fff6e0;
+  --warn-line: #a86b00;
+  --warn-ink: #4a3000; /* on --warn-paper: 11.3:1 */
+  --refusal-line: #a4262c;
+
+  --radius: 6px;
+  --gap: 1rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #eef1f5; /* on --paper: 14.1:1 */
+    --ink-quiet: #b8c1cc; /* on --paper: 8.4:1 */
+    --paper: #14181f;
+    --paper-sunk: #1d232c;
+    --line: #3c4655;
+    --accent: #7cb8ff; /* on --paper: 8.2:1 */
+    --accent-ink: #0b1220;
+    --warn-paper: #33280d;
+    --warn-line: #e0aa3e;
+    --warn-ink: #ffeccc;
+    --refusal-line: #ff8a8a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', 'Noto Sans KR', sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.925em;
+  background: var(--paper-sunk);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+a {
+  color: var(--accent);
+}
+
+/* A visible focus ring everywhere, on every scheme. The default ring is the
+   first thing a design system removes and the first thing a keyboard user
+   needs. */
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  padding: 0.6rem 1rem;
+  background: var(--accent);
+  color: var(--accent-ink);
+  z-index: 10;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+.shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.shell__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap);
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper-sunk);
+}
+
+.shell__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.shell__wordmark {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.shell__tagline {
+  color: var(--ink-quiet);
+  font-size: 0.875rem;
+}
+
+.shell__nav-list {
+  display: flex;
+  gap: 0.25rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.shell__nav-link {
+  display: inline-block;
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius);
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.shell__nav-link:hover {
+  background: var(--paper);
+  text-decoration: underline;
+}
+
+/* The current page is marked by weight and an underline as well as by colour:
+   colour alone is not a signal every reader receives. */
+.shell__nav-link--current {
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+  text-decoration-thickness: 3px;
+}
+
+.shell__account {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.875rem;
+}
+
+.shell__roles {
+  color: var(--ink-quiet);
+}
+
+.shell__main {
+  flex: 1;
+  padding: 1.5rem 1.25rem;
+}
+
+/* main takes focus on route change, and a focused container should not show a
+   ring as if it were interactive — but it must not be invisible either, so the
+   ring is kept and the offset pulled in. */
+.shell__main:focus-visible {
+  outline-offset: -3px;
+}
+
+.shell__footer {
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--line);
+  color: var(--ink-quiet);
+  font-size: 0.8125rem;
+}
+
+.panel {
+  max-width: 60rem;
+}
+
+.panel--refusal {
+  border-left: 4px solid var(--refusal-line);
+  padding-left: 1rem;
+}
+
+.panel__meta {
+  color: var(--ink-quiet);
+  font-size: 0.875rem;
+}
+
+.notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--warn-line);
+}
+
+.notice--warning {
+  background: var(--warn-paper);
+  color: var(--warn-ink);
+}
+
+.notice__text {
+  margin: 0;
+}
+
+.button {
+  font: inherit;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.button--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.button--quiet {
+  background: transparent;
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.error-summary {
+  border: 2px solid var(--refusal-line);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin-bottom: var(--gap);
+}
+
+.error-summary__title {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.error-summary__list {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.disclosure {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 0.5rem;
+}
+
+.disclosure__trigger {
+  font: inherit;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.disclosure__region {
+  padding: 0 0.75rem 0.75rem;
+}
+
+/*
+ * R55: collapsing is visual compression, not suppression. The collapsed region
+ * keeps its content in the DOM and in the layout — no display:none, no hidden,
+ * no unmount — so a screen reader reaches it and the browser's find-in-page
+ * finds it. What changes is how much of it is drawn.
+ */
+.disclosure__region--collapsed {
+  max-height: 3.2em;
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

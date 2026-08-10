@@ -85,7 +85,23 @@ const (
 	// a payload signature rather than with a credential, and for liveness
 	// probes. It is not mountable on the PEP or console surfaces.
 	AuthPublic Auth = "public"
+	// AuthStatic admits an unauthenticated request for the console's own
+	// static bundle and its operator configuration document.
+	//
+	// It is a separate value from AuthPublic rather than a relaxation of the
+	// console surface's entry in [allowedAuth], because the two say different
+	// things. A browser performing a top level navigation cannot present a
+	// bearer token, so the bundle has to be reachable without one; a console
+	// *API* route that asked for no credential would still be a mistake, and
+	// keeping AuthPublic off the console surface is what keeps that a mount
+	// time failure. AuthStatic is mountable on the console surface alone.
+	AuthStatic Auth = "static"
 )
+
+// needsCredential reports whether an auth kind is enforced by the identity
+// middleware. The two unauthenticated kinds are enforced by what the handler
+// behind them is allowed to be, not by a credential check.
+func needsCredential(a Auth) bool { return a == AuthWorkload || a == AuthUser }
 
 // allowedAuth is the surface-to-credential table, checked at mount time.
 //
@@ -94,7 +110,7 @@ const (
 // holds, and nothing else has to be read to confirm it.
 var allowedAuth = map[Surface][]Auth{
 	SurfacePEP:      {AuthWorkload},
-	SurfaceConsole:  {AuthUser},
+	SurfaceConsole:  {AuthUser, AuthStatic},
 	SurfaceCallback: {AuthWorkload, AuthPublic},
 }
 
@@ -229,7 +245,7 @@ func (s *Server) mount(r Route) error {
 		return fmt.Errorf("api: route %q asks for %q on the %s surface, which admits only %s",
 			r.Name, r.Auth, r.Surface, joinAuth(allowed))
 	}
-	if r.Auth != AuthPublic && s.cfg.Identity == nil {
+	if needsCredential(r.Auth) && s.cfg.Identity == nil {
 		return fmt.Errorf("api: route %q requires a %s credential but no identity middleware is configured",
 			r.Name, r.Auth)
 	}
