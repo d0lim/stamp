@@ -90,12 +90,13 @@ mkdir -p "${out}"
 render all-in-one values-all-in-one.yaml
 render split values-split.yaml
 render_refusal split-no-api values-split-no-api.yaml
+render_refusal no-callback values-no-callback.yaml
 
 helm lint "deploy/helm/stamp" --values "deploy/helm/stamp/values-all-in-one.yaml" >/dev/null
 helm lint "deploy/helm/stamp" --values "deploy/helm/stamp/values-split.yaml" >/dev/null
 
 if [ "${check}" = "1" ]; then
-    for name in all-in-one.yaml split.yaml split-no-api.err.txt; do
+    for name in all-in-one.yaml split.yaml split-no-api.err.txt no-callback.err.txt; do
         if ! diff -u "${repo_root}/deploy/helm/snapshots/${name}" "${out}/${name}"; then
             echo "deploy/helm/snapshots/${name} is stale: run deploy/helm/render.sh" >&2
             exit 1
@@ -103,5 +104,5 @@ if [ "${check}" = "1" ]; then
     done
     echo "snapshots are current"
 else
-    echo "rendered ${out}/all-in-one.yaml, ${out}/split.yaml and ${out}/split-no-api.err.txt"
+    echo "rendered ${out}/all-in-one.yaml, ${out}/split.yaml, ${out}/split-no-api.err.txt and ${out}/no-callback.err.txt"
 fi

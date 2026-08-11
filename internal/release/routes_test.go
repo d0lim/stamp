@@ -119,6 +119,44 @@ func (m mountTable) surfacesOf(role string) []string {
 	return out
 }
 
+// surfacesOfEveryRole returns the listeners any role's routes are mounted on.
+//
+// It is the all-in-one tier's answer to surfacesOf: that tier is started with
+// --roles=all, so every route in this table is mounted in its process and every
+// surface in it is one it has to bind.
+func (m mountTable) surfacesOfEveryRole() []string {
+	seen := map[string]struct{}{}
+	for _, r := range m.Routes {
+		seen[r.Surface] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// pathsOn returns the request paths mounted on one surface, with the method
+// dropped and duplicates collapsed: one path served by two methods is one thing
+// a deployment either reaches or does not.
+func (m mountTable) pathsOn(surface string) []string {
+	seen := map[string]struct{}{}
+	for _, r := range m.Routes {
+		if r.Surface != surface {
+			continue
+		}
+		fields := strings.Fields(r.Pattern)
+		seen[fields[len(fields)-1]] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // patternsOn returns the patterns one role mounts on one surface, for a message
 // that names what became unreachable rather than only which listener did.
 func (m mountTable) patternsOn(role, surface string) []string {
