@@ -399,8 +399,16 @@ func TestUnauthenticatedDecideIsRefusedBeforeEvaluation(t *testing.T) {
 	}
 }
 
-// A submission from someone the challenge does not target is refused by the
-// handler and audited by the lifecycle.
+// A submission from someone the challenge does not target is refused and
+// audited.
+//
+// The refusal is the lifecycle's rather than the handler's, and the sentinel
+// moved with it: standing is settled before the decision's state is judged, so a
+// non-target is turned away with ErrNotAuthorized before the handler is asked
+// anything (#38). Both sentinels answer 404 at every surface that maps them, and
+// which one arrives is not observable from outside — what is observable, and
+// what internal/runtime/oracle_test.go asserts, is that the answer no longer
+// changes when the decision resolves.
 func TestSubmissionFromNonTargetIsRefusedAndAudited(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, harnessOptions{
@@ -412,14 +420,149 @@ func TestSubmissionFromNonTargetIsRefusedAndAudited(t *testing.T) {
 	}
 
 	_, err = h.svc.Submit(ctx, decision.Submission{Caller: user("mallory"), DecisionID: res.ID, Ordinal: 0})
-	if !errors.Is(err, challenge.ErrNotTarget) {
-		t.Fatalf("submission from a non-target returned %v, want ErrNotTarget", err)
+	if !errors.Is(err, decision.ErrNotAuthorized) {
+		t.Fatalf("submission from a non-target returned %v, want ErrNotAuthorized", err)
 	}
 	if n := h.approvalCount(res.ID, 0); n != 0 {
 		t.Errorf("a refused submission recorded %d approvals", n)
 	}
 	if rows := h.auditPayloads(decision.AuditKindAccessRefused, res.ID); len(rows) != 1 {
 		t.Errorf("audited submission refusals = %d, want 1", len(rows))
+	}
+}
+
+// TestStandingIsSettledBeforeStateOnTheSubmitPath is #38's second half at the
+// lifecycle, where the ordering lives.
+//
+// The end-to-end assertion is internal/runtime/oracle_test.go, which compares
+// response bytes. This one is here because the ordering is a property of this
+// function and a future edit that moves the state check back in front of the
+// standing check would be a two-line diff nothing else in this package notices.
+func TestStandingIsSettledBeforeStateOnTheSubmitPath(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		policies: []*policy.Policy{gatedPolicy("wire-transfer", 1, "alice")},
+	})
+
+	// Three decisions, one per state a stranger must not be able to tell apart.
+	pending, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	resolved, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("alice"), DecisionID: resolved.ID, Ordinal: 0,
+	}); err != nil {
+		t.Fatalf("alice's approval: %v", err)
+	}
+	expired, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+
+	stranger := func(name, id string) {
+		t.Helper()
+		_, err := h.svc.Submit(ctx, decision.Submission{
+			Caller: user("mallory"), DecisionID: id, Ordinal: 0,
+		})
+		if !errors.Is(err, decision.ErrNotAuthorized) {
+			t.Errorf("a stranger submitting to %s returned %v, want ErrNotAuthorized: "+
+				"a state sentinel here is a 409 at the surface, and a 409 where a stranger "+
+				"would otherwise read 404 is how they learn the decision is real", name, err)
+		}
+	}
+	stranger("a pending decision", pending.ID)
+	stranger("a resolved decision", resolved.ID)
+
+	// The approver the challenge names is told what a stranger is not: the
+	// decision she is submitting to has already resolved.
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("alice"), DecisionID: resolved.ID, Ordinal: 0,
+	}); !errors.Is(err, decision.ErrNotPending) {
+		t.Errorf("alice submitting to a resolved decision returned %v, want ErrNotPending", err)
+	}
+
+	// Past every deadline. The third decision is now over, and the expiry test
+	// is the first state check either caller meets — which is why alice's answer
+	// below is the expiry rather than the state the sweeper has yet to write.
+	h.clock.Advance(2 * decision.DefaultTTL)
+
+	stranger("an expired decision", expired.ID)
+
+	// The fourth case is the one the other three have to be indistinguishable
+	// from. Its sentinel is the store's rather than this package's, and the two
+	// are one answer at every surface that maps them — which is the property
+	// internal/runtime/oracle_test.go asserts in bytes.
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("mallory"), DecisionID: "00000000-0000-4000-8000-000000000000", Ordinal: 0,
+	}); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("a stranger submitting to a decision that does not exist returned %v, want ErrNotFound", err)
+	}
+
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("alice"), DecisionID: expired.ID, Ordinal: 0,
+	}); !errors.Is(err, store.ErrDecisionExpired) {
+		t.Errorf("alice submitting to an expired decision returned %v, want ErrDecisionExpired", err)
+	}
+}
+
+// TestACounterpartyOfAChallengeThatNamesNobodyIsStillAdmitted is the other side
+// of the standing check, and the one that would break a challenge kind if it
+// were written the obvious way.
+//
+// An external challenge has no approver set: the party that completes it is a
+// system, arriving on the unauthenticated callback listener as a workload
+// principal that is neither the decision's creator nor anybody's target. A
+// standing rule that only asked "is this caller a target" would refuse every
+// callback before the handler could check the credential that authenticates it,
+// and the challenge kind would simply stop working.
+func TestACounterpartyOfAChallengeThatNamesNobodyIsStillAdmitted(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		policies:        []*policy.Policy{externallyGatedPolicy("screened-transfer")},
+		externalHandler: &externalHandler{},
+	})
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if !res.Pending() {
+		t.Fatalf("the decision is %s, want it pending on its external challenge", res.State)
+	}
+
+	// The callback principal the callback surface submits as: a workload, named
+	// by nothing on this decision.
+	out, err := h.svc.Submit(ctx, decision.Submission{
+		Caller:     workload("external-callback"),
+		DecisionID: res.ID,
+		Ordinal:    0,
+		Payload:    json.RawMessage(`{"nonce": "nonce-external-0f0f"}`),
+	})
+	if err != nil {
+		t.Fatalf("the callback was refused before its handler saw it: %v", err)
+	}
+	if out.State != store.DecisionAllowed {
+		t.Errorf("the decision is %s after its challenge was satisfied, want allowed", out.State)
+	}
+
+	// A console credential is not that counterparty. It is refused here rather
+	// than left to the handler, because the handler's refusal would arrive after
+	// the state checks and hand a person the 409s an external challenge has no
+	// reason to show anyone.
+	second, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller:     user("mallory"),
+		DecisionID: second.ID,
+		Ordinal:    0,
+		Payload:    json.RawMessage(`{"nonce": "nonce-external-0f0f"}`),
+	}); !errors.Is(err, decision.ErrNotAuthorized) {
+		t.Errorf("a person completing an external challenge returned %v, want ErrNotAuthorized", err)
 	}
 }
 

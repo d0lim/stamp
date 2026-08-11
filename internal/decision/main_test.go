@@ -137,6 +137,10 @@ type harnessOptions struct {
 	// can register a handler that publishes the wrong thing and check that the
 	// assertions notice.
 	mfaHandler challenge.Handler
+	// externalHandler registers the fourth kind. It is off by default because
+	// most of this package's tests are about the three kinds that name people,
+	// and the whole point of this one is that it names nobody.
+	externalHandler challenge.Handler
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -219,11 +223,15 @@ func (h *harness) newService(writer *store.AuditWriter, opts harnessOptions) *de
 	if opts.mfaHandler != nil {
 		mfa = opts.mfaHandler
 	}
-	registry, err := challenge.NewRegistry(
+	handlers := []challenge.Handler{
 		&quorumHandler{writer: writer, pool: h.store.Pool()},
 		&delayHandler{},
 		mfa,
-	)
+	}
+	if opts.externalHandler != nil {
+		handlers = append(handlers, opts.externalHandler)
+	}
+	registry, err := challenge.NewRegistry(handlers...)
 	if err != nil {
 		h.t.Fatalf("new challenge registry: %v", err)
 	}
@@ -785,6 +793,66 @@ func mfaAndQuorumPolicy(id string, approvers ...string) *policy.Policy {
 		Challenges: []policy.Challenge{
 			policy.MFA{Mode: policy.MFADelegated, ACRValues: []string{"urn:stamp:acr:mfa"}},
 			policy.Quorum{Threshold: 1, Approvers: policy.ApproverSet{Members: approvers}},
+		},
+	}
+}
+
+// externalHandler is the shape of the one kind that names no targets.
+//
+// It deliberately does not implement [challenge.Targeter], because the real one
+// does not: its counterparty is a system STAMP called out to, holding a
+// signature over a nonce this server minted rather than an identity the
+// lifecycle could compare against an approver set. That absence is load-bearing
+// — it is what the standing check in Submit has to fall through — so the double
+// reproduces it rather than being convenient.
+type externalHandler struct{ target string }
+
+func (*externalHandler) Kind() policy.ChallengeType { return policy.ChallengeExternal }
+
+func (x *externalHandler) Issue(_ context.Context, req challenge.IssueRequest) (challenge.IssueResult, error) {
+	spec, ok := req.Spec.(policy.External)
+	if !ok {
+		return challenge.IssueResult{}, fmt.Errorf("%w: %T", challenge.ErrUnsupportedSpec, req.Spec)
+	}
+	x.target = spec.Target
+	return challenge.IssueResult{
+		State:  challenge.StatePending,
+		Detail: map[string]any{"target": spec.Target, "nonce": "nonce-external-0f0f"},
+	}, nil
+}
+
+// Submit accepts the body that carries the nonce this challenge was opened with,
+// and nothing else. That check standing in for a signature is the point: the
+// counterparty proves itself to the handler, which is why the lifecycle must not
+// turn it away before the handler is asked.
+func (*externalHandler) Submit(_ context.Context, req challenge.SubmitRequest) (challenge.SubmitResult, error) {
+	var body struct {
+		Nonce string `json:"nonce"`
+	}
+	if err := json.Unmarshal(req.Payload, &body); err != nil {
+		return challenge.SubmitResult{}, fmt.Errorf("%w: %w", challenge.ErrInvalidPayload, err)
+	}
+	if body.Nonce != "nonce-external-0f0f" {
+		return challenge.SubmitResult{}, fmt.Errorf("%w: the callback carries no nonce of this challenge",
+			challenge.ErrNotTarget)
+	}
+	return challenge.SubmitResult{State: challenge.StateSatisfied, Have: 1, Need: 1}, nil
+}
+
+func (*externalHandler) Status(_ context.Context, req challenge.StatusRequest) (challenge.Status, error) {
+	return challenge.Status{State: req.Stored, Have: 0, Need: 1, Deadline: req.Deadline}, nil
+}
+
+// externallyGatedPolicy waits on a system rather than on a person.
+func externallyGatedPolicy(id string) *policy.Policy {
+	return &policy.Policy{
+		ID:        id,
+		Subject:   "user",
+		Resource:  "account",
+		Actions:   []string{"transfer"},
+		Condition: policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+		Challenges: []policy.Challenge{
+			policy.External{Target: "https://sanctions.test/screen"},
 		},
 	}
 }
