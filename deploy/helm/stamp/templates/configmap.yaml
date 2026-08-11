@@ -1,0 +1,166 @@
+{{- if not (has .Values.authoring.mode (list "both" "file" "console")) -}}
+{{- fail (printf "authoring.mode is %q, want \"both\", \"file\" or \"console\". The binary refuses an unrecognized mode rather than falling back to the permissive one, so a typo here is a crash loop, not a default." .Values.authoring.mode) -}}
+{{- end -}}
+{{/*
+Every tier reads the same non-secret configuration. What differs between tiers
+is the DSN, the listen addresses and whether it migrates, and all three of those
+are per-tier environment on the Deployment rather than entries here.
+
+Nothing in this ConfigMap may be a credential. The two settings that are one —
+the DSN and the CIBA client secret — are secretKeyRef entries on the pod, and
+the six documents that may contain one are mounted from Secrets.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "stamp.fullname" . }}-env
+  labels:
+    {{- include "stamp.labels" . | nindent 4 }}
+data:
+  STAMP_OIDC_ISSUER: {{ required "oidc.issuer is required: it is the trust boundary every token is verified against" .Values.oidc.issuer | quote }}
+  STAMP_OIDC_JWKS_URL: {{ required "oidc.jwksUrl is required" .Values.oidc.jwksUrl | quote }}
+  STAMP_OIDC_AUDIENCE: {{ required "oidc.audience is required" .Values.oidc.audience | quote }}
+  {{- with .Values.oidc.workloadClients }}
+  STAMP_OIDC_WORKLOAD_CLIENTS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.oidc.algorithms }}
+  STAMP_OIDC_ALGORITHMS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.oidc.acrValues }}
+  STAMP_OIDC_ACR_VALUES: {{ join "," . | quote }}
+  {{- end }}
+  STAMP_OIDC_ALLOW_INSECURE_TRANSPORT: {{ .Values.oidc.allowInsecureTransport | quote }}
+  {{- with .Values.approverIssuer }}
+  STAMP_APPROVER_ISSUER: {{ . | quote }}
+  {{- end }}
+
+  STAMP_DB_MAX_CONNS: {{ .Values.database.maxConns | quote }}
+  {{- with .Values.database.roleNames.check }}
+  STAMP_DB_ROLE_CHECK: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.database.roleNames.decide }}
+  STAMP_DB_ROLE_DECIDE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.database.roleNames.consumer }}
+  STAMP_DB_ROLE_CONSUMER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.database.roleNames.admin }}
+  STAMP_DB_ROLE_ADMIN: {{ . | quote }}
+  {{- end }}
+
+  {{- with .Values.egress.allow }}
+  STAMP_EGRESS_ALLOW: {{ join "," . | quote }}
+  {{- end }}
+  STAMP_EGRESS_ALLOW_LOOPBACK: {{ .Values.egress.allowLoopback | quote }}
+  STAMP_EGRESS_ALLOW_PRIVATE: {{ .Values.egress.allowPrivate | quote }}
+  STAMP_FACT_ALLOW_FAIL_OPEN: {{ .Values.factAllowFailOpen | quote }}
+
+  STAMP_AUDIT_FAIL_CLOSED: {{ .Values.audit.failClosed | quote }}
+
+  STAMP_AUTHORING_MODE: {{ .Values.authoring.mode | quote }}
+  {{- with .Values.authoring.capabilityClaim }}
+  STAMP_CAPABILITY_CLAIM: {{ . | quote }}
+  {{- end }}
+
+  {{- with .Values.governance.minApprovers }}
+  STAMP_GOVERNANCE_MIN_APPROVERS: {{ . | quote }}
+  {{- end }}
+  STAMP_GOVERNANCE_PROPOSER_MAY_APPROVE: {{ .Values.governance.proposerMayApprove | quote }}
+
+  {{- with .Values.console.apiBaseUrl }}
+  STAMP_CONSOLE_API_BASE_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.console.oidc.issuer }}
+  STAMP_CONSOLE_OIDC_ISSUER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.console.oidc.clientId }}
+  STAMP_CONSOLE_OIDC_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.console.oidc.authorizationEndpoint }}
+  STAMP_CONSOLE_OIDC_AUTHORIZATION_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.console.oidc.tokenEndpoint }}
+  STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.console.oidc.endSessionEndpoint }}
+  STAMP_CONSOLE_OIDC_END_SESSION_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.console.oidc.scopes }}
+  STAMP_CONSOLE_OIDC_SCOPES: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.console.roleClaim }}
+  STAMP_CONSOLE_ROLE_CLAIM: {{ . | quote }}
+  {{- end }}
+  STAMP_CONSOLE_ALLOW_INSECURE_TRANSPORT: {{ .Values.console.allowInsecureTransport | quote }}
+
+  {{- with .Values.callbackBaseUrl }}
+  STAMP_CALLBACK_BASE_URL: {{ . | quote }}
+  {{- end }}
+
+  {{- with .Values.mfa.acrValues }}
+  STAMP_MFA_ACR_VALUES: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.requiredAmr }}
+  STAMP_MFA_REQUIRED_AMR: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.authorizationEndpoint }}
+  STAMP_MFA_AUTHORIZATION_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.clientId }}
+  STAMP_MFA_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.redirectUri }}
+  STAMP_MFA_REDIRECT_URI: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.scopes }}
+  STAMP_MFA_SCOPES: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.tokenIssuer }}
+  STAMP_MFA_TOKEN_ISSUER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.tokenClientId }}
+  STAMP_MFA_TOKEN_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.tokenAudience }}
+  STAMP_MFA_TOKEN_AUDIENCE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.ciba.backchannelEndpoint }}
+  STAMP_MFA_CIBA_BACKCHANNEL_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.ciba.tokenEndpoint }}
+  STAMP_MFA_CIBA_TOKEN_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.ciba.clientId }}
+  STAMP_MFA_CIBA_CLIENT_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.mfa.ciba.scope }}
+  STAMP_MFA_CIBA_SCOPE: {{ . | quote }}
+  {{- end }}
+
+  {{- with .Values.kafka.brokers }}
+  STAMP_KAFKA_BROKERS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .Values.kafka.group }}
+  STAMP_KAFKA_GROUP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.kafka.adapterName }}
+  STAMP_KAFKA_ADAPTER_NAME: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.kafka.pollRecords }}
+  STAMP_KAFKA_POLL_RECORDS: {{ . | quote }}
+  {{- end }}
+
+  {{- range $name, $doc := .Values.documents }}
+  {{- if $doc.secretName }}
+  {{- $env := "" }}
+  {{- if eq $name "factSources" }}{{- $env = "STAMP_FACT_SOURCES" }}
+  {{- else if eq $name "streamSources" }}{{- $env = "STAMP_STREAM_SOURCES" }}
+  {{- else if eq $name "ingestCredentials" }}{{- $env = "STAMP_INGEST_CREDENTIALS" }}
+  {{- else if eq $name "externalTargets" }}{{- $env = "STAMP_EXTERNAL_TARGETS" }}
+  {{- else if eq $name "idpGroupSources" }}{{- $env = "STAMP_IDP_GROUP_SOURCES" }}
+  {{- else if eq $name "kafkaTopics" }}{{- $env = "STAMP_KAFKA_TOPICS" }}
+  {{- else }}{{- fail (printf "documents.%s is not a setting this chart knows" $name) }}
+  {{- end }}
+  {{ $env }}: {{ include "stamp.documentPath" $doc | quote }}
+  {{- end }}
+  {{- end }}
