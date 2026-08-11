@@ -419,7 +419,16 @@ func (a *App) build(ctx context.Context) error {
 	// path with four doors, and the revision reconcile that has to follow the
 	// last approval has to follow all four for the same reason.
 	submitter := &reconciling{inner: plane, governance: governance, logger: a.logger}
-	approvals, err := api.NewApprovals(api.ApprovalsConfig{Decisions: submitter, Reviews: quorum})
+	approvals, err := api.NewApprovals(api.ApprovalsConfig{
+		Decisions: submitter,
+		Reviews:   quorum,
+		Rate:      cfg.ApprovalSubmitRate,
+		// The same buffer the decide surface writes its rate refusals through. A
+		// submission shed under the budget never reaches the lifecycle — that is
+		// what makes it cheap — so this surface is the only place it can be
+		// recorded.
+		Audit: buffer,
+	})
 	if err != nil {
 		return err
 	}
@@ -1014,6 +1023,11 @@ func (a *App) challengeHandlers(quorum *challenge.Quorum, gate *fact.Gate,
 		Gate:            gate,
 		Targets:         cfg.ExternalTargets,
 		CallbackBaseURL: cfg.CallbackBaseURL,
+		// R43's dispatch budget. It is the same operator setting the step-up
+		// handler reads, because "how much may one subject cause" is one thought;
+		// what the two handlers do with an unset value differs, and that is the
+		// handlers' own business.
+		SubjectRate: cfg.ChallengeIssueRate,
 	})
 	if err != nil {
 		return nil, err
@@ -1124,6 +1138,10 @@ func (a *App) delegatedMFA() (*mfa.Delegated, error) {
 		Initiator:        initiator,
 		AllowedACRValues: cfg.MFA.AllowedACRValues,
 		RequiredAMR:      cfg.MFA.RequiredAMR,
+		// R43's issue budget. It is above the re-issue interval and not instead
+		// of it: that interval is keyed on the decision content and so cannot see
+		// a caller opening a different decision every time.
+		SubjectIssueRate: cfg.ChallengeIssueRate,
 		Issuer:           issuer,
 		ClientID:         clientID,
 		Audience:         audience,

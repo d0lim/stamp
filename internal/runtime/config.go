@@ -240,6 +240,32 @@ type Config struct {
 	DecideRate        stream.RateLimit
 	DecideSubjectRate stream.RateLimit
 
+	// ChallengeIssueRate is R43's per-subject bound on challenge issuance, and
+	// ApprovalSubmitRate its per-approver bound on approval submission. A zero
+	// field selects the owning package's default for that field; a negative rate
+	// removes the limit.
+	//
+	// ChallengeIssueRate is not the same knob as the re-issue interval and does
+	// not replace it. That interval is keyed on the subject *and the decision
+	// content*, so it suppresses a re-evaluation of one decision and cannot see a
+	// caller creating a hundred different ones — which is N different keys, N IdP
+	// requests, and N prompts on one phone. This is the bound over that.
+	//
+	// One rate configures the step-up handler and the webhook handler because an
+	// operator thinking about "how much may one subject cause" is thinking about
+	// one thing; each handler still defaults it separately when it is unset,
+	// because a prompt on a person's phone and a POST to a machine are not worth
+	// the same by default.
+	//
+	// Both limits are **per instance**, like DecideRate above and for the same
+	// reason: the buckets live in the process, so a fleet of N replicas admits N
+	// times what is written here, and an operator sizing a fleet divides. What
+	// bounds the fleet as a whole is elsewhere — MaxOutstanding for decisions,
+	// and for these, the challenge deadline and the quorum threshold, which are
+	// counted in the database.
+	ChallengeIssueRate stream.RateLimit
+	ApprovalSubmitRate stream.RateLimit
+
 	// GovernanceFloor is R33's operator lower bound on a revision quorum.
 	GovernanceFloor revision.Floor
 	// RevisionTTL bounds how long a revision may stay pending. Zero selects
@@ -689,6 +715,11 @@ const (
 	EnvDecideSubjectRate      = "STAMP_DECIDE_SUBJECT_RATE_PER_SECOND"
 	EnvDecideSubjectRateBurst = "STAMP_DECIDE_SUBJECT_RATE_BURST"
 
+	EnvChallengeIssueRate  = "STAMP_CHALLENGE_ISSUE_RATE_PER_SECOND"
+	EnvChallengeIssueBurst = "STAMP_CHALLENGE_ISSUE_RATE_BURST"
+	EnvApprovalRate        = "STAMP_APPROVAL_RATE_PER_SECOND"
+	EnvApprovalBurst       = "STAMP_APPROVAL_RATE_BURST"
+
 	EnvFloorMinApprovers       = "STAMP_GOVERNANCE_MIN_APPROVERS"
 	EnvFloorProposerMayApprove = "STAMP_GOVERNANCE_PROPOSER_MAY_APPROVE"
 	EnvRevisionTTL             = "STAMP_REVISION_TTL"
@@ -788,6 +819,14 @@ func ConfigFromEnv() (Config, error) {
 		DecideSubjectRate: stream.RateLimit{
 			PerSecond: envFloat(EnvDecideSubjectRate, fail),
 			Burst:     envFloat(EnvDecideSubjectRateBurst, fail),
+		},
+		ChallengeIssueRate: stream.RateLimit{
+			PerSecond: envFloat(EnvChallengeIssueRate, fail),
+			Burst:     envFloat(EnvChallengeIssueBurst, fail),
+		},
+		ApprovalSubmitRate: stream.RateLimit{
+			PerSecond: envFloat(EnvApprovalRate, fail),
+			Burst:     envFloat(EnvApprovalBurst, fail),
 		},
 		RevisionTTL:           envDuration(EnvRevisionTTL, 0, fail),
 		ReconcileInterval:     envDuration(EnvReconcileInterval, DefaultReconcileInterval, fail),
@@ -940,14 +979,21 @@ func ConfigFromEnv() (Config, error) {
 	}
 	cfg.AuthoringMode = mode
 
-	// A decide rate that cannot mean anything is a startup failure rather than a
-	// value quietly resolved into one of the two things it might have meant. The
-	// two shapes that cannot mean anything are a negative bucket size, and a
-	// bucket size configured alongside a rate that turns the limit off — the
-	// second is an operator who wrote down a limit and got none, which is the
-	// direction worth refusing to boot in.
-	checkDecideRate(EnvDecideRate, EnvDecideBurst, cfg.DecideRate, fail)
-	checkDecideRate(EnvDecideSubjectRate, EnvDecideSubjectRateBurst, cfg.DecideSubjectRate, fail)
+	// A rate that cannot mean anything is a startup failure rather than a value
+	// quietly resolved into one of the two things it might have meant. The two
+	// shapes that cannot mean anything are a negative bucket size, and a bucket
+	// size configured alongside a rate that turns the limit off — the second is
+	// an operator who wrote down a limit and got none, which is the direction
+	// worth refusing to boot in.
+	//
+	// Every R43 budget is checked by the same function, because an operator who
+	// mistyped the approval burst is in exactly the position the decide burst's
+	// check exists for, and a limit that is only validated on one of four
+	// surfaces is a limit somebody can be silently without.
+	checkRate(EnvDecideRate, EnvDecideBurst, cfg.DecideRate, fail)
+	checkRate(EnvDecideSubjectRate, EnvDecideSubjectRateBurst, cfg.DecideSubjectRate, fail)
+	checkRate(EnvChallengeIssueRate, EnvChallengeIssueBurst, cfg.ChallengeIssueRate, fail)
+	checkRate(EnvApprovalRate, EnvApprovalBurst, cfg.ApprovalSubmitRate, fail)
 
 	aliases, err := aliasesFrom(os.Getenv(EnvCheckPropertyAliases))
 	if err != nil {
@@ -1642,8 +1688,8 @@ func envFloat(key string, fail func(string, ...any)) float64 {
 	return v
 }
 
-// checkDecideRate refuses the two decide-rate spellings that have no meaning.
-func checkDecideRate(rateKey, burstKey string, r stream.RateLimit, fail func(string, ...any)) {
+// checkRate refuses the two token-bucket spellings that have no meaning.
+func checkRate(rateKey, burstKey string, r stream.RateLimit, fail func(string, ...any)) {
 	if r.Burst < 0 {
 		fail("%s: %g is negative, and a bucket cannot hold less than nothing", burstKey, r.Burst)
 	}

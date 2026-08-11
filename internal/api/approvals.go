@@ -16,6 +16,32 @@ package api
 // forwarded to the challenge handler verbatim, and it is the handler that
 // refuses a body carrying an approver name — one refusal, in the place that
 // knows what a valid body is.
+//
+// # The submission budget, and why its refusal looks different
+//
+// R43's fourth axis is here: a per-approver rate limit on submissions, charged
+// before the lifecycle is asked anything. What makes it worth standing at this
+// door is what a submission costs behind it — a row lock on the decision, a
+// challenge handler's verification, and, for a quorum, an approval row — so a
+// caller replaying submissions is a caller holding the serialized part of the
+// lifecycle, and a limit applied after that has limited nothing.
+//
+// Its refusal is a status code, and the two other budgets this unit added are
+// not. That is deliberate rather than an inconsistency to be factored away. A
+// challenge issue has no HTTP response of its own — the caller on that path is a
+// PEP asking for a decision — so a refusal there can only be expressed as
+// challenge state. This one is answering a console, over a request the approver
+// made themselves, about an action they can simply retry; 429 with a code is
+// what a console can render and what a human can act on, and folding it into a
+// decision object would be answering a question nobody asked.
+//
+// The limit is **per instance**: the buckets live in this process, so a fleet of
+// N replicas admits N times what is configured. That is the same trade the
+// decide surface makes and for the same reason — a limiter that queried would
+// cost more than what it sheds — and it is bounded the same way, by the fact that
+// what a submission can actually achieve is governed by the quorum threshold and
+// the challenge's own idempotence, which are in the database. An operator sizing
+// a fleet divides.
 
 import (
 	"context"
@@ -29,6 +55,7 @@ import (
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // The approval endpoints.
@@ -47,6 +74,41 @@ const (
 // and a digest, so this is generous by two orders of magnitude and still small
 // enough that the surface cannot be made to allocate.
 const DefaultMaxApprovalBytes = 8 << 10
+
+// DefaultMaxTrackedApprovers bounds the submission-budget table. Its keys are
+// caller identifiers from verified tokens, which is a smaller and better
+// controlled namespace than a subject identifier — and it is bounded anyway,
+// because [stream.Limiter]'s refusal on a full table is what makes "the limiter
+// could not record a charge" a refusal rather than a hole.
+const DefaultMaxTrackedApprovers = 4096
+
+// DefaultApprovalRate is how often one approver may submit, for a deployment
+// that configured no budget (R43).
+//
+// A person clicking approve does it once per decision and then reads the next
+// one. Two a second sustained, twenty in a burst, is far above anything a human
+// does through a console and far below what a replay costs the lifecycle.
+//
+// An operator who wants no limit says so with a negative rate.
+var DefaultApprovalRate = stream.RateLimit{PerSecond: 2, Burst: 20}
+
+// The vocabulary of an approval refused under the budget.
+const (
+	// ApprovalRateLimitedCode is the error code the console reads.
+	ApprovalRateLimitedCode = "rate_limited"
+
+	// ApprovalRateLimitedReason is the ground written into the audit record.
+	//
+	// It is its own word, not the decide path's `rate_limited`, because the two
+	// are different budgets over different traffic and an operator reading the
+	// chain has to be able to tell which one shed what: one says a PEP was asking
+	// for too many decisions, this one says an approver was submitting too often.
+	ApprovalRateLimitedReason = "approval_rate_limited"
+
+	// rateScopeApprover names the budget in the audit record, alongside the
+	// "caller" and "subject" the decide path writes.
+	rateScopeApprover = "approver"
+)
 
 // ApprovalSubmitter takes evidence toward a challenge and returns the decision
 // as it then stands.
@@ -74,6 +136,16 @@ type ApprovalsConfig struct {
 	// MaxRequestBytes bounds a submission body. Zero selects
 	// DefaultMaxApprovalBytes.
 	MaxRequestBytes int64
+	// Rate bounds submissions per approver (R43). A zero field selects
+	// [DefaultApprovalRate] for that field; a negative rate removes the limit.
+	Rate stream.RateLimit
+	// MaxTrackedApprovers overrides [DefaultMaxTrackedApprovers].
+	MaxTrackedApprovers int
+	// Audit records refusals under the budget. It is optional only so that a
+	// test of this surface need not stand up a chain writer; a deployment that
+	// leaves it nil has a limit that sheds silently, which is why the wiring
+	// passes the same buffer the decide surface writes through.
+	Audit EventRecorder
 	// Now overrides the clock, for tests.
 	Now func() time.Time
 }
@@ -83,6 +155,9 @@ type Approvals struct {
 	decisions ApprovalSubmitter
 	reviews   ApprovalReviewer
 	maxBytes  int64
+	limiter   *stream.Limiter
+	rate      stream.RateLimit
+	audit     EventRecorder
 	now       func() time.Time
 }
 
@@ -100,6 +175,8 @@ func NewApprovals(cfg ApprovalsConfig) (*Approvals, error) {
 		decisions: cfg.Decisions,
 		reviews:   cfg.Reviews,
 		maxBytes:  cfg.MaxRequestBytes,
+		rate:      cfg.Rate,
+		audit:     cfg.Audit,
 		now:       cfg.Now,
 	}
 	if a.maxBytes <= 0 {
@@ -108,6 +185,19 @@ func NewApprovals(cfg ApprovalsConfig) (*Approvals, error) {
 	if a.now == nil {
 		a.now = time.Now
 	}
+	// A zero field takes the default for that field, so an operator who raised
+	// the burst does not have to restate the rate.
+	if a.rate.PerSecond == 0 {
+		a.rate.PerSecond = DefaultApprovalRate.PerSecond
+	}
+	if a.rate.Burst == 0 {
+		a.rate.Burst = DefaultApprovalRate.Burst
+	}
+	tracked := cfg.MaxTrackedApprovers
+	if tracked <= 0 {
+		tracked = DefaultMaxTrackedApprovers
+	}
+	a.limiter = stream.NewLimiter(tracked, func() time.Time { return a.now() })
 	return a, nil
 }
 
@@ -141,6 +231,16 @@ func (a *Approvals) submit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "this endpoint requires an end-user credential")
 		return
 	}
+	// Charged before the path is parsed and before the body is read, because
+	// everything below this line is work a caller over its budget has already
+	// been told it may not have. The key is the caller identifier the verified
+	// token established — never anything from the request — so a budget cannot be
+	// escaped by spelling a decision differently.
+	if !a.limiter.Allow("approver\x1f"+caller.CallerID(), a.rate, 1) {
+		a.refuseSubmission(w, r, caller)
+		return
+	}
+
 	id, ordinal, err := challengeRef(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -167,6 +267,32 @@ func (a *Approvals) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// refuseSubmission answers a submission over the budget and records it.
+//
+// The audit goes through the buffer rather than through a synchronous append,
+// for the reason the decide surface's does: this is the path taken by a caller
+// sending more than it is allowed to, and a chain transaction per refusal would
+// make the limiter generate load in proportion to the load it exists to shed.
+// What can be lost that way is the record of a refusal, never the record of a
+// submission that was accepted — those are written by the lifecycle, inside the
+// transaction that accepted them.
+func (a *Approvals) refuseSubmission(w http.ResponseWriter, r *http.Request, caller *identity.Subject) {
+	if a.audit != nil {
+		a.audit.Record(r.Context(), Event{
+			Kind:     EventRateLimited,
+			Time:     a.now(),
+			CallerID: caller.CallerID(),
+			Reason:   ApprovalRateLimitedReason,
+			Method:   r.Method,
+			Path:     r.URL.Path,
+			Scope:    rateScopeApprover,
+			Limit:    formatRate(a.rate),
+		})
+	}
+	writeError(w, http.StatusTooManyRequests, ApprovalRateLimitedCode,
+		"too many submissions; try again shortly")
 }
 
 func (a *Approvals) review(w http.ResponseWriter, r *http.Request) {

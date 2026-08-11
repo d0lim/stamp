@@ -30,6 +30,7 @@ import (
 	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // Defaults for the knobs a deployment does not set.
@@ -47,10 +48,46 @@ const (
 	// than grown.
 	DefaultMaxTrackedIssues = 4096
 
+	// DefaultMaxTrackedSubjects bounds the issue-budget table, for the reason
+	// [stream.Limiter] is bounded at all: its keys are subject identifiers, and
+	// an unbounded table would let whoever can name subjects grow this process.
+	DefaultMaxTrackedSubjects = 4096
+
 	// correlatorBytes is the entropy in a correlator. It is the value a
 	// completion has to match exactly, so it is sized as a secret rather than
 	// as an identifier.
 	correlatorBytes = 32
+)
+
+// DefaultSubjectIssueRate is how often one person may be sent a step-up prompt
+// by a deployment that configured no budget of its own (R43).
+//
+// It is small because the resource being spent is a human's attention and an
+// IdP's push channel, not CPU. Five is a burst somebody could plausibly be owed
+// — several authorizations opened at once by a busy desk — and the sustained
+// three a minute is already faster than anyone completes a step-up, so a
+// legitimate subject never reaches it and a flood reaches it immediately.
+//
+// An operator who genuinely wants no limit says so with a negative rate. Leaving
+// it unset is not that statement: an unconfigured deployment is the one most
+// likely to be the one that needed the bound.
+var DefaultSubjectIssueRate = stream.RateLimit{PerSecond: 0.05, Burst: 5}
+
+// Why an issue opened no challenge, as recorded in [Detail.Failure].
+//
+// The vocabulary is a closed set of single words for the reason
+// [challenge.ExternalDetail]'s is: it is written into the audit trail and read
+// by an operator deciding whether a person was refused because of what they
+// asked for or because of how often they asked.
+const (
+	// FailureIssueRateLimited is a challenge that was not opened because the
+	// subject was over the per-subject issue budget.
+	//
+	// It is a distinct word rather than a reuse of the decide path's
+	// `rate_limited` because the two bound different things and are configured
+	// separately: an operator reading this one learns that prompts were shed,
+	// not that decisions were.
+	FailureIssueRateLimited = "issue_rate_limited"
 )
 
 // Config configures a [Delegated] handler.
@@ -92,6 +129,22 @@ type Config struct {
 	// MaxTrackedIssues overrides [DefaultMaxTrackedIssues].
 	MaxTrackedIssues int
 
+	// SubjectIssueRate bounds how often one subject may have a challenge opened
+	// against them (R43). A zero field selects [DefaultSubjectIssueRate] for
+	// that field; a negative rate removes the limit.
+	//
+	// It is not MinReissueInterval and does not replace it. That interval is a
+	// coherence protection with a different key — the subject *and the decision
+	// content* — so it suppresses a re-evaluation of one decision and cannot see
+	// a caller opening a hundred different ones. This is the abuse bound above
+	// it, and the two are configured apart because they answer to different
+	// operators: one to whoever tunes revalidation, one to whoever sizes the
+	// deployment.
+	SubjectIssueRate stream.RateLimit
+
+	// MaxTrackedSubjects overrides [DefaultMaxTrackedSubjects].
+	MaxTrackedSubjects int
+
 	// CallbackURL reports where a completion for one challenge should land.
 	//
 	// A step-up returns through a browser redirect, so the completion has to
@@ -123,6 +176,17 @@ type Delegated struct {
 	mu          sync.Mutex
 	recent      map[string]recentIssue
 	initiations int
+
+	// The per-subject issue budget. limitAt is the instant the charge in
+	// progress is dated at: [stream.Limiter] takes its clock at construction and
+	// the lifecycle supplies the issuing instant per request, so the two are
+	// joined by writing it here immediately before Allow reads it. Every access
+	// to either field — including the clock closure's, which only ever runs
+	// inside Allow — happens under limitMu.
+	limitMu   sync.Mutex
+	limiter   *stream.Limiter
+	issueRate stream.RateLimit
+	limitAt   time.Time
 }
 
 // recentIssue is one challenge this process opened recently.
@@ -174,6 +238,7 @@ func NewDelegated(cfg Config) (*Delegated, error) {
 		callbackURL: cfg.CallbackURL,
 		correlator:  cfg.NewCorrelator,
 		recent:      make(map[string]recentIssue),
+		issueRate:   cfg.SubjectIssueRate,
 	}
 	if d.minReissue == 0 {
 		d.minReissue = DefaultMinReissueInterval
@@ -184,8 +249,25 @@ func NewDelegated(cfg Config) (*Delegated, error) {
 	if d.correlator == nil {
 		d.correlator = randomCorrelator
 	}
+	// A zero field takes the default for that field, so an operator who raised
+	// the burst does not have to restate the rate.
+	if d.issueRate.PerSecond == 0 {
+		d.issueRate.PerSecond = DefaultSubjectIssueRate.PerSecond
+	}
+	if d.issueRate.Burst == 0 {
+		d.issueRate.Burst = DefaultSubjectIssueRate.Burst
+	}
+	tracked := cfg.MaxTrackedSubjects
+	if tracked <= 0 {
+		tracked = DefaultMaxTrackedSubjects
+	}
+	d.limiter = stream.NewLimiter(tracked, d.chargedAt)
 	return d, nil
 }
+
+// chargedAt is the clock [stream.Limiter] reads. It is only ever called from
+// inside Allow, which is only ever called by allowIssue with limitMu held.
+func (d *Delegated) chargedAt() time.Time { return d.limitAt }
 
 // Kind implements [challenge.Handler].
 func (d *Delegated) Kind() policy.ChallengeType { return policy.ChallengeMFA }
@@ -249,6 +331,33 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 		return challenge.IssueResult{State: challenge.StatePending, Detail: detail}, nil
 	}
 
+	// Charged here: after re-issue suppression, because a reused challenge opens
+	// nothing and buzzes nobody, and charging it would let one decision's
+	// revalidation drain the budget that exists to protect the person; and
+	// before the correlator is minted, because everything below this line either
+	// spends entropy or reaches an IdP.
+	//
+	// The refusal is a failed challenge and not an error. An error here would
+	// come back out of decide as a 500 — an outage where what happened is that
+	// the system judged the request — so it takes the shape the external
+	// handler's refused round trip takes: a challenge that can never be met,
+	// which the lifecycle resolves into a denied decision and an audit row. The
+	// word saying which refusal it was travels on the challenge row.
+	if !d.allowIssue(subjectID, req.Now) {
+		return challenge.IssueResult{State: challenge.StateFailed, Detail: Detail{
+			Mode:              policy.MFADelegated,
+			SubjectID:         subjectID,
+			RequiredACRValues: required,
+			AllowedACRValues:  slices.Clone(d.allowedACR),
+			Issuer:            d.issuer,
+			ClientID:          d.clientID,
+			Audience:          d.audience,
+			IssuedAt:          req.Now.UTC(),
+			ContextHash:       contextHash,
+			Failure:           FailureIssueRateLimited,
+		}}, nil
+	}
+
 	correlator, err := d.correlator()
 	if err != nil {
 		return challenge.IssueResult{}, fmt.Errorf("mfa: generating a correlator: %w", err)
@@ -300,6 +409,25 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 	return challenge.IssueResult{State: challenge.StatePending, Detail: detail}, nil
 }
 
+// allowIssue charges one issuance against the subject's budget.
+//
+// The key is prefixed the way the decide surface's is, and for the same reason:
+// a table shared by more than one namespace is a budget that can be spent by
+// something it was not measuring. There is only one namespace in it today, and
+// the prefix is what keeps adding a second from being a silent collision.
+//
+// The key is the subject identifier alone — not the caller, not the decision.
+// Not the caller, because the resource being protected is one person's phone and
+// N callers must not each get their own N prompts' worth of it. Not the
+// decision, because keying on the decision is exactly what [Delegated.reuse]
+// does, and it is why that key cannot see this attack.
+func (d *Delegated) allowIssue(subjectID string, now time.Time) bool {
+	d.limitMu.Lock()
+	defer d.limitMu.Unlock()
+	d.limitAt = now
+	return d.limiter.Allow("subject\x1f"+subjectID, d.issueRate, 1)
+}
+
 // callbackFor asks where a completion for this challenge should land.
 func (d *Delegated) callbackFor(in challenge.Instance) string {
 	if d.callbackURL == nil {
@@ -333,6 +461,14 @@ func (d *Delegated) Submit(_ context.Context, req challenge.SubmitRequest) (chal
 	detail, err := DecodeDetail(req.Detail)
 	if err != nil {
 		return challenge.SubmitResult{}, err
+	}
+	// A challenge that was refused at issue never opened, so there is nothing
+	// here to complete: no correlator was minted and nobody was asked anything.
+	// It is refused before the body is read, because reading it would be
+	// pretending there was a question.
+	if detail.Failure != "" {
+		return challenge.SubmitResult{}, fmt.Errorf("%w: %s was refused at issue (%s)",
+			challenge.ErrNotSubmittable, req.Instance, detail.Failure)
 	}
 	body, err := decodeSubmission(req.Payload)
 	if err != nil {
@@ -407,6 +543,13 @@ func (d *Delegated) Status(_ context.Context, req challenge.StatusRequest) (chal
 	state := req.Stored
 	if !state.Terminal() {
 		switch {
+		// Read first, and read at all, because the lifecycle stores every
+		// challenge pending and asks this afterwards: a refusal that lived only
+		// in Issue's return value would leave the challenge open. It is the same
+		// arrangement [challenge.ExternalDetail.Failure] has, for the same
+		// reason.
+		case detail.Failure != "":
+			state = challenge.StateFailed
 		case detail.Consumed():
 			state = challenge.StateSatisfied
 		case req.Deadline != nil && !req.Now.Before(*req.Deadline):
@@ -461,6 +604,13 @@ func (d *Delegated) Redeem(ctx context.Context, req challenge.RedeemRequest) (ch
 	detail, err := DecodeDetail(req.Detail)
 	if err != nil {
 		return challenge.Redemption{}, err
+	}
+	// Refused for the same reason [Delegated.Submit] refuses it: a challenge that
+	// was never opened sent nobody anywhere, so a callback claiming to come back
+	// from it is answering a request this deployment did not make.
+	if detail.Failure != "" {
+		return challenge.Redemption{}, fmt.Errorf("%w: %s was refused at issue (%s)",
+			challenge.ErrNotRedeemable, req.Instance, detail.Failure)
 	}
 	// Refused before the token call rather than after it. A spent challenge has
 	// nothing a code could add, and redeeming one would spend a real
