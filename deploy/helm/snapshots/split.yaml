@@ -64,12 +64,6 @@ data:
   STAMP_MFA_CIBA_CLIENT_ID: "stamp-ciba"
   STAMP_KAFKA_BROKERS: "kafka-0.kafka:9092"
   STAMP_KAFKA_GROUP: "stamp-consumer"
-  STAMP_EXTERNAL_TARGETS: "/etc/stamp/documents/external-targets.json"
-  STAMP_FACT_SOURCES: "/etc/stamp/documents/fact-sources.json"
-  STAMP_IDP_GROUP_SOURCES: "/etc/stamp/documents/idp-group-sources.json"
-  STAMP_INGEST_CREDENTIALS: "/etc/stamp/documents/ingest-credentials.json"
-  STAMP_KAFKA_TOPICS: "/etc/stamp/documents/kafka-topics.json"
-  STAMP_STREAM_SOURCES: "/etc/stamp/documents/stream-sources.json"
 ---
 # Source: stamp/templates/service.yaml
 apiVersion: v1
@@ -258,7 +252,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: check
       annotations:
-        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
+        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -305,11 +299,14 @@ spec:
               value: "false"
             - name: STAMP_DB_APPLY_GRANTS
               value: "false"
-            - name: STAMP_MFA_CIBA_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: "stamp-ciba"
-                  key: "client-secret"
+            - name: STAMP_FACT_SOURCES
+              value: "/etc/stamp/documents/fact-sources.json"
+            - name: STAMP_IDP_GROUP_SOURCES
+              value: "/etc/stamp/documents/idp-group-sources.json"
+            - name: STAMP_KAFKA_TOPICS
+              value: "/etc/stamp/documents/kafka-topics.json"
+            - name: STAMP_STREAM_SOURCES
+              value: "/etc/stamp/documents/stream-sources.json"
             # STAMP_AUDIT_WRITER_ID is deliberately unset: exactly one live
             # process may hold a writer identifier, and the default derives one
             # from the pod's hostname. Setting it to a literal here would make
@@ -334,10 +331,6 @@ spec:
               cpu: "1"
               memory: 512Mi
           volumeMounts:
-            - name: doc-external-targets
-              mountPath: "/etc/stamp/documents/external-targets.json"
-              subPath: "external-targets.json"
-              readOnly: true
             - name: doc-fact-sources
               mountPath: "/etc/stamp/documents/fact-sources.json"
               subPath: "fact-sources.json"
@@ -345,10 +338,6 @@ spec:
             - name: doc-idp-group-sources
               mountPath: "/etc/stamp/documents/idp-group-sources.json"
               subPath: "idp-group-sources.json"
-              readOnly: true
-            - name: doc-ingest-credentials
-              mountPath: "/etc/stamp/documents/ingest-credentials.json"
-              subPath: "ingest-credentials.json"
               readOnly: true
             - name: doc-kafka-topics
               mountPath: "/etc/stamp/documents/kafka-topics.json"
@@ -362,13 +351,11 @@ spec:
       # credential and none of them may appear in a manifest. The signing key is
       # mounted for the same reason and a stronger one — the chart has no field
       # its bytes could have been written into.
+      #
+      # Which of them this tier gets is stamp.tierReadsDocument's answer, and it
+      # follows the binary: a document a tier's roles never read is a credential
+      # sitting on a filesystem nothing in that pod consults.
       volumes:
-        - name: doc-external-targets
-          secret:
-            secretName: "stamp-external-targets"
-            items:
-              - key: "external-targets.json"
-                path: "external-targets.json"
         - name: doc-fact-sources
           secret:
             secretName: "stamp-fact-sources"
@@ -381,12 +368,6 @@ spec:
             items:
               - key: "idp-group-sources.json"
                 path: "idp-group-sources.json"
-        - name: doc-ingest-credentials
-          secret:
-            secretName: "stamp-ingest-credentials"
-            items:
-              - key: "ingest-credentials.json"
-                path: "ingest-credentials.json"
         - name: doc-kafka-topics
           secret:
             secretName: "stamp-kafka-topics"
@@ -434,7 +415,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: decide
       annotations:
-        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
+        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -487,6 +468,20 @@ spec:
               value: "false"
             - name: STAMP_DB_APPLY_GRANTS
               value: "false"
+            - name: STAMP_EXTERNAL_TARGETS
+              value: "/etc/stamp/documents/external-targets.json"
+            - name: STAMP_FACT_SOURCES
+              value: "/etc/stamp/documents/fact-sources.json"
+            - name: STAMP_IDP_GROUP_SOURCES
+              value: "/etc/stamp/documents/idp-group-sources.json"
+            - name: STAMP_KAFKA_TOPICS
+              value: "/etc/stamp/documents/kafka-topics.json"
+            - name: STAMP_STREAM_SOURCES
+              value: "/etc/stamp/documents/stream-sources.json"
+            # R42 with R39: the CIBA client secret reaches the tiers that can
+            # open an mfa challenge and no other. A check tier compromised
+            # through the PEP surface holds no credential that could ask this
+            # deployment's IdP to authenticate somebody.
             - name: STAMP_MFA_CIBA_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -524,10 +519,6 @@ spec:
               mountPath: "/etc/stamp/documents/idp-group-sources.json"
               subPath: "idp-group-sources.json"
               readOnly: true
-            - name: doc-ingest-credentials
-              mountPath: "/etc/stamp/documents/ingest-credentials.json"
-              subPath: "ingest-credentials.json"
-              readOnly: true
             - name: doc-kafka-topics
               mountPath: "/etc/stamp/documents/kafka-topics.json"
               subPath: "kafka-topics.json"
@@ -540,6 +531,10 @@ spec:
       # credential and none of them may appear in a manifest. The signing key is
       # mounted for the same reason and a stronger one — the chart has no field
       # its bytes could have been written into.
+      #
+      # Which of them this tier gets is stamp.tierReadsDocument's answer, and it
+      # follows the binary: a document a tier's roles never read is a credential
+      # sitting on a filesystem nothing in that pod consults.
       volumes:
         - name: doc-external-targets
           secret:
@@ -559,12 +554,6 @@ spec:
             items:
               - key: "idp-group-sources.json"
                 path: "idp-group-sources.json"
-        - name: doc-ingest-credentials
-          secret:
-            secretName: "stamp-ingest-credentials"
-            items:
-              - key: "ingest-credentials.json"
-                path: "ingest-credentials.json"
         - name: doc-kafka-topics
           secret:
             secretName: "stamp-kafka-topics"
@@ -612,7 +601,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: consumer
       annotations:
-        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
+        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -659,11 +648,16 @@ spec:
               value: "false"
             - name: STAMP_DB_APPLY_GRANTS
               value: "false"
-            - name: STAMP_MFA_CIBA_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: "stamp-ciba"
-                  key: "client-secret"
+            - name: STAMP_FACT_SOURCES
+              value: "/etc/stamp/documents/fact-sources.json"
+            - name: STAMP_IDP_GROUP_SOURCES
+              value: "/etc/stamp/documents/idp-group-sources.json"
+            - name: STAMP_INGEST_CREDENTIALS
+              value: "/etc/stamp/documents/ingest-credentials.json"
+            - name: STAMP_KAFKA_TOPICS
+              value: "/etc/stamp/documents/kafka-topics.json"
+            - name: STAMP_STREAM_SOURCES
+              value: "/etc/stamp/documents/stream-sources.json"
             # STAMP_AUDIT_WRITER_ID is deliberately unset: exactly one live
             # process may hold a writer identifier, and the default derives one
             # from the pod's hostname. Setting it to a literal here would make
@@ -684,10 +678,6 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 5
           volumeMounts:
-            - name: doc-external-targets
-              mountPath: "/etc/stamp/documents/external-targets.json"
-              subPath: "external-targets.json"
-              readOnly: true
             - name: doc-fact-sources
               mountPath: "/etc/stamp/documents/fact-sources.json"
               subPath: "fact-sources.json"
@@ -712,13 +702,11 @@ spec:
       # credential and none of them may appear in a manifest. The signing key is
       # mounted for the same reason and a stronger one — the chart has no field
       # its bytes could have been written into.
+      #
+      # Which of them this tier gets is stamp.tierReadsDocument's answer, and it
+      # follows the binary: a document a tier's roles never read is a credential
+      # sitting on a filesystem nothing in that pod consults.
       volumes:
-        - name: doc-external-targets
-          secret:
-            secretName: "stamp-external-targets"
-            items:
-              - key: "external-targets.json"
-                path: "external-targets.json"
         - name: doc-fact-sources
           secret:
             secretName: "stamp-fact-sources"
@@ -784,7 +772,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: api
       annotations:
-        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
+        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -831,6 +819,20 @@ spec:
               value: "true"
             - name: STAMP_DB_APPLY_GRANTS
               value: "true"
+            - name: STAMP_EXTERNAL_TARGETS
+              value: "/etc/stamp/documents/external-targets.json"
+            - name: STAMP_FACT_SOURCES
+              value: "/etc/stamp/documents/fact-sources.json"
+            - name: STAMP_IDP_GROUP_SOURCES
+              value: "/etc/stamp/documents/idp-group-sources.json"
+            - name: STAMP_KAFKA_TOPICS
+              value: "/etc/stamp/documents/kafka-topics.json"
+            - name: STAMP_STREAM_SOURCES
+              value: "/etc/stamp/documents/stream-sources.json"
+            # R42 with R39: the CIBA client secret reaches the tiers that can
+            # open an mfa challenge and no other. A check tier compromised
+            # through the PEP surface holds no credential that could ask this
+            # deployment's IdP to authenticate somebody.
             - name: STAMP_MFA_CIBA_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -891,10 +893,6 @@ spec:
               mountPath: "/etc/stamp/documents/idp-group-sources.json"
               subPath: "idp-group-sources.json"
               readOnly: true
-            - name: doc-ingest-credentials
-              mountPath: "/etc/stamp/documents/ingest-credentials.json"
-              subPath: "ingest-credentials.json"
-              readOnly: true
             - name: doc-kafka-topics
               mountPath: "/etc/stamp/documents/kafka-topics.json"
               subPath: "kafka-topics.json"
@@ -921,6 +919,10 @@ spec:
       # credential and none of them may appear in a manifest. The signing key is
       # mounted for the same reason and a stronger one — the chart has no field
       # its bytes could have been written into.
+      #
+      # Which of them this tier gets is stamp.tierReadsDocument's answer, and it
+      # follows the binary: a document a tier's roles never read is a credential
+      # sitting on a filesystem nothing in that pod consults.
       volumes:
         - name: doc-external-targets
           secret:
@@ -940,12 +942,6 @@ spec:
             items:
               - key: "idp-group-sources.json"
                 path: "idp-group-sources.json"
-        - name: doc-ingest-credentials
-          secret:
-            secretName: "stamp-ingest-credentials"
-            items:
-              - key: "ingest-credentials.json"
-                path: "ingest-credentials.json"
         - name: doc-kafka-topics
           secret:
             secretName: "stamp-kafka-topics"
@@ -1010,7 +1006,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: console
       annotations:
-        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
+        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -1057,11 +1053,14 @@ spec:
               value: "false"
             - name: STAMP_DB_APPLY_GRANTS
               value: "false"
-            - name: STAMP_MFA_CIBA_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: "stamp-ciba"
-                  key: "client-secret"
+            - name: STAMP_FACT_SOURCES
+              value: "/etc/stamp/documents/fact-sources.json"
+            - name: STAMP_IDP_GROUP_SOURCES
+              value: "/etc/stamp/documents/idp-group-sources.json"
+            - name: STAMP_KAFKA_TOPICS
+              value: "/etc/stamp/documents/kafka-topics.json"
+            - name: STAMP_STREAM_SOURCES
+              value: "/etc/stamp/documents/stream-sources.json"
             # STAMP_AUDIT_WRITER_ID is deliberately unset: exactly one live
             # process may hold a writer identifier, and the default derives one
             # from the pod's hostname. Setting it to a literal here would make
@@ -1082,10 +1081,6 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 5
           volumeMounts:
-            - name: doc-external-targets
-              mountPath: "/etc/stamp/documents/external-targets.json"
-              subPath: "external-targets.json"
-              readOnly: true
             - name: doc-fact-sources
               mountPath: "/etc/stamp/documents/fact-sources.json"
               subPath: "fact-sources.json"
@@ -1093,10 +1088,6 @@ spec:
             - name: doc-idp-group-sources
               mountPath: "/etc/stamp/documents/idp-group-sources.json"
               subPath: "idp-group-sources.json"
-              readOnly: true
-            - name: doc-ingest-credentials
-              mountPath: "/etc/stamp/documents/ingest-credentials.json"
-              subPath: "ingest-credentials.json"
               readOnly: true
             - name: doc-kafka-topics
               mountPath: "/etc/stamp/documents/kafka-topics.json"
@@ -1110,13 +1101,11 @@ spec:
       # credential and none of them may appear in a manifest. The signing key is
       # mounted for the same reason and a stronger one — the chart has no field
       # its bytes could have been written into.
+      #
+      # Which of them this tier gets is stamp.tierReadsDocument's answer, and it
+      # follows the binary: a document a tier's roles never read is a credential
+      # sitting on a filesystem nothing in that pod consults.
       volumes:
-        - name: doc-external-targets
-          secret:
-            secretName: "stamp-external-targets"
-            items:
-              - key: "external-targets.json"
-                path: "external-targets.json"
         - name: doc-fact-sources
           secret:
             secretName: "stamp-fact-sources"
@@ -1129,12 +1118,6 @@ spec:
             items:
               - key: "idp-group-sources.json"
                 path: "idp-group-sources.json"
-        - name: doc-ingest-credentials
-          secret:
-            secretName: "stamp-ingest-credentials"
-            items:
-              - key: "ingest-credentials.json"
-                path: "ingest-credentials.json"
         - name: doc-kafka-topics
           secret:
             secretName: "stamp-kafka-topics"
