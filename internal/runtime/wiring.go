@@ -122,11 +122,12 @@ func (a *App) build(ctx context.Context) error {
 
 	// --- audit and identity ------------------------------------------------
 	buffer, err := api.NewAuditBuffer(api.AuditConfig{
-		Writer:        writer,
-		Capacity:      cfg.AuditCapacity,
-		BatchSize:     cfg.AuditBatchSize,
-		FlushInterval: cfg.AuditFlushInterval,
-		FailClosed:    cfg.AuditFailClosed,
+		Writer:         writer,
+		Capacity:       cfg.AuditCapacity,
+		BatchSize:      cfg.AuditBatchSize,
+		FlushInterval:  cfg.AuditFlushInterval,
+		AlertThreshold: cfg.AuditAlertThreshold,
+		FailClosed:     cfg.AuditFailClosed,
 		OnAlert: func(stats api.AuditStats) {
 			a.logger.Error("audit buffer is losing events",
 				slog.Int64("dropped", stats.Dropped),
