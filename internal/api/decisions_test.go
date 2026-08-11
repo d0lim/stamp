@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // The decide surface owns four things and no more: it puts the two endpoints on
@@ -104,12 +106,22 @@ func (d *recordingDecider) lastRead(t *testing.T) readCall {
 	return d.reads[len(d.reads)-1]
 }
 
-// staticSchema is a policy schema source that answers with whatever it holds,
+// countingSchema is a policy schema source that answers with whatever it holds,
 // including nothing — an instance that has not loaded a policy set yet is a
-// state the surface has to answer for.
-type staticSchema struct{ schema *policy.Schema }
+// state the surface has to answer for — and counts how often it was asked.
+//
+// The count is what lets a test assert that a refused request did no work: the
+// schema read is the first step of turning a body into an evaluation input, so
+// a request that never reached it never built one.
+type countingSchema struct {
+	schema *policy.Schema
+	reads  atomic.Int64
+}
 
-func (s staticSchema) Schema() *policy.Schema { return s.schema }
+func (s *countingSchema) Schema() *policy.Schema {
+	s.reads.Add(1)
+	return s.schema
+}
 
 // decideSchema declares the vocabulary these tests are written against: an
 // account with a string number, an int amount and an `id`, so that the envelope
@@ -137,10 +149,53 @@ func decideSchema() *policy.Schema {
 	}
 }
 
+// recordingEvents is the audit seam the decide surface writes rate-limit
+// refusals through. It is the interface and not an [api.AuditBuffer] so that a
+// test reads back the event itself rather than a Merkle root it would have to
+// recompute to say anything about.
+type recordingEvents struct {
+	mu     sync.Mutex
+	events []api.Event
+}
+
+func (r *recordingEvents) Record(_ context.Context, e api.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func (r *recordingEvents) snapshot() []api.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]api.Event(nil), r.events...)
+}
+
+// decideClock is a hand-wound clock, so that a test about a budget refilling
+// does not have to wait for it.
+type decideClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (c *decideClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+func (c *decideClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(d)
+}
+
 type decideFixture struct {
 	server *api.Server
 	idp    *mockIdP
 	life   *recordingDecider
+	audit  *recordingEvents
+	clock  *decideClock
+	schema *countingSchema
 }
 
 type decideOptions struct {
@@ -150,6 +205,12 @@ type decideOptions struct {
 	aliases       map[string]string
 	maxBytes      int64
 	maxTTL        time.Duration
+
+	// The rate limits under test. A zero value takes the surface's defaults,
+	// which is what every test that is not about rate limiting wants.
+	rate           stream.RateLimit
+	subjectRate    stream.RateLimit
+	maxRateEntries int
 }
 
 func newDecideFixture(t *testing.T, opts decideOptions) *decideFixture {
@@ -176,14 +237,22 @@ func newDecideFixture(t *testing.T, opts decideOptions) *decideFixture {
 	if schema == nil && !opts.noSchema {
 		schema = decideSchema()
 	}
+	schemas := &countingSchema{schema: schema}
+	audit := &recordingEvents{}
+	clock := &decideClock{at: fixedNow}
 	decisions, err := api.NewDecisions(api.DecisionsConfig{
 		Decisions:       life,
 		Access:          life,
-		Schema:          staticSchema{schema: schema},
+		Schema:          schemas,
 		ContextEntity:   opts.contextEntity,
 		PropertyAliases: opts.aliases,
 		MaxRequestBytes: opts.maxBytes,
 		MaxTTL:          opts.maxTTL,
+		Audit:           audit,
+		Rate:            opts.rate,
+		SubjectRate:     opts.subjectRate,
+		MaxRateEntries:  opts.maxRateEntries,
+		Now:             clock.Now,
 	})
 	if err != nil {
 		t.Fatalf("build decide api: %v", err)
@@ -191,7 +260,7 @@ func newDecideFixture(t *testing.T, opts decideOptions) *decideFixture {
 	if err := server.Mount(decisions); err != nil {
 		t.Fatalf("mount: %v", err)
 	}
-	return &decideFixture{server: server, idp: idp, life: life}
+	return &decideFixture{server: server, idp: idp, life: life, audit: audit, clock: clock, schema: schemas}
 }
 
 func (f *decideFixture) workload(t *testing.T, id string) string {
@@ -244,6 +313,16 @@ func decideBody(extra string) string {
 		body += ",\n\t\t" + extra
 	}
 	return body + "\n\t}"
+}
+
+// decideBodyFor is the same request about a named subject, for the tests that
+// are about which budget a request spends.
+func decideBodyFor(subjectID string) string {
+	return `{
+		"subject":  {"type": "account", "id": "` + subjectID + `", "properties": {"number": "1001"}},
+		"resource": {"type": "account", "id": "acct-dst", "properties": {"amount": 5000}},
+		"action":   {"name": "close"}
+	}`
 }
 
 // ---------------------------------------------------------------------------
@@ -760,11 +839,16 @@ func TestTheDecideRoutesAreOnThePEPSurfaceAlone(t *testing.T) {
 // answer 500s that look like an outage.
 func TestTheDecideSurfaceRefusesToBeBuiltWithoutItsDependencies(t *testing.T) {
 	life := &recordingDecider{}
+	schemas := &countingSchema{schema: decideSchema()}
+	audit := &recordingEvents{}
 	for name, cfg := range map[string]api.DecisionsConfig{
-		"no lifecycle":   {Access: life, Schema: staticSchema{schema: decideSchema()}},
-		"no read rule":   {Decisions: life, Schema: staticSchema{schema: decideSchema()}},
-		"no schema":      {Decisions: life, Access: life},
-		"nothing at all": {},
+		"no lifecycle": {Access: life, Schema: schemas, Audit: audit},
+		"no read rule": {Decisions: life, Schema: schemas, Audit: audit},
+		"no schema":    {Decisions: life, Access: life, Audit: audit},
+		// R43 asks the refusal to be audited, so a surface with nowhere to record
+		// one cannot serve: it would shed load and leave no sign that it had.
+		"no audit recorder": {Decisions: life, Access: life, Schema: schemas},
+		"nothing at all":    {},
 	} {
 		if _, err := api.NewDecisions(cfg); err == nil {
 			t.Errorf("%s: the decide surface was built anyway", name)
