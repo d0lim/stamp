@@ -40,7 +40,6 @@ import (
 
 	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/decision"
-	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/store"
@@ -59,6 +58,23 @@ const (
 	// DecisionReadPattern is the creator's read of one decision.
 	DecisionReadPattern = "GET " + DecisionsPath + "/{id}"
 )
+
+// CodeNotInstalled is the `error` code for the one server state several
+// surfaces have to describe: this deployment holds no policy set yet.
+//
+// It is a constant because it was two words before it was one. decide answered
+// `policy_set_stale` and the policy surface answered `not_installed`, which made
+// one state two states to anyone writing a client against both — and the split
+// happened by each handler reaching for whatever word was nearest, which is what
+// a shared name prevents from happening again.
+//
+// `error` and `reason` are different vocabularies and this is why they must not
+// be confused: engine.ReasonPolicySetStale is the ground a *decision* was
+// reached on, carried inside a decision object that exists. This is what a
+// surface says when it produced no decision at all. A client reading the two as
+// one word would treat "no answer" and "answered, on this ground" as the same
+// event.
+const CodeNotInstalled = "not_installed"
 
 // DefaultMaxDecisionTTL bounds the lifetime a caller may ask for.
 //
@@ -279,7 +295,13 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		// carry a deny with a reason, but a decision object that was never
 		// created and never audited would be a record of something that did not
 		// happen. So this is a refusal with a status, not a decision.
-		writeError(w, http.StatusServiceUnavailable, string(engine.ReasonPolicySetStale),
+		//
+		// And because it is a refusal rather than a decision, the code is
+		// [CodeNotInstalled] and not the engine's reason for the same state.
+		// This once answered `policy_set_stale`, which is what a *decision*
+		// carries as its ground; borrowing it here made one server state look
+		// like two to a client that also reads the policy surface.
+		writeError(w, http.StatusServiceUnavailable, CodeNotInstalled,
 			"this instance holds no policy set yet")
 		return
 	}

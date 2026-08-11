@@ -43,7 +43,9 @@ package api
 
 import (
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/d0lim/stamp/internal/decision"
@@ -79,6 +81,55 @@ const (
 	rateScopeCaller  = "caller"
 	rateScopeSubject = "subject"
 )
+
+// RetryAfterHeader is the one transport-level thing a shed request says.
+//
+// The header exists because the refusal's body does not travel. A denied
+// decision object is legible to something that speaks this API, and the things
+// between a PEP and this handler — a retry middleware, a gateway, a dashboard —
+// do not: they read a status line and a header table. Without one of those
+// saying anything, a request that was shed and a request that was judged are the
+// same event to every one of them, which is the blindness #45 names.
+const RetryAfterHeader = "Retry-After"
+
+// maxRetryAfterSeconds bounds what a refusal will ask a caller to wait.
+//
+// A budget can be configured arbitrarily slow, and 1/PerSecond for a very small
+// rate is a number no client will honour and float arithmetic will eventually
+// stop representing. Clamping under-promises — a caller comes back too early and
+// is refused again, which is the state it was already in. Over-promising is the
+// failure that matters, because a caller told to wait longer than the budget
+// needs has been made slower than the limit asks for, by the limit.
+const maxRetryAfterSeconds = 3600
+
+// retryAfterSeconds is how long until this budget has a token again, in the
+// whole seconds RFC 9110 gives the header.
+//
+// It is the refill interval — one token's worth of time at the sustained rate —
+// and not the time until the bucket is full. What a refused caller needs is the
+// moment one more request will be admitted, and the burst above that is capacity
+// they have already spent.
+//
+// It rounds up, because the alternative rounds a sub-second interval to zero and
+// invites the retry storm the limit exists to shed: every budget this surface
+// ships by default refills faster than once a second, so zero would be the
+// common answer rather than the edge case.
+func retryAfterSeconds(l stream.RateLimit) int {
+	if l.PerSecond <= 0 {
+		// Not reachable from a refusal — an unlimited budget refuses nothing —
+		// but a header that said "0" or "-1" would be worse than the one second
+		// this answers with if a later caller finds a path here.
+		return 1
+	}
+	interval := math.Ceil(1 / l.PerSecond)
+	if interval < 1 {
+		return 1
+	}
+	if interval > maxRetryAfterSeconds {
+		return maxRetryAfterSeconds
+	}
+	return int(interval)
+}
 
 // decideLimiter charges the two budgets and reports which one ran out.
 type decideLimiter struct {
@@ -148,6 +199,19 @@ type rateRefusal struct {
 // makes this deny distinguishable from a policy deny is the reason, which is
 // the mechanism decision.ReasonOutstandingCap already established.
 //
+// The response carries `Retry-After`, and that is the one part of it that is
+// unusual enough to want stating. RFC 9110 specifies the header on 429, 503 and
+// the 3xx redirects, and this is a 200 — so it is being used outside the letter
+// of the specification, deliberately, and with its eyes open. The alternative
+// was worse in both directions: changing the status to 429 breaks the property
+// above (a PEP would have to read the transport to learn it was judged), and
+// leaving the header off leaves every intermediary unable to tell a shed request
+// from a judged one, which is the whole of #45. What is being claimed is narrow
+// — the header is advisory in every direction, a client that ignores it is
+// correct, and no cache or proxy behaviour keys on it at 200 — so an
+// intermediary that reads it gains a true signal and one that does not loses
+// nothing it had.
+//
 // The audit goes through the buffer rather than through a synchronous chain
 // append, and the reasoning is in the shape of the thing being recorded. This is
 // the path taken by a caller sending more than it is allowed to; a synchronous
@@ -179,6 +243,10 @@ func (d *Decisions) refuseRate(w http.ResponseWriter, r *http.Request, callerID 
 	}
 	d.audit.Record(r.Context(), e)
 
+	// The budget that ran out is the one whose interval is named: a caller told
+	// to wait the subject budget's interval when it was its own that was spent
+	// has been handed a number about somebody else's traffic.
+	w.Header().Set(RetryAfterHeader, strconv.Itoa(retryAfterSeconds(ref.limit)))
 	writeJSON(w, http.StatusOK, decision.Result{
 		State:       store.DecisionDenied,
 		Outcome:     engine.Deny,

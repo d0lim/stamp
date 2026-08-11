@@ -278,6 +278,13 @@ func (a *Approvals) submit(w http.ResponseWriter, r *http.Request) {
 // What can be lost that way is the record of a refusal, never the record of a
 // submission that was accepted — those are written by the lifecycle, inside the
 // transaction that accepted them.
+//
+// It carries `Retry-After` for the reason the decide path's refusal does, and
+// here the header is doing exactly what RFC 9110 specifies it for: this is a
+// 429, which is one of the three statuses the specification names. The shape of
+// the refusal is otherwise untouched — same status, same code, same message —
+// because what an approver needs is unchanged and it is the console in front of
+// them, not an intermediary, that renders it.
 func (a *Approvals) refuseSubmission(w http.ResponseWriter, r *http.Request, caller *identity.Subject) {
 	if a.audit != nil {
 		a.audit.Record(r.Context(), Event{
@@ -291,6 +298,7 @@ func (a *Approvals) refuseSubmission(w http.ResponseWriter, r *http.Request, cal
 			Limit:    formatRate(a.rate),
 		})
 	}
+	w.Header().Set(RetryAfterHeader, strconv.Itoa(retryAfterSeconds(a.rate)))
 	writeError(w, http.StatusTooManyRequests, ApprovalRateLimitedCode,
 		"too many submissions; try again shortly")
 }
@@ -360,15 +368,28 @@ func readApprovalBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([
 // these is a refusal an operator has to be able to tell apart from an outage,
 // and a handler deciding case by case is how "you are not an approver" ends up
 // as a 500 that pages somebody.
+//
+// It is shared by every surface that acts on one named decision through the
+// lifecycle — submission, review, cancellation, the inbox — so that "you may not
+// have this" has one answer rather than one per handler.
 func approvalError(err error) (status int, code, message string) {
 	switch {
 	case errors.Is(err, decision.ErrUnauthenticated):
 		return http.StatusUnauthorized, "unauthenticated", "this endpoint requires an end-user credential"
-	case errors.Is(err, challenge.ErrNotTarget), errors.Is(err, decision.ErrNotAuthorized):
-		// Deliberately the same answer as for a decision that does not exist
-		// would be: a non-approver learns nothing about what they asked for.
-		return http.StatusForbidden, "not_an_approver", "this decision is not waiting on you"
-	case errors.Is(err, decision.ErrNoSuchChallenge), errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, challenge.ErrNotTarget), errors.Is(err, decision.ErrNotAuthorized),
+		errors.Is(err, decision.ErrNoSuchChallenge), errors.Is(err, store.ErrNotFound):
+		// One answer, and the same bytes, for every way of not being allowed to
+		// have this decision — including the way that is simply that it does not
+		// exist. This is what the comment here used to *claim* while the code
+		// answered `403 not_an_approver` for the first two and `404 not_found`
+		// for the last two (#38), which made a two-request oracle out of R40: ask
+		// about an identifier, read the status, learn whether it names anything.
+		//
+		// The cost is paid by the person who has standing and lost it — an
+		// approver revised out of the set reads "no such decision" rather than
+		// "not waiting on you". The inbox is where that person is told the truth,
+		// and it can afford to: a list of what is waiting on you leaks nothing by
+		// omitting what is not.
 		return http.StatusNotFound, "not_found", "no such decision or challenge"
 	case errors.Is(err, store.ErrDecisionExpired):
 		return http.StatusConflict, "expired", "this decision has expired"

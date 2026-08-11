@@ -544,14 +544,26 @@ func validDecisionState(state string) bool {
 //
 // "not authorised" and "does not exist" are the same answer for the same reason
 // they are on the approval surface: a reader who may not see a decision learns
-// nothing from the difference.
+// nothing from the difference. That was the claim before it was the code (#38) —
+// the two used to be `403 not_readable` and `404 not_found`, which is the same
+// existence oracle the approval surface had, reachable by anyone holding a
+// console credential.
+//
+// It matters here in particular because this endpoint is the *other* door to
+// R40's rule: a targeted approver reads their decision here rather than on the
+// PEP surface, since a workload credential and a user token cannot be served by
+// one route. The decide surface already answers both refusals identically, so a
+// difference here would have been a difference anyone could reach by asking the
+// question twice.
+//
+// The list endpoint's `not_an_auditor` is not part of this and stays a 403: it
+// is about standing to read a collection, it answers nothing about any decision,
+// and R22 asks for it to be told plainly and chained.
 func auditReadError(err error) (status int, code, message string) {
 	switch {
 	case errors.Is(err, decision.ErrUnauthenticated):
 		return http.StatusUnauthorized, "unauthenticated", "this endpoint requires an end-user credential"
-	case errors.Is(err, decision.ErrNotAuthorized):
-		return http.StatusForbidden, "not_readable", "this decision is not yours to read"
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, decision.ErrNotAuthorized), errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound, "not_found", "no such decision"
 	default:
 		return http.StatusInternalServerError, "internal_error", "the decision could not be read"

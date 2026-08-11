@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -305,8 +306,12 @@ func TestCollectorErrorsBecomeActionableStatuses(t *testing.T) {
 		err  error
 		want int
 	}{
-		{name: "not a target", err: fmt.Errorf("wrapped: %w", challenge.ErrNotTarget), want: http.StatusForbidden},
-		{name: "not entitled", err: decision.ErrNotAuthorized, want: http.StatusForbidden},
+		// The first two are 404 rather than 403 on purpose: see
+		// TestNotAnApproverIsByteIdenticalToNoSuchDecision. A caller who may not
+		// act on a decision is told what a caller asking about a decision that
+		// does not exist is told.
+		{name: "not a target", err: fmt.Errorf("wrapped: %w", challenge.ErrNotTarget), want: http.StatusNotFound},
+		{name: "not entitled", err: decision.ErrNotAuthorized, want: http.StatusNotFound},
 		{name: "no such challenge", err: decision.ErrNoSuchChallenge, want: http.StatusNotFound},
 		{name: "no such decision", err: store.ErrNotFound, want: http.StatusNotFound},
 		{name: "already resolved", err: decision.ErrNotPending, want: http.StatusConflict},
@@ -409,8 +414,80 @@ func TestReviewRefusedToANonTarget(t *testing.T) {
 	f := newApprovalFixture(t)
 	f.collector.reviewErr = challenge.ErrNotTarget
 	rec := f.do(t, api.SurfaceConsole, http.MethodGet, reviewPath, f.userToken(t, "mallory"), "")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("review answered %d, want 403", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("review answered %d, want 404 — the answer a decision that does not exist gets", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R40's answer is one answer, on every surface (#38)
+// ---------------------------------------------------------------------------
+
+// TestNotAnApproverIsByteIdenticalToNoSuchDecision is #38.
+//
+// The comment on the mapping said the two were deliberately the same answer, and
+// they were not: a non-approver got `403 not_an_approver` and a decision that
+// does not exist got `404 not_found`, which is a two-request oracle for "does
+// this identifier name a decision" — ask, and the status code answers. R40's
+// rule is that a decision is readable by its creator or a targeted approver, and
+// a rule that leaks the existence of what it refuses is a rule about content
+// rather than about existence.
+//
+// The comparison is on the bytes rather than on the status, because a body that
+// differs is the same oracle one layer down: a client reads `{"error":…}` as
+// readily as it reads a status line.
+//
+// The consequence is deliberate and it is a real cost: an approver whose
+// approver set was revised out from under them now reads "no such decision"
+// instead of "this decision is not waiting on you". The console's inbox is what
+// tells them the truth — it lists what is actually waiting — and that list is
+// the surface where saying so leaks nothing, because being on it is already the
+// proof of standing.
+func TestNotAnApproverIsByteIdenticalToNoSuchDecision(t *testing.T) {
+	t.Parallel()
+	// Every error the surface answers "you may not have this" with, whatever the
+	// layer beneath called it.
+	refusals := map[string]error{
+		"not a target of the challenge": challenge.ErrNotTarget,
+		"not entitled to the decision":  decision.ErrNotAuthorized,
+		"no such challenge":             decision.ErrNoSuchChallenge,
+		"no such decision":              store.ErrNotFound,
+	}
+
+	submit := func(t *testing.T, err error) *httptest.ResponseRecorder {
+		t.Helper()
+		f := newApprovalFixture(t)
+		f.collector.submitErr = err
+		return f.approve(t, "mallory", "")
+	}
+	review := func(t *testing.T, err error) *httptest.ResponseRecorder {
+		t.Helper()
+		f := newApprovalFixture(t)
+		f.collector.reviewErr = err
+		return f.do(t, api.SurfaceConsole, http.MethodGet, reviewPath, f.userToken(t, "mallory"), "")
+	}
+
+	for name, call := range map[string]func(*testing.T, error) *httptest.ResponseRecorder{
+		"submission": submit,
+		"review":     review,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			base := call(t, store.ErrNotFound)
+			if base.Code != http.StatusNotFound {
+				t.Fatalf("a decision that does not exist = %d, want 404: %s", base.Code, base.Body.String())
+			}
+			for what, err := range refusals {
+				rec := call(t, fmt.Errorf("decision: submit: %w", err))
+				if rec.Code != base.Code {
+					t.Errorf("%s: status %d, want %d — the status tells the two apart",
+						what, rec.Code, base.Code)
+				}
+				if !bytes.Equal(rec.Body.Bytes(), base.Body.Bytes()) {
+					t.Errorf("%s: body\n got %q\nwant %q", what, rec.Body.String(), base.Body.String())
+				}
+			}
+		})
 	}
 }
 
@@ -462,6 +539,14 @@ func TestSubmissionsAreRefusedOverTheApproverBudget(t *testing.T) {
 	}
 	if body.Error != api.ApprovalRateLimitedCode {
 		t.Errorf("error code = %q, want %q", body.Error, api.ApprovalRateLimitedCode)
+	}
+
+	// And it says when to come back. On this surface the header is doing what
+	// RFC 9110 specifies it for — a 429 is one of the statuses it is defined on —
+	// so a console with a retry button and everything between it and here read
+	// the same number: one token every second is this budget's interval.
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want %q — this budget's refill interval", got, "1")
 	}
 
 	// And it is audited, with its own ground: an operator reading the chain has

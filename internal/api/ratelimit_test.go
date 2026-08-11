@@ -442,3 +442,103 @@ func TestDecideRateDefaultsAndTheWayToTurnItOff(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// the transport-level signal (#45)
+// ---------------------------------------------------------------------------
+
+// TestARateLimitedDecideCarriesRetryAfter is #45's first half.
+//
+// The refusal is a denied decision object with HTTP 200 and stays one — a PEP
+// that had to branch on the transport to learn its request was judged would have
+// two answers to keep in step. But the *body* is only legible to something that
+// speaks this API, and a rate limit is the one deny in the vocabulary whose
+// answer to "should I come back" is yes. Everything between the PEP and here — a
+// retry middleware, a gateway, a dashboard — reads headers and status codes, and
+// with neither of those saying anything it cannot tell a shed request from a
+// judged one.
+//
+// The value is the refill interval, so a caller that honours it arrives when
+// there is a token waiting rather than into the same refusal.
+func TestARateLimitedDecideCarriesRetryAfter(t *testing.T) {
+	// One token every two seconds: a refill interval that is a whole number of
+	// seconds, so the header can be compared with the budget rather than with
+	// whatever rounding produced it.
+	limit := stream.RateLimit{PerSecond: 0.5, Burst: 1}
+	f := newDecideFixture(t, decideOptions{rate: generous, subjectRate: limit})
+	token := f.workload(t, "svc-shed")
+
+	if rec := f.create(t, token, decideBody("")); rec.Code != http.StatusCreated {
+		t.Fatalf("the first request = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec := f.create(t, token, decideBody(""))
+	if _, isDeny := denied(t, rec); !isDeny {
+		t.Fatalf("the second request = %d %s, want a denied decision", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want %q — the interval this budget refills in", got, "2")
+	}
+
+	// The header is not decoration: coming back earlier than it says is refused,
+	// and coming back when it says is admitted. A number that promised a token
+	// which is not there would send a well-behaved client into a retry loop.
+	f.clock.Advance(time.Second)
+	if _, isDeny := denied(t, f.create(t, token, decideBody(""))); !isDeny {
+		t.Error("a retry before Retry-After was admitted; the header over-promises")
+	}
+	f.clock.Advance(time.Second)
+	if rec := f.create(t, token, decideBody("")); rec.Code != http.StatusCreated {
+		t.Errorf("a retry at Retry-After = %d %s, want the budget to have refilled",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheCallerBudgetRefusalCarriesItsOwnInterval: the two budgets refill at
+// different rates, and the header names the one that actually ran out. A caller
+// told to wait the subject budget's interval when it was its own that was spent
+// has been told a number about somebody else.
+func TestTheCallerBudgetRefusalCarriesItsOwnInterval(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{
+		rate:        stream.RateLimit{PerSecond: 0.25, Burst: 1},
+		subjectRate: generous,
+	})
+	token := f.workload(t, "svc-noisy")
+
+	if rec := f.create(t, token, decideBody("")); rec.Code != http.StatusCreated {
+		t.Fatalf("the first request = %d", rec.Code)
+	}
+	rec := f.create(t, token, decideBody(""))
+	if _, isDeny := denied(t, rec); !isDeny {
+		t.Fatalf("the second request = %d, want a denied decision", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "4" {
+		t.Errorf("Retry-After = %q, want %q — the caller budget's interval, not the subject's", got, "4")
+	}
+}
+
+// TestAPolicyDenyCarriesNoRetryAfter is the other side of the same claim. A
+// policy deny is a judgement, and a judgement does not expire on a timer; a
+// caller that retried it would get the same answer forever. The header is what
+// separates the retryable deny from the final one at the transport level, so
+// putting it on both would be worse than putting it on neither.
+func TestAPolicyDenyCarriesNoRetryAfter(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.result = decision.Result{
+		State:       store.DecisionDenied,
+		Outcome:     engine.Deny,
+		Reason:      engine.ReasonNoMatchingPolicy,
+		Obligations: []decision.Obligation{},
+	}
+
+	rec := f.create(t, f.workload(t, "svc-payments"), decideBody(""))
+	reason, isDeny := denied(t, rec)
+	if !isDeny {
+		t.Fatalf("a policy deny = %d %s, want a denied decision", rec.Code, rec.Body.String())
+	}
+	if reason != string(engine.ReasonNoMatchingPolicy) {
+		t.Fatalf("reason = %q, want the policy's ground", reason)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("a policy deny carries Retry-After %q; retrying it is not a thing to invite", got)
+	}
+}
