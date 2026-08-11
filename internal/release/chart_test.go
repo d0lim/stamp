@@ -227,6 +227,57 @@ func (c container) addr(t *testing.T, surface string) string {
 	return e.Value
 }
 
+// boundSurfaces returns the surfaces a tier actually listens on, sorted.
+func boundSurfaces(t *testing.T, c container) []string {
+	t.Helper()
+	var out []string
+	for _, surface := range []string{"pep", "console", "callback"} {
+		if c.addr(t, surface) != "" {
+			out = append(out, surface)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// surfaceDrift reports the ways one tier's bound listeners disagree with the
+// listeners its role's routes are mounted on (R39, #46).
+//
+// The two directions are not the same failure. A route on a surface the tier
+// does not bind is unreachable and silent — no router refuses it, because no
+// router has heard of it — and that is the one that shipped. A bound surface
+// with no route behind it is a listener exposed for nothing.
+//
+// It takes the binding as an argument rather than reading a manifest so that
+// the self-check can hand it planted drift and watch the same code report it.
+func surfaceDrift(table mountTable, role string, bound []string) []string {
+	isBound := map[string]struct{}{}
+	for _, s := range bound {
+		isBound[s] = struct{}{}
+	}
+	served := map[string]struct{}{}
+	var problems []string
+	for _, surface := range table.surfacesOf(role) {
+		served[surface] = struct{}{}
+		if _, ok := isBound[surface]; !ok {
+			problems = append(problems, fmt.Sprintf(
+				"the %s role mounts %v on the %s surface and this tier does not bind it: "+
+					"those routes are not refused there, they are unreachable",
+				role, table.patternsOn(role, surface), surface))
+		}
+	}
+	for _, surface := range bound {
+		if _, ok := served[surface]; !ok {
+			problems = append(problems, fmt.Sprintf(
+				"this tier binds the %s surface and the %s role mounts no route on it: "+
+					"a listener with nothing behind it is exposure with no reason for it",
+				surface, role))
+		}
+	}
+	sort.Strings(problems)
+	return problems
+}
+
 // --- both topologies render ----------------------------------------------
 
 func TestAllInOneRendersOneTierRunningEveryRole(t *testing.T) {
@@ -287,24 +338,24 @@ func TestSplitRendersOneTierPerRole(t *testing.T) {
 func TestSplitIsNotAllInOneUnderFiveNames(t *testing.T) {
 	split := load(t, splitSnapshot)
 
-	t.Run("each tier binds only the surfaces its roles serve", func(t *testing.T) {
-		// check answers AuthZEN on the PEP surface and nothing else; a check
-		// tier reachable on the console surface would be an authoring endpoint
-		// on the highest-QPS, least-trusted tier.
-		want := map[string]map[string]string{
-			"stamp-check":    {"pep": ":8080", "console": "", "callback": ""},
-			"stamp-decide":   {"pep": ":8080", "console": ":8081", "callback": ":8082"},
-			"stamp-consumer": {"pep": "", "console": "", "callback": ":8082"},
-			"stamp-api":      {"pep": "", "console": ":8081", "callback": ""},
-			"stamp-console":  {"pep": "", "console": ":8081", "callback": ""},
-		}
-		for tier, surfaces := range want {
-			c := split.deployment(t, tier).container(t)
-			for surface, addr := range surfaces {
-				if got := c.addr(t, surface); got != addr {
-					t.Errorf("%s binds %s at %q, want %q", tier, surface, got, addr)
-				}
+	t.Run("each tier binds exactly the surfaces its role's routes are on", func(t *testing.T) {
+		// Derived, not written down. This assertion used to carry a map of tier
+		// to surface by hand, and a hand-written expectation is wrong in the
+		// same direction as the thing it checks: when the decide tier stopped
+		// binding the PEP surface, POST /decisions could not be served at all
+		// in a split deployment, and the map said so too (#46).
+		//
+		// The surfaces a role serves come from the routes its components mount,
+		// which is what testdata/mounted-routes.json holds.
+		table := loadMountTable(t, mountTableFile)
+		for _, d := range split.byKind("Deployment") {
+			c := d.container(t)
+			role := c.rolesArg(t)
+			bound := boundSurfaces(t, c)
+			for _, problem := range surfaceDrift(table, role, bound) {
+				t.Errorf("%s: %s", d.Metadata.Name, problem)
 			}
+
 			// The container ports and the Service ports follow the binding: a
 			// port published for a listener that is down is a lie in the API
 			// server's own data.
@@ -313,15 +364,23 @@ func TestSplitIsNotAllInOneUnderFiveNames(t *testing.T) {
 				published = append(published, p.Name)
 			}
 			sort.Strings(published)
-			var bound []string
-			for surface, addr := range surfaces {
-				if addr != "" {
-					bound = append(bound, surface)
-				}
-			}
-			sort.Strings(bound)
 			if strings.Join(published, ",") != strings.Join(bound, ",") {
-				t.Errorf("%s publishes ports %v but binds %v", tier, published, bound)
+				t.Errorf("%s publishes ports %v but binds %v", d.Metadata.Name, published, bound)
+			}
+		}
+	})
+
+	t.Run("a bound surface is bound at the port the chart's values give it", func(t *testing.T) {
+		// The one thing the mount table cannot say: routes name a listener,
+		// values.yaml names its port. Ports are asserted separately so that a
+		// changed port fails as a changed port.
+		ports := map[string]string{"pep": ":8080", "console": ":8081", "callback": ":8082"}
+		for _, d := range split.byKind("Deployment") {
+			c := d.container(t)
+			for _, surface := range boundSurfaces(t, c) {
+				if got := c.addr(t, surface); got != ports[surface] {
+					t.Errorf("%s binds %s at %q, want %q", d.Metadata.Name, surface, got, ports[surface])
+				}
 			}
 		}
 	})
@@ -373,6 +432,49 @@ func TestSplitIsNotAllInOneUnderFiveNames(t *testing.T) {
 		migrate, _ := c.env("STAMP_DB_MIGRATE")
 		if migrate.Value != "true" {
 			t.Errorf("the all-in-one tier does not migrate; nothing else would")
+		}
+	})
+}
+
+// TestTheSurfaceDriftCheckFails is the self-check for the derivation above. The
+// hand-written map it replaced was green on the day POST /decisions could not
+// be served at all, so a derived one that has only ever agreed has not yet
+// earned any more belief than the map did.
+func TestTheSurfaceDriftCheckFails(t *testing.T) {
+	table := loadMountTable(t, mountTableFile)
+
+	t.Run("the binding the P0 shipped", func(t *testing.T) {
+		// #46 exactly: a decide tier that binds console and callback and not
+		// PEP. Nothing refuses POST /decisions, because no router on that tier
+		// was ever told about it, and the split topology serves no decisions.
+		problems := surfaceDrift(table, "decide", []string{"callback", "console"})
+		if len(problems) == 0 {
+			t.Fatal("a decide tier with no PEP listener reported no drift, and that binding " +
+				"is the P0 this check exists for")
+		}
+		joined := strings.Join(problems, "\n  ")
+		for _, want := range []string{"pep", "POST /decisions", "unreachable"} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("the drift was caught but not named: want %q in\n  %s", want, joined)
+			}
+		}
+	})
+
+	t.Run("a listener with nothing behind it", func(t *testing.T) {
+		problems := surfaceDrift(table, "check", []string{"console", "pep"})
+		if len(problems) == 0 {
+			t.Fatal("a check tier listening on the console surface reported no drift")
+		}
+		if joined := strings.Join(problems, "\n  "); !strings.Contains(joined, "console") {
+			t.Errorf("the drift was caught but not named: want the console surface in\n  %s", joined)
+		}
+	})
+
+	// The control: the same function, the same table, the binding the chart
+	// really renders for that tier.
+	t.Run("the aligned binding reports nothing", func(t *testing.T) {
+		if problems := surfaceDrift(table, "check", []string{"pep"}); len(problems) > 0 {
+			t.Fatalf("the check role's real binding reported drift:\n  %s", strings.Join(problems, "\n  "))
 		}
 	})
 }

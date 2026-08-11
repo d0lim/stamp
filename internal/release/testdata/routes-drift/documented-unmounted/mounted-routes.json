@@ -1,0 +1,23 @@
+{
+  "note": "Fixture: the inbox route is gone from the rendering while the document still lists it.",
+  "routes": [
+    {
+      "name": "decision-create",
+      "roles": [
+        "decide"
+      ],
+      "surface": "pep",
+      "pattern": "POST /decisions",
+      "auth": "workload"
+    },
+    {
+      "name": "mfa-callback",
+      "roles": [
+        "decide"
+      ],
+      "surface": "callback",
+      "pattern": "POST /decisions/{id}/challenges/{ordinal}/mfa",
+      "auth": "public"
+    }
+  ]
+}
