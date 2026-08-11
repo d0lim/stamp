@@ -164,6 +164,78 @@ variable is this path, never the document.
 {{- end -}}
 
 {{/*
+stamp.documentEnv maps a documents.* setting to the variable the binary reads
+it from. It is the one place the six names are listed, and an unknown name is
+refused here rather than rendered into a manifest nothing would read.
+*/}}
+{{- define "stamp.documentEnv" -}}
+{{- $names := dict
+    "factSources" "STAMP_FACT_SOURCES"
+    "streamSources" "STAMP_STREAM_SOURCES"
+    "ingestCredentials" "STAMP_INGEST_CREDENTIALS"
+    "externalTargets" "STAMP_EXTERNAL_TARGETS"
+    "idpGroupSources" "STAMP_IDP_GROUP_SOURCES"
+    "kafkaTopics" "STAMP_KAFKA_TOPICS" -}}
+{{- $env := index $names . -}}
+{{- if not $env -}}
+{{- fail (printf "documents.%s is not a setting this chart knows" .) -}}
+{{- end -}}
+{{- $env -}}
+{{- end -}}
+
+{{/*
+stamp.tierRuns reports whether a tier runs one role. The all-in-one tier runs
+every one of them, which is what --roles=all means.
+*/}}
+{{- define "stamp.tierRuns" -}}
+{{- if or (eq .tier.name "all") (eq .tier.name .role) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+stamp.tierIssuesChallenges reports whether a tier can open a challenge, and so
+whether it presents an external target's shared secret or the CIBA client's
+credentials.
+
+Two roles can, and the chart follows internal/runtime/credentials.go rather than
+guessing: the decide role issues when a decision is created, and the api role
+re-issues during the revalidation that applying a revision performs
+(internal/decision/revalidate.go). An api tier without them would fail at the
+moment a governance change landed.
+*/}}
+{{- define "stamp.tierIssuesChallenges" -}}
+{{- if or (include "stamp.tierRuns" (dict "tier" .tier "role" "decide"))
+          (include "stamp.tierRuns" (dict "tier" .tier "role" "api")) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+stamp.tierReadsDocument reports whether one tier mounts one configuration
+document (R42, R39).
+
+The two credential-only documents follow their consumer. The ingest grants
+authenticate an event producer against the ingest route, which only the consumer
+role mounts; the external targets carry the webhook signing secret, which only a
+tier that issues a challenge presents.
+
+The other four reach every tier, and that is a property of the binary rather
+than a shortcut. Every process loads the policy set at boot and the schema gate
+refuses a source of a kind no plane in the process answers for, so the documents
+that carry *declarations* have to be readable wherever a snapshot is loaded —
+which is everywhere. The group sources are the awkward case: one document holds
+both the declarations and the directory credential, so it stays on every tier,
+and the narrowing there happens inside the binary instead (idpgroup.Gate, for
+the roles that never call a directory).
+*/}}
+{{- define "stamp.tierReadsDocument" -}}
+{{- if eq .document "ingestCredentials" -}}
+{{- include "stamp.tierRuns" (dict "tier" .tier "role" "consumer") -}}
+{{- else if eq .document "externalTargets" -}}
+{{- include "stamp.tierIssuesChallenges" (dict "tier" .tier) -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
 Audit checkpoints (R32, R42).
 
 The directories are constants rather than settings. The key directory is a

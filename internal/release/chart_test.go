@@ -649,14 +649,173 @@ func TestCredentialsArriveByReference(t *testing.T) {
 			}
 		}
 		// The three documents that may hold a credential are named settings,
-		// and their values are paths rather than documents.
-		for _, name := range []string{"STAMP_EXTERNAL_TARGETS", "STAMP_IDP_GROUP_SOURCES", "STAMP_INGEST_CREDENTIALS"} {
-			cm := split.byKind("ConfigMap")[0]
-			if v, ok := cm.Data[name]; ok && !strings.HasPrefix(v, documentMount) {
-				t.Errorf("%s = %q, want a path into %s", name, v, documentMount)
+		// and their values are paths rather than documents. They are per-tier
+		// environment rather than ConfigMap entries — two of the three do not
+		// reach every tier — so the scan is of the pod, and the ConfigMap is
+		// asserted not to carry them at all.
+		cm := split.byKind("ConfigMap")[0]
+		for _, name := range credentialDocuments {
+			if v, ok := c.env(name); ok && !strings.HasPrefix(v.Value, documentMount) {
+				t.Errorf("%s on %s = %q, want a path into %s",
+					name, d.Metadata.Name, v.Value, documentMount)
+			}
+			if _, ok := cm.Data[name]; ok {
+				t.Errorf("%s is a ConfigMap entry, so every tier reads it; it belongs to the tiers "+
+					"that consume it", name)
 			}
 		}
 	}
+}
+
+// credentialDocuments are the settings whose document may hold a credential.
+var credentialDocuments = []string{
+	"STAMP_EXTERNAL_TARGETS", "STAMP_IDP_GROUP_SOURCES", "STAMP_INGEST_CREDENTIALS",
+}
+
+// documentEnv is every configuration document setting, with the tiers of the
+// split topology that are supposed to read it.
+//
+// The expectations are written out rather than derived, because deriving them
+// from the chart is what let #34 stand: the chart and the test would agree with
+// each other and with nothing else. They follow internal/runtime/credentials.go,
+// and internal/runtime's own tests hold the binary to the same line.
+var documentEnv = map[string][]string{
+	// Declarations. Every process loads the policy set at boot and the schema
+	// gate refuses a source of a kind no plane in the process answers for, so a
+	// tier without these is a tier that cannot start.
+	"STAMP_FACT_SOURCES":   {"check", "decide", "consumer", "api", "console"},
+	"STAMP_STREAM_SOURCES": {"check", "decide", "consumer", "api", "console"},
+	"STAMP_KAFKA_TOPICS":   {"check", "decide", "consumer", "api", "console"},
+	// Declarations and a directory credential in one document. It stays
+	// everywhere for the reason above; the narrowing for it is inside the
+	// binary, where a role that never resolves a group gets a gate that dials
+	// nothing.
+	"STAMP_IDP_GROUP_SOURCES": {"check", "decide", "consumer", "api", "console"},
+	// Credentials only, and they follow their consumer.
+	"STAMP_INGEST_CREDENTIALS": {"consumer"},
+	"STAMP_EXTERNAL_TARGETS":   {"decide", "api"},
+}
+
+// TestACredentialDocumentReachesOnlyTheTiersThatUseIt is #34's acceptance, and
+// R42's second clause: a secret is not present where it is not needed.
+//
+// The check tier is the one the requirement is about. It is the tier a PEP can
+// reach, it is scaled to the request rate, and the database side of R39 already
+// gives it a login that cannot write a policy — which the filesystem was handing
+// back. It holds no webhook signing key, no CIBA client secret and no ingest
+// grant here, and the assertions below are two-sided: the tiers that do use one
+// have it, so the narrowing cannot be a deployment that does not work.
+func TestACredentialDocumentReachesOnlyTheTiersThatUseIt(t *testing.T) {
+	split := load(t, splitSnapshot)
+	for setting, tiers := range documentEnv {
+		t.Run(setting, func(t *testing.T) {
+			for _, tier := range []string{"check", "decide", "consumer", "api", "console"} {
+				d := split.deployment(t, "stamp-"+tier)
+				c := d.container(t)
+				want := false
+				for _, name := range tiers {
+					if name == tier {
+						want = true
+					}
+				}
+
+				e, got := c.env(setting)
+				if got != want {
+					t.Errorf("the %s tier reads %s = %v, want %v", tier, setting, got, want)
+					continue
+				}
+				if !got {
+					// And the document is not mounted either: a variable is not
+					// the only way a credential reaches a filesystem.
+					for _, mnt := range c.VolumeMounts {
+						if strings.Contains(mnt.MountPath, documentBasename(setting)) {
+							t.Errorf("the %s tier mounts %s at %s while reading no variable for it",
+								tier, setting, mnt.MountPath)
+						}
+					}
+					continue
+				}
+				if !strings.HasPrefix(e.Value, documentMount) {
+					t.Errorf("the %s tier reads %s = %q, want a path into %s",
+						tier, setting, e.Value, documentMount)
+				}
+				mounted := false
+				for _, mnt := range c.VolumeMounts {
+					if mnt.MountPath == e.Value {
+						mounted = true
+					}
+				}
+				if !mounted {
+					t.Errorf("the %s tier names %s at %s and mounts nothing there, which is a boot failure",
+						tier, setting, e.Value)
+				}
+			}
+		})
+	}
+}
+
+// TestTheCIBAClientSecretReachesOnlyTheTiersThatIssue is the same rule on the
+// one credential that arrives as a variable rather than as a document.
+//
+// The api role is in the expectation deliberately: applying a revision
+// revalidates the decisions still open under it and re-issues a challenge whose
+// binding moved, so an api tier without the client would fail at the moment a
+// governance change landed.
+func TestTheCIBAClientSecretReachesOnlyTheTiersThatIssue(t *testing.T) {
+	split := load(t, splitSnapshot)
+	issues := map[string]bool{"decide": true, "api": true}
+	for _, tier := range []string{"check", "decide", "consumer", "api", "console"} {
+		d := split.deployment(t, "stamp-"+tier)
+		c := d.container(t)
+		_, got := c.env("STAMP_MFA_CIBA_CLIENT_SECRET")
+		if got != issues[tier] {
+			t.Errorf("the %s tier reads STAMP_MFA_CIBA_CLIENT_SECRET = %v, want %v",
+				tier, got, issues[tier])
+		}
+		if got {
+			c.secretRef(t, "STAMP_MFA_CIBA_CLIENT_SECRET")
+		}
+	}
+
+	// The all-in-one values configure no CIBA client, so this variable is
+	// absent there for a reason that has nothing to do with roles. The "runs
+	// every role" branch of the helper that gates it is exercised by the other
+	// setting that reads the same helper — the external targets, asserted in
+	// TestEveryDocumentReachesTheTierThatRunsEveryRole.
+}
+
+// TestEveryDocumentReachesTheTierThatRunsEveryRole is the other end of the
+// narrowing. One tier running --roles=all consumes everything, so a rule that
+// narrowed by tier name rather than by the roles the tier runs would take the
+// single-container install's credentials away from it.
+func TestEveryDocumentReachesTheTierThatRunsEveryRole(t *testing.T) {
+	c := load(t, allInOneSnapshot).deployment(t, "stamp").container(t)
+	if got := c.rolesArg(t); got != "all" {
+		t.Fatalf("the all-in-one tier runs --roles=%s, want all", got)
+	}
+	for setting := range documentEnv {
+		e, ok := c.env(setting)
+		if !ok {
+			t.Errorf("the all-in-one tier does not read %s; it runs every role that consumes one", setting)
+			continue
+		}
+		if !strings.HasPrefix(e.Value, documentMount) {
+			t.Errorf("%s = %q, want a path into %s", setting, e.Value, documentMount)
+		}
+	}
+}
+
+// documentBasename is the file a setting's document is mounted as, derived from
+// the values files both snapshots use.
+func documentBasename(setting string) string {
+	return map[string]string{
+		"STAMP_FACT_SOURCES":       "fact-sources.json",
+		"STAMP_STREAM_SOURCES":     "stream-sources.json",
+		"STAMP_KAFKA_TOPICS":       "kafka-topics.json",
+		"STAMP_IDP_GROUP_SOURCES":  "idp-group-sources.json",
+		"STAMP_INGEST_CREDENTIALS": "ingest-credentials.json",
+		"STAMP_EXTERNAL_TARGETS":   "external-targets.json",
+	}[setting]
 }
 
 // --- audit checkpoints (R32 with R42) ------------------------------------

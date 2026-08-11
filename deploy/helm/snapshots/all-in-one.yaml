@@ -168,6 +168,18 @@ spec:
               value: "true"
             - name: STAMP_DB_APPLY_GRANTS
               value: "true"
+            - name: STAMP_EXTERNAL_TARGETS
+              value: "/etc/stamp/documents/external-targets.json"
+            - name: STAMP_FACT_SOURCES
+              value: "/etc/stamp/documents/fact-sources.json"
+            - name: STAMP_IDP_GROUP_SOURCES
+              value: "/etc/stamp/documents/idp-group-sources.json"
+            - name: STAMP_INGEST_CREDENTIALS
+              value: "/etc/stamp/documents/ingest-credentials.json"
+            - name: STAMP_KAFKA_TOPICS
+              value: "/etc/stamp/documents/kafka-topics.json"
+            - name: STAMP_STREAM_SOURCES
+              value: "/etc/stamp/documents/stream-sources.json"
             # R32 and R42. The api role is the only one that registers the
             # checkpointer, so these six variables are rendered on this tier and
             # on no other — the key is mounted where it is used, and a check tier
@@ -211,6 +223,30 @@ spec:
               cpu: 500m
               memory: 512Mi
           volumeMounts:
+            - name: doc-external-targets
+              mountPath: "/etc/stamp/documents/external-targets.json"
+              subPath: "external-targets.json"
+              readOnly: true
+            - name: doc-fact-sources
+              mountPath: "/etc/stamp/documents/fact-sources.json"
+              subPath: "fact-sources.json"
+              readOnly: true
+            - name: doc-idp-group-sources
+              mountPath: "/etc/stamp/documents/idp-group-sources.json"
+              subPath: "idp-group-sources.json"
+              readOnly: true
+            - name: doc-ingest-credentials
+              mountPath: "/etc/stamp/documents/ingest-credentials.json"
+              subPath: "ingest-credentials.json"
+              readOnly: true
+            - name: doc-kafka-topics
+              mountPath: "/etc/stamp/documents/kafka-topics.json"
+              subPath: "kafka-topics.json"
+              readOnly: true
+            - name: doc-stream-sources
+              mountPath: "/etc/stamp/documents/stream-sources.json"
+              subPath: "stream-sources.json"
+              readOnly: true
             - name: checkpoint-key
               mountPath: "/etc/stamp/checkpoint/signing-key.pem"
               subPath: "signing-key.pem"
@@ -226,7 +262,47 @@ spec:
       # credential and none of them may appear in a manifest. The signing key is
       # mounted for the same reason and a stronger one — the chart has no field
       # its bytes could have been written into.
+      #
+      # Which of them this tier gets is stamp.tierReadsDocument's answer, and it
+      # follows the binary: a document a tier's roles never read is a credential
+      # sitting on a filesystem nothing in that pod consults.
       volumes:
+        - name: doc-external-targets
+          secret:
+            secretName: "stamp-external-targets"
+            items:
+              - key: "external-targets.json"
+                path: "external-targets.json"
+        - name: doc-fact-sources
+          secret:
+            secretName: "stamp-fact-sources"
+            items:
+              - key: "fact-sources.json"
+                path: "fact-sources.json"
+        - name: doc-idp-group-sources
+          secret:
+            secretName: "stamp-idp-group-sources"
+            items:
+              - key: "idp-group-sources.json"
+                path: "idp-group-sources.json"
+        - name: doc-ingest-credentials
+          secret:
+            secretName: "stamp-ingest-credentials"
+            items:
+              - key: "ingest-credentials.json"
+                path: "ingest-credentials.json"
+        - name: doc-kafka-topics
+          secret:
+            secretName: "stamp-kafka-topics"
+            items:
+              - key: "kafka-topics.json"
+                path: "kafka-topics.json"
+        - name: doc-stream-sources
+          secret:
+            secretName: "stamp-stream-sources"
+            items:
+              - key: "stream-sources.json"
+                path: "stream-sources.json"
         - name: checkpoint-key
           secret:
             secretName: "stamp-checkpoint-key"

@@ -217,9 +217,8 @@ type Sources struct {
 	client     *http.Client
 	cache      *cache
 	now        func() time.Time
-	issuers    map[string]struct{}
-	decls      map[string]Declaration
-	maxTTL     time.Duration
+	limits     limits
+	decls      declarations
 	maxBytes   int64
 	maxMembers int
 }
@@ -266,51 +265,116 @@ func NewSources(decls []Declaration, cfg SourcesConfig) (*Sources, error) {
 		maxMembers = DefaultMaxMembers
 	}
 
+	bounds, err := newLimits(cfg.Issuers, cfg.AllowFailOpen, maxTTL)
+	if err != nil {
+		return nil, err
+	}
 	s := &Sources{
 		cfg:        cfg,
 		gate:       cfg.Gate,
 		client:     cfg.Gate.HTTPClient(),
 		cache:      newCache(maxEntries, now),
 		now:        now,
-		issuers:    make(map[string]struct{}, len(cfg.Issuers)),
-		decls:      make(map[string]Declaration, len(decls)),
-		maxTTL:     maxTTL,
+		limits:     bounds,
 		maxBytes:   maxBytes,
 		maxMembers: maxMembers,
 	}
-	for _, iss := range cfg.Issuers {
-		if iss.Issuer == "" {
-			return nil, fmt.Errorf("%w: a trusted issuer entry carries no issuer", fact.ErrLoad)
-		}
-		s.issuers[iss.Issuer] = struct{}{}
-	}
-
-	var errs []error
-	for _, decl := range decls {
-		if _, dup := s.decls[decl.Name]; dup {
-			errs = append(errs, fmt.Errorf("%w: source %q: declared more than once", fact.ErrLoad, decl.Name))
-			continue
-		}
-		resolved, err := s.resolve(decl)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		s.decls[decl.Name] = resolved
-	}
-	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
+	if s.decls, err = resolveAll(decls, s.resolve); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
 
-// resolve checks one declaration against operator configuration.
+// limits are the operator-level bounds a declaration is admitted against: which
+// issuers this deployment trusts, whether it grants fail-open, and how stale a
+// membership answer may be.
+//
+// They are held apart from [Sources] because they are the whole of what
+// admitting a declaration needs. A [Gate] holds the same three and nothing
+// else, which is what makes its declaration set the same set — see [NewGate].
+type limits struct {
+	issuers       map[string]struct{}
+	allowFailOpen bool
+	maxTTL        time.Duration
+}
+
+func newLimits(issuers []identity.IssuerConfig, allowFailOpen bool, maxTTL time.Duration) (limits, error) {
+	l := limits{
+		issuers:       make(map[string]struct{}, len(issuers)),
+		allowFailOpen: allowFailOpen,
+		maxTTL:        maxTTL,
+	}
+	if l.maxTTL <= 0 {
+		l.maxTTL = DefaultMaxTTL
+	}
+	for _, iss := range issuers {
+		if iss.Issuer == "" {
+			return limits{}, fmt.Errorf("%w: a trusted issuer entry carries no issuer", fact.ErrLoad)
+		}
+		l.issuers[iss.Issuer] = struct{}{}
+	}
+	return l, nil
+}
+
+// resolveAll admits a declaration list, refusing a repeated name and collecting
+// every rejection rather than reporting the first.
+//
+// It is the shared half of [NewSources] and [NewGate]: they differ only in the
+// admit function they hand it, and therefore only in whether a destination is
+// put through the egress gate.
+func resolveAll(decls []Declaration, admit func(Declaration) (Declaration, error)) (declarations, error) {
+	out := make(declarations, len(decls))
+	var errs []error
+	for _, decl := range decls {
+		if _, dup := out[decl.Name]; dup {
+			errs = append(errs, fmt.Errorf("%w: source %q: declared more than once", fact.ErrLoad, decl.Name))
+			continue
+		}
+		resolved, err := admit(decl)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		out[decl.Name] = resolved
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return out, nil
+}
+
+// resolve checks one declaration against operator configuration, and then puts
+// its destination through the egress gate.
+//
+// The gate is the only thing this adds to [limits.admit], and it is the only
+// thing a process that will never call a directory does not need.
 func (s *Sources) resolve(decl Declaration) (Declaration, error) {
-	fail := func(format string, args ...any) error {
-		return fmt.Errorf("%w: source %q: %s", fact.ErrLoad, decl.Name, fmt.Sprintf(format, args...))
+	decl, err := s.limits.admit(decl)
+	if err != nil {
+		return decl, err
 	}
 	failWith := func(err error) error {
 		return fmt.Errorf("%w: source %q: %w", fact.ErrLoad, decl.Name, err)
+	}
+	// The first of the egress gate's checks. The same gate runs again at call
+	// time and once more inside the dialler, so a destination is admitted by
+	// exactly one rule set however it is arrived at.
+	if err := s.gate.CheckURL(decl.URL); err != nil {
+		return decl, failWith(err)
+	}
+	if err := s.gate.Preflight(context.Background(), decl.URL); err != nil {
+		return decl, failWith(err)
+	}
+	return decl, nil
+}
+
+// admit checks one declaration against operator configuration and fills in its
+// defaults. It reaches nothing: every rule here is about the declaration and
+// the deployment's own settings, which is why a gate-only deployment applies
+// exactly this and stops.
+func (l limits) admit(decl Declaration) (Declaration, error) {
+	fail := func(format string, args ...any) error {
+		return fmt.Errorf("%w: source %q: %s", fact.ErrLoad, decl.Name, fmt.Sprintf(format, args...))
 	}
 	if !policy.ValidIdent(decl.Name) {
 		return decl, fail("name is not a valid identifier")
@@ -318,7 +382,7 @@ func (s *Sources) resolve(decl Declaration) (Declaration, error) {
 	if decl.Issuer == "" {
 		return decl, fail("no issuer is configured; a group source is bound to the issuer whose subjects it names")
 	}
-	if _, ok := s.issuers[decl.Issuer]; !ok {
+	if _, ok := l.issuers[decl.Issuer]; !ok {
 		return decl, fail("issuer %q is not trusted by this deployment, so its members could never be recognised as approvers", decl.Issuer)
 	}
 
@@ -343,7 +407,7 @@ func (s *Sources) resolve(decl Declaration) (Declaration, error) {
 	// The operator flag, not the declaration, is what grants fail-open. The
 	// check is repeated here rather than borrowed from the synchronous plane
 	// because a deployment may configure this plane and not that one.
-	if onErr == policy.OnErrorAllow && !s.cfg.AllowFailOpen {
+	if onErr == policy.OnErrorAllow && !l.allowFailOpen {
 		return decl, fail("on_error: allow requires the operator fail-open flag, which is not enabled on this deployment")
 	}
 	decl.OnError = onErr
@@ -351,27 +415,18 @@ func (s *Sources) resolve(decl Declaration) (Declaration, error) {
 	switch {
 	case decl.TTL <= 0:
 		return decl, fail("ttl must be positive; the freshness bound of a membership answer is not allowed to be implicit")
-	case decl.TTL > s.maxTTL:
+	case decl.TTL > l.maxTTL:
 		// The cap is the deployment's revocation delay budget. A membership
 		// answer held past it is a person who left the group and can still be
 		// resolved into an approver set.
 		return decl, fail("ttl %s exceeds the maximum %s; a membership ttl is how long a removed member stays an eligible approver",
-			decl.TTL, s.maxTTL)
+			decl.TTL, l.maxTTL)
 	}
 	if decl.Timeout <= 0 {
 		return decl, fail("timeout must be positive")
 	}
 	if decl.URL == "" {
 		return decl, fail("url is required")
-	}
-	// The first of the egress gate's checks. The same gate runs again at call
-	// time and once more inside the dialler, so a destination is admitted by
-	// exactly one rule set however it is arrived at.
-	if err := s.gate.CheckURL(decl.URL); err != nil {
-		return decl, failWith(err)
-	}
-	if err := s.gate.Preflight(context.Background(), decl.URL); err != nil {
-		return decl, failWith(err)
 	}
 
 	if decl.MembersField == "" {
@@ -386,20 +441,23 @@ func (s *Sources) resolve(decl Declaration) (Declaration, error) {
 	return decl, nil
 }
 
-// Names returns the configured group source names, sorted.
-func (s *Sources) Names() []string {
-	out := make([]string, 0, len(s.decls))
-	for name := range s.decls {
+// declarations is an admitted declaration set, and the whole of what verifying
+// a schema needs.
+//
+// It is its own type because two things hold one: [Sources], which can call a
+// directory, and [Gate], which cannot. Verification is a method here rather
+// than on either of them, so the two cannot drift into checking different
+// things — there is only one implementation to drift.
+type declarations map[string]Declaration
+
+// Names returns the declared source names, sorted.
+func (d declarations) Names() []string {
+	out := make([]string, 0, len(d))
+	for name := range d {
 		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out
-}
-
-// Declaration returns the resolved declaration for a source.
-func (s *Sources) Declaration(name string) (Declaration, bool) {
-	decl, ok := s.decls[name]
-	return decl, ok
 }
 
 // VerifySchema checks a policy schema's idp_group sources against this
@@ -408,7 +466,11 @@ func (s *Sources) Declaration(name string) (Declaration, bool) {
 // It is the counterpart of [fact.Registry.VerifySchema], which skips this kind
 // precisely because it is served here. Between the two of them and the stream
 // plane's, every source a schema declares is checked by exactly one.
-func (s *Sources) VerifySchema(schema *policy.Schema) error {
+//
+// Nothing it reads is a credential: it compares the schema against
+// [Declaration.SourceDecl], which by construction carries nothing about the
+// directory. That is what lets a deployment gate a kind it never calls.
+func (d declarations) VerifySchema(schema *policy.Schema) error {
 	if schema == nil {
 		return nil
 	}
@@ -418,7 +480,7 @@ func (s *Sources) VerifySchema(schema *policy.Schema) error {
 		if sd.Kind != policy.SourceIdPGroup {
 			continue
 		}
-		decl, ok := s.decls[sd.Name]
+		decl, ok := d[sd.Name]
 		if !ok {
 			errs = append(errs, fmt.Errorf("%w: source %q: declared by the schema as an idp group source but not configured on this deployment",
 				fact.ErrLoad, sd.Name))
@@ -430,6 +492,83 @@ func (s *Sources) VerifySchema(schema *policy.Schema) error {
 	}
 	return errors.Join(errs...)
 }
+
+// GateConfig configures a [Gate]. It is [SourcesConfig] with everything a call
+// would need taken out: there is no egress gate, no fallback resolver and no
+// cache, because a gate makes no call and answers no lookup.
+type GateConfig struct {
+	// Issuers is the deployment's trusted issuer set, as the identity layer
+	// pins it. Required, and required for the same reason [SourcesConfig] needs
+	// it: a declaration bound to an untrusted issuer is refused here exactly as
+	// it is there.
+	Issuers []identity.IssuerConfig
+	// AllowFailOpen is the operator-level flag that admits declarations asking
+	// to fail open.
+	AllowFailOpen bool
+	// MaxTTL caps a declaration's TTL. Zero selects DefaultMaxTTL.
+	MaxTTL time.Duration
+}
+
+// Gate is the schema gate for the idp_group kind on a process that will never
+// call a directory.
+//
+// It exists because the two questions a deployment asks about a group source
+// are separable and only one of them needs a credential. "Does this schema
+// name a source this deployment serves, with the signature it serves it with"
+// is answered from [Declaration.SourceDecl] alone — [declarations.VerifySchema]
+// is literally the method [Sources] answers it with. "What is in this group" is
+// the one that dials, and a role that never asks it has no business holding the
+// directory's credential (R42).
+//
+// It is not a weaker gate. Weakening the gate is the thing
+// [runtime.snapshotSource] must never do: a kind missing a plane is not a
+// laxer check but no check at all, so a process that stops calling directories
+// still has to refuse every schema a calling process would refuse. That is why
+// this type verifies through the same map and the same method rather than
+// through a second implementation that agrees today.
+type Gate struct {
+	decls declarations
+}
+
+// NewGate admits the same declarations [NewSources] admits, minus the egress
+// check — which is the one rule about the destination rather than about the
+// declaration, and the one a process that will not dial does not need.
+//
+// Its rejections wrap [fact.ErrLoad] like every other plane's.
+func NewGate(decls []Declaration, cfg GateConfig) (*Gate, error) {
+	if len(cfg.Issuers) == 0 {
+		return nil, fmt.Errorf("%w: group sources require the deployment's trusted issuer set", fact.ErrLoad)
+	}
+	bounds, err := newLimits(cfg.Issuers, cfg.AllowFailOpen, cfg.MaxTTL)
+	if err != nil {
+		return nil, err
+	}
+	admitted, err := resolveAll(decls, bounds.admit)
+	if err != nil {
+		return nil, err
+	}
+	return &Gate{decls: admitted}, nil
+}
+
+// Names returns the declared group source names, sorted.
+func (g *Gate) Names() []string { return g.decls.Names() }
+
+// VerifySchema implements the schema gate. It is [Sources]' answer, from the
+// same code.
+func (g *Gate) VerifySchema(schema *policy.Schema) error { return g.decls.VerifySchema(schema) }
+
+// Names returns the configured group source names, sorted.
+func (s *Sources) Names() []string { return s.decls.Names() }
+
+// Declaration returns the resolved declaration for a source.
+func (s *Sources) Declaration(name string) (Declaration, bool) {
+	decl, ok := s.decls[name]
+	return decl, ok
+}
+
+// VerifySchema implements the schema gate for a deployment that can also call
+// these directories. It is [Gate]'s answer, from the same code.
+func (s *Sources) VerifySchema(schema *policy.Schema) error { return s.decls.VerifySchema(schema) }
 
 func sameSignature(configured, declared policy.SourceDecl) error {
 	if configured.Returns != declared.Returns {

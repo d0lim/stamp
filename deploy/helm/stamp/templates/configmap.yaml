@@ -3,8 +3,14 @@
 {{- end -}}
 {{/*
 Every tier reads the same non-secret configuration. What differs between tiers
-is the DSN, the listen addresses and whether it migrates, and all three of those
-are per-tier environment on the Deployment rather than entries here.
+is the DSN, the listen addresses, whether it migrates, and which configuration
+documents it reads — all of those are per-tier environment on the Deployment
+rather than entries here.
+
+The documents are the newest of those four and the reason is R42: two of the six
+carry only a credential, and they reach the tier that spends it and no other. A
+document path stated here would be stated for every tier, and a variable naming
+a document the pod does not mount is a process that fails to boot.
 
 Nothing in this ConfigMap may be a credential. The two settings that are one —
 the DSN and the CIBA client secret — are secretKeyRef entries on the pod, and
@@ -148,19 +154,4 @@ data:
   {{- end }}
   {{- with .Values.kafka.pollRecords }}
   STAMP_KAFKA_POLL_RECORDS: {{ . | quote }}
-  {{- end }}
-
-  {{- range $name, $doc := .Values.documents }}
-  {{- if $doc.secretName }}
-  {{- $env := "" }}
-  {{- if eq $name "factSources" }}{{- $env = "STAMP_FACT_SOURCES" }}
-  {{- else if eq $name "streamSources" }}{{- $env = "STAMP_STREAM_SOURCES" }}
-  {{- else if eq $name "ingestCredentials" }}{{- $env = "STAMP_INGEST_CREDENTIALS" }}
-  {{- else if eq $name "externalTargets" }}{{- $env = "STAMP_EXTERNAL_TARGETS" }}
-  {{- else if eq $name "idpGroupSources" }}{{- $env = "STAMP_IDP_GROUP_SOURCES" }}
-  {{- else if eq $name "kafkaTopics" }}{{- $env = "STAMP_KAFKA_TOPICS" }}
-  {{- else }}{{- fail (printf "documents.%s is not a setting this chart knows" $name) }}
-  {{- end }}
-  {{ $env }}: {{ include "stamp.documentPath" $doc | quote }}
-  {{- end }}
   {{- end }}

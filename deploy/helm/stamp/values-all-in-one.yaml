@@ -41,6 +41,33 @@ audit:
       secretName: stamp-checkpoint-key
       key: signing-key.pem
 
+# The configuration documents, named here so that the rendered manifest shows
+# what one tier running every role reads: all six. The split topology is where
+# the narrowing is visible, and this is the other side of the same rule — a tier
+# whose roles include the consumer and the decide ones reads the ingest grants
+# and the external targets, because it is the tier that spends them.
+#
+# The Secrets are the operator's; this release creates none of them.
+documents:
+  factSources:
+    secretName: stamp-fact-sources
+    key: fact-sources.json
+  streamSources:
+    secretName: stamp-stream-sources
+    key: stream-sources.json
+  ingestCredentials:
+    secretName: stamp-ingest-credentials
+    key: ingest-credentials.json
+  externalTargets:
+    secretName: stamp-external-targets
+    key: external-targets.json
+  idpGroupSources:
+    secretName: stamp-idp-group-sources
+    key: idp-group-sources.json
+  kafkaTopics:
+    secretName: stamp-kafka-topics
+    key: kafka-topics.json
+
 console:
   # Empty: the bundle and the API are the same origin here, which is what makes
   # this the single-container install.
