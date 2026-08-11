@@ -153,8 +153,22 @@ services:
       # Delegated MFA, step-up redirect (D26). CIBA is deliberately unset: U0
       # established that Keycloak's CIBA grant needs an external authentication
       # device server this bundle does not ship.
+      #
+      # The authorization endpoint is the browser-facing origin because a
+      # person's browser is what follows it; the token endpoint is the
+      # container-internal one because STAMP is what calls it. Keycloak stamps
+      # `iss` from KC_HOSTNAME either way, which is the same arrangement
+      # STAMP_OIDC_JWKS_URL relies on.
+      #
+      # `stamp-stepup` is registered as a public client with
+      # `pkce.code.challenge.method: S256`, so there is no client secret here and
+      # PKCE is what proves the redeemer is the requester. U2 measured this realm
+      # refusing an authorization request that carries no `code_challenge_method`
+      # outright — `error=invalid_request` — which is why the parameter is not
+      # optional.
       STAMP_MFA_ACR_VALUES: "1"
       STAMP_MFA_AUTHORIZATION_ENDPOINT: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo/protocol/openid-connect/auth
+      STAMP_MFA_TOKEN_ENDPOINT: http://keycloak:8080/realms/stamp-demo/protocol/openid-connect/token
       STAMP_MFA_CLIENT_ID: stamp-stepup
       STAMP_MFA_REDIRECT_URI: http://localhost:${DEMO_CALLBACK_PORT:-18783}/decisions/
       STAMP_MFA_TOKEN_CLIENT_ID: stamp-stepup

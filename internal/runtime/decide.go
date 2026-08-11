@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/identity"
@@ -33,6 +34,7 @@ import (
 type DecisionPath interface {
 	Decide(ctx context.Context, req decision.Request) (decision.Result, error)
 	Submit(ctx context.Context, sub decision.Submission) (decision.Result, error)
+	Redeem(ctx context.Context, cb decision.Callback) (challenge.Redemption, error)
 	Get(ctx context.Context, caller *identity.Subject, id string) (decision.Result, error)
 }
 
@@ -155,6 +157,15 @@ func (p *decidePlane) Decide(ctx context.Context, req decision.Request) (decisio
 // Submit hands evidence to a challenge.
 func (p *decidePlane) Submit(ctx context.Context, sub decision.Submission) (decision.Result, error) {
 	return p.Service().Submit(ctx, sub)
+}
+
+// Redeem turns a challenge's own redirect into the makings of a submission.
+//
+// It goes through the plane for the reason [decidePlane.Get] does: a revision
+// that swaps the service between the redemption and the submission that follows
+// it must not leave the two talking to different services.
+func (p *decidePlane) Redeem(ctx context.Context, cb decision.Callback) (challenge.Redemption, error) {
+	return p.Service().Redeem(ctx, cb)
 }
 
 // Get returns a decision to a caller R40 entitles to see it.

@@ -1,6 +1,6 @@
 ---
 contract: decision-api
-version: 1.2.0
+version: 1.3.0
 source: internal/api
 ---
 
@@ -46,6 +46,7 @@ source: internal/api
 | `GET /audit/decisions` | console | user | `decide` |
 | `GET /audit/decisions/{id}` | console | user | `decide` |
 | `POST /decisions/{id}/challenges/{ordinal}/mfa` | callback | public | `decide` |
+| `GET /decisions/{id}/challenges/{ordinal}/mfa` | callback | public | `decide` |
 | `POST /external/{id}/{ordinal}` | callback | public | `decide` |
 | `POST /ingest/v1/events` | callback | workload | `consumer` |
 | `GET /policies` | console | user | `api` |
@@ -128,7 +129,31 @@ source: internal/api
 
 **뷰에 실리는 것은 challenge 핸들러가 이름으로 고른 것뿐이다.** challenge 행의 `detail`은 저장용이고 correlator·nonce·PKCE verifier를 담는다 — 그것들은 뷰로 가지 않으며, 갈 수 있는 통로 자체가 없다. 결정 레이어는 특정 challenge kind를 알지 못하므로(선택적 `challenge.Viewer` 인터페이스로만 묻는다) 저장된 값을 스스로 꺼내 실을 수 없다.
 
-**알려진 노출**: 지금 step-up 인가 요청은 correlator를 `state` 파라미터로 싣는다. 그래서 이 URL을 받는 호출자와 주체의 브라우저에 correlator가 도달한다. correlator는 결합값이지 인가값이 아니며(완결은 여전히 검증된 주체·발급자·nonce·acr를 요구한다) 이것은 KTD2로 해소된다 — `state`는 CSRF 전용이 되고 challenge는 콜백 **경로**가 식별한다.
+**1.2.0의 "알려진 노출"은 닫혔다.** 그때는 step-up 인가 요청이 correlator를 `state`로 실었고, URL이 응답에 실리면서 correlator가 호출자와 브라우저에 도달했다. 1.3.0의 `state`는 challenge마다 새로 만드는 CSRF 토큰이다(KTD2) — correlator는 어떤 URL에도 나타나지 않고, PKCE verifier도 마찬가지다. challenge를 식별하는 것은 콜백 **경로**다.
+
+### step-up 콜백
+
+`GET /decisions/{id}/challenges/{ordinal}/mfa`는 IdP가 주체의 브라우저를 되돌려 보내는 곳이다. 기존 `POST`는 그대로 남는다 — CIBA 경로와 모의 OP 검증이 그것을 쓴다.
+
+| 쿼리 파라미터 | 뜻 |
+|---|---|
+| `code` | 인가 코드. STAMP가 challenge 행의 verifier로 교환한다 |
+| `state` | 이 challenge가 발급한 CSRF 토큰. 다르면 토큰 교환 **이전에** 거절된다 |
+| `error` · `error_description` | IdP가 거절한 경우 |
+
+**응답은 사람이 읽는 HTML이다.** 이 라우트에 도착하는 것은 방금 비밀번호를 입력한 사람이고, 다른 콜백처럼 JSON 403을 주면 무엇이 잘못됐는지 알 수 없다. 페이지는 스크립트·스타일·외부 참조를 하나도 갖지 않으며 `default-src 'none'` CSP와 `Referrer-Policy: no-referrer`를 함께 낸다 — URL의 쿼리에 인가 코드가 들어 있으므로 리퍼러 억제가 형식이 아니라 방어다.
+
+상태 코드는 두 구간으로 나뉜다.
+
+| 구간 | 답 |
+|---|---|
+| `state`가 확인되기 **전**의 모든 실패 — 없는 결정, 없는 challenge, 틀린 `state`, 교환되지 않는 코드, 이미 닫힌 challenge | **`403` 하나, 같은 페이지 하나.** 상태 코드로 결정 식별자의 존재를 알아낼 수 없어야 한다(`POST /external`의 균일 403과 같은 이유) |
+| 교환에 성공한 **뒤**의 실패 — 약한 `acr`, 오래된 `auth_time`, 어긋난 `nonce`, 이미 소비된 correlator | 무엇을 할 수 있는지 말하는 페이지. 이 지점의 상대는 `state`를 쥔 주체이지 낯선 사람이 아니다 |
+| STAMP 쪽 장애 | `500`과 "아무것도 기록되지 않았다" |
+
+**충족되지 않은 `acr`는 이 경로에서도 거절된다.** S1이 확인했듯 IdP는 충족하지 못한 `acr` 요청을 오류가 아니라 침묵 강등으로 답하므로, 교환된 `id_token`의 `acr` 검증이 유일한 방어선이다. 판정은 challenge 핸들러 한 곳에서만 일어나고 콜백 표면은 아무것도 판정하지 않는다.
+
+**PKCE는 선택이 아니다.** 인가 요청은 `code_challenge`와 `code_challenge_method=S256`을 싣는다. 데모 realm의 `stamp-stepup`처럼 challenge method가 등록된 클라이언트에서 Keycloak은 그것을 **요구사항**으로 읽고, 없는 요청을 `error=invalid_request`로 거절한다(U2 실측). verifier는 challenge 행에 살며(KTD3) 어떤 응답에도 나가지 않는다.
 
 ### deny의 `reason`
 

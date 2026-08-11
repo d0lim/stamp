@@ -22,7 +22,9 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,6 +40,7 @@ import (
 	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/challenge/mfa"
 	"github.com/d0lim/stamp/internal/fact"
+	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/store"
 )
@@ -139,12 +142,35 @@ var testKey = sync.OnceValue(func() *rsa.PrivateKey {
 type mockIdP struct {
 	server *httptest.Server
 	key    *rsa.PrivateKey
+
+	// mu guards the pending authorizations the token endpoint redeems.
+	mu      sync.Mutex
+	pending map[string]*pendingAuthorization
+	// exchanges counts token calls, so "no code was spent" is an assertion.
+	exchanges int
+}
+
+// pendingAuthorization is one authorization code this IdP would honour.
+//
+// It holds what the measured Keycloak holds between the redirect and the token
+// call: the PKCE commitment, the redirect target, the nonce, and the
+// authentication the code is worth. Recording them here rather than trusting the
+// token request is what makes the mock able to refuse the way the real one did.
+type pendingAuthorization struct {
+	challenge   string
+	redirectURI string
+	nonce       string
+	subject     string
+	acr         string
+	authTime    time.Time
+	spent       bool
 }
 
 func newMockIdP(t *testing.T) *mockIdP {
 	t.Helper()
-	m := &mockIdP{key: testKey()}
+	m := &mockIdP{key: testKey(), pending: map[string]*pendingAuthorization{}}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/token", m.serveToken)
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		doc := map[string]any{"keys": []map[string]string{{
 			"kty": "RSA",
@@ -181,21 +207,40 @@ func (m *mockIdP) token(t *testing.T, subject, clientID string) string {
 
 func (m *mockIdP) sign(t *testing.T, claims map[string]any) string {
 	t.Helper()
-	header := map[string]string{"alg": "RS256", "kid": testKeyID, "typ": "JWT"}
-	encode := func(v any) string {
-		data, err := json.Marshal(v)
-		if err != nil {
-			t.Fatalf("marshal token part: %v", err)
-		}
-		return base64.RawURLEncoding.EncodeToString(data)
-	}
-	signing := encode(header) + "." + encode(claims)
-	digest := sha256.Sum256([]byte(signing))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, m.key, crypto.SHA256, digest[:])
+	token, err := m.signClaims(claims)
 	if err != nil {
 		t.Fatalf("sign token: %v", err)
 	}
-	return signing + "." + base64.RawURLEncoding.EncodeToString(sig)
+	return token
+}
+
+// signClaims is the signing itself, separated so the token endpoint can call it
+// from the server's goroutine — where a t.Fatalf would be a data race rather
+// than a failure.
+func (m *mockIdP) signClaims(claims map[string]any) (string, error) {
+	header := map[string]string{"alg": "RS256", "kid": testKeyID, "typ": "JWT"}
+	encode := func(v any) (string, error) {
+		data, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return base64.RawURLEncoding.EncodeToString(data), nil
+	}
+	head, err := encode(header)
+	if err != nil {
+		return "", err
+	}
+	body, err := encode(claims)
+	if err != nil {
+		return "", err
+	}
+	signing := head + "." + body
+	digest := sha256.Sum256([]byte(signing))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, m.key, crypto.SHA256, digest[:])
+	if err != nil {
+		return "", err
+	}
+	return signing + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
 func (m *mockIdP) workload(t *testing.T, id string) string { return m.token(t, id, testWorkload) }
@@ -222,6 +267,102 @@ func (m *mockIdP) stepUp(t *testing.T, subject, acr string, authTime time.Time, 
 		"nonce":     nonce,
 	}
 	return m.sign(t, claims)
+}
+
+// authorize plays the browser's half of a step-up.
+//
+// It reads the authorization URL the challenge published — which is the only
+// place the nonce, the PKCE challenge and the per-challenge redirect target
+// exist outside the challenge row — and registers a code the token endpoint will
+// honour. The test never sees the verifier, exactly as the browser never does.
+func (m *mockIdP) authorize(t *testing.T, authorizationURL, subject, acr string, authTime time.Time,
+) (code, state string) {
+	t.Helper()
+	u, err := url.Parse(authorizationURL)
+	if err != nil {
+		t.Fatalf("parse the published authorization url: %v", err)
+	}
+	q := u.Query()
+	if got := q.Get("code_challenge_method"); got != identity.PKCEMethod {
+		t.Fatalf("code_challenge_method = %q, want %q: the measured demo idp refuses a request without it",
+			got, identity.PKCEMethod)
+	}
+	if q.Get("code_challenge") == "" {
+		t.Fatal("the authorization request carries no pkce challenge")
+	}
+	code = "code-" + strconv.Itoa(len(m.pending)) + "-" + q.Get("state")[:8]
+	m.mu.Lock()
+	m.pending[code] = &pendingAuthorization{
+		challenge:   q.Get("code_challenge"),
+		redirectURI: q.Get("redirect_uri"),
+		nonce:       q.Get("nonce"),
+		subject:     subject,
+		acr:         acr,
+		authTime:    authTime,
+	}
+	m.mu.Unlock()
+	return code, q.Get("state")
+}
+
+// serveToken redeems a code the way the measured Keycloak did: `invalid_grant`
+// for a code that is unknown, spent, presented with the wrong verifier, or
+// presented against a different redirect target.
+func (m *mockIdP) serveToken(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	m.mu.Lock()
+	m.exchanges++
+	auth, known := m.pending[r.PostForm.Get("code")]
+	m.mu.Unlock()
+
+	refuse := func() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"Code not valid"}`))
+	}
+	if !known || r.PostForm.Get("grant_type") != "authorization_code" {
+		refuse()
+		return
+	}
+	m.mu.Lock()
+	spent := auth.spent
+	auth.spent = true
+	m.mu.Unlock()
+	if spent {
+		refuse()
+		return
+	}
+	if identity.PKCEChallenge(r.PostForm.Get("code_verifier")) != auth.challenge {
+		refuse()
+		return
+	}
+	if r.PostForm.Get("redirect_uri") != auth.redirectURI {
+		refuse()
+		return
+	}
+
+	token, err := m.signClaims(map[string]any{
+		"iss":       m.server.URL,
+		"sub":       auth.subject,
+		"aud":       testAudience,
+		"azp":       testConsole,
+		"iat":       time.Now().Add(-time.Minute).Unix(),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+		"acr":       auth.acr,
+		"auth_time": auth.authTime.Unix(),
+		"nonce":     auth.nonce,
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"id_token":"` + token + `","token_type":"Bearer"}`))
+}
+
+func (m *mockIdP) tokenCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.exchanges
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +502,7 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 			AuthorizationEndpoint: idp.server.URL + "/authorize",
 			ClientID:              testConsole,
 			RedirectURI:           "http://127.0.0.1:1/callback",
+			TokenEndpoint:         idp.server.URL + "/token",
 			// The mock IdP is plaintext loopback, which is the one place an
 			// authorization code over http is not a code handed to the network.
 			AllowInsecureTransport: true,

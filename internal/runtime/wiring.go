@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -456,7 +457,14 @@ func (a *App) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	mfaCallback, err := api.NewMFA(api.MFAConfig{Decisions: submitter, Tokens: verifier})
+	// The decision service is both the submitter and the redeemer: redeeming an
+	// IdP redirect is routing it to the challenge that sent it, and the
+	// lifecycle is what knows which challenge that is.
+	mfaCallback, err := api.NewMFA(api.MFAConfig{
+		Decisions: submitter,
+		Tokens:    verifier,
+		Redeemer:  plane,
+	})
 	if err != nil {
 		return err
 	}
@@ -1046,10 +1054,25 @@ func (a *App) challengeHandlers(quorum *challenge.Quorum, gate *fact.Gate,
 // behind it. Every other failure stays a failure.
 func (a *App) delegatedMFA() (*mfa.Delegated, error) {
 	cfg := a.cfg
+	// R42: a client secret arrives from a file, never from a value. Empty is the
+	// normal case — a step-up client is public and PKCE is the proof.
+	var clientSecret string
+	if path := cfg.MFA.ClientSecretFile; path != "" {
+		raw, rerr := os.ReadFile(path) //nolint:gosec // an operator-supplied secret mount path
+		if rerr != nil {
+			return nil, fmt.Errorf("runtime: reading %s: %w", EnvMFAClientSecret, rerr)
+		}
+		clientSecret = strings.TrimSpace(string(raw))
+		if clientSecret == "" {
+			return nil, fmt.Errorf("runtime: %s names an empty file", EnvMFAClientSecret)
+		}
+	}
 	requests, err := identity.NewStepUp(identity.StepUpConfig{
 		AuthorizationEndpoint:  cfg.MFA.AuthorizationEndpoint,
 		ClientID:               cfg.MFA.ClientID,
 		RedirectURI:            cfg.MFA.RedirectURI,
+		TokenEndpoint:          cfg.MFA.TokenEndpoint,
+		ClientSecret:           clientSecret,
 		Scopes:                 cfg.MFA.Scopes,
 		AllowInsecureTransport: cfg.MFA.AllowInsecureTransport,
 	})

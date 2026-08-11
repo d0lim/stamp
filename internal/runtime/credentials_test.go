@@ -369,6 +369,8 @@ func withStepUp(cfg *Config) {
 	cfg.MFA.AuthorizationEndpoint = "https://idp.internal.example/authorize"
 	cfg.MFA.ClientID = "stamp-stepup"
 	cfg.MFA.RedirectURI = "https://stamp-callback.example/mfa/return"
+	// Required since a step-up has to redeem its code; never called here.
+	cfg.MFA.TokenEndpoint = "https://idp.internal.example/token"
 }
 
 // groupDirectory is a stub SCIM-shaped group directory that records the

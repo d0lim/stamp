@@ -59,7 +59,7 @@ import (
 
 // ContractVersion is the semantic version of the interfaces in this file. It is
 // bumped when the contract changes, not when a handler does.
-const ContractVersion = "1.1.0"
+const ContractVersion = "1.2.0"
 
 // Errors handlers and the registry return as sentinels. A handler may wrap them
 // with detail; callers branch with errors.Is.
@@ -87,6 +87,17 @@ var (
 	// ErrUnsupportedSpec reports a declaration a handler cannot serve — the
 	// direct MFA mode in v1, for instance.
 	ErrUnsupportedSpec = errors.New("challenge: unsupported challenge specification")
+
+	// ErrNotRedeemable reports a Redeem against a challenge kind that has no
+	// transport of its own to redeem — a quorum is answered by people posting to
+	// the approval endpoint, not by a redirect coming back.
+	ErrNotRedeemable = errors.New("challenge: challenge has no redirect to redeem")
+
+	// ErrRedemptionRefused reports a callback the challenge would not redeem: a
+	// `state` that is not the one it minted, an authorization code the IdP would
+	// not exchange, a challenge whose completion is already spent. It is
+	// deliberately one sentinel for the whole family — see [Redeemer].
+	ErrRedemptionRefused = errors.New("challenge: the callback was not redeemed")
 )
 
 // State is one challenge's progress state.
@@ -338,6 +349,54 @@ type View struct {
 // this seam exists to avoid.
 type Viewer interface {
 	View(ctx context.Context, req ViewRequest) (View, error)
+}
+
+// RedeemRequest carries a challenge's own redirect back to the handler that
+// sent it.
+type RedeemRequest struct {
+	Instance Instance
+	Decision DecisionContext
+	Detail   json.RawMessage
+	// Params is the callback's query, as received. It is the transport's own
+	// vocabulary — `code` and `state` for a step-up — so the surface passes it
+	// through rather than naming fields it would then have to keep in step with
+	// whichever transports exist.
+	Params map[string]string
+	Now    time.Time
+}
+
+// Redemption is what a redeemed callback turned into.
+//
+// It is not a submission. A callback carries a credential the deployment has
+// not verified yet, and verifying credentials is the identity package's job on
+// the surface that received it — so a redemption hands back the raw credential
+// and the body that will accompany it, and the surface completes the round by
+// calling Submit with the caller that credential proved.
+type Redemption struct {
+	// Credential is the raw token the redirect was worth, for the surface to
+	// verify. A redemption that produced none is a redemption that proved
+	// nothing, and the surface refuses it the way it refuses one that will not
+	// verify.
+	Credential string
+	// Payload is the submission body to send back through Submit.
+	Payload json.RawMessage
+}
+
+// Redeemer turns a challenge's own redirect into the makings of a submission.
+//
+// It is optional, and separate from Handler for the reason [Targeter] and
+// [Viewer] are: the contract stays at three verbs. Only a kind that sent
+// somebody somewhere has a redirect to redeem, and a handler that does not
+// implement this has none — which is why the lifecycle answers
+// [ErrNotRedeemable] rather than inventing a default.
+//
+// Every refusal is [ErrRedemptionRefused] with the reason wrapped for the audit
+// trail and never for the response. The party arriving here followed a link; it
+// is not a caller the deployment has authenticated, and the difference between
+// "that state is wrong" and "that code is spent" is a difference an operator
+// needs and a stranger does not.
+type Redeemer interface {
+	Redeem(ctx context.Context, req RedeemRequest) (Redemption, error)
 }
 
 // Registry maps challenge kinds to their handlers.
