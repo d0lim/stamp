@@ -132,12 +132,40 @@ func retryAfterSeconds(l stream.RateLimit) int {
 }
 
 // decideLimiter charges the two budgets and reports which one ran out.
+//
+// The two budgets get two tables, and that is the part worth stating, because
+// one table with two key namespaces in it is the shape this started as. A
+// bounded table refuses when it is full and a sweep frees nothing, so the
+// entries in it are a resource the keys compete for: a flood of invented
+// subjects would fill a shared table, and the next caller to arrive — one that
+// had spent none of its own budget — would be refused for pressure it did not
+// create. Prefixing the keys kept the two namespaces from naming the same
+// bucket; it did nothing about the one cap they were both spending.
 type decideLimiter struct {
-	limiter *stream.Limiter
-	caller  stream.RateLimit
-	subject stream.RateLimit
+	callers  *stream.Limiter
+	subjects *stream.Limiter
+	caller   stream.RateLimit
+	subject  stream.RateLimit
 }
 
+// newDecideLimiter gives each budget a table of maxEntries.
+//
+// maxEntries bounds each table rather than the two together, so the split costs
+// memory rather than capacity. Measured, a limiter entry — the bucket, the map
+// slot and the key's bytes at the length the decide surface's keys actually run
+// to — is 136 bytes, so a table at the 8192-entry default holds about 1.06 MiB
+// and the second one costs that again. That is the whole of the price, and it
+// is paid by a process that already holds a policy set, a schema cache and a
+// database pool.
+//
+// The alternative was to divide the existing 8192 between the two tables, and it
+// is the wrong trade in the direction that matters. The caller table needs one
+// entry per credential — a deployment has as many as it has PEPs — while the
+// subject table needs one per distinct subject in flight, which is the number
+// that grows with traffic. Halving that one narrows the window before
+// sweep-or-refuse starts refusing legitimate requests, which is to say it would
+// buy back a megabyte by making the availability property worse under exactly
+// the load this limit exists for.
 func newDecideLimiter(caller, subject stream.RateLimit, maxEntries int, now func() time.Time) *decideLimiter {
 	// A zero field takes the default for that field, so an operator who raised
 	// the burst does not have to restate the rate.
@@ -154,20 +182,24 @@ func newDecideLimiter(caller, subject stream.RateLimit, maxEntries int, now func
 		subject.Burst = DefaultDecideSubjectRate.Burst
 	}
 	return &decideLimiter{
-		limiter: stream.NewLimiter(maxEntries, now),
-		caller:  caller,
-		subject: subject,
+		callers:  stream.NewLimiter(maxEntries, now),
+		subjects: stream.NewLimiter(maxEntries, now),
+		caller:   caller,
+		subject:  subject,
 	}
 }
 
 // allowCaller charges one decide against the caller's budget.
 //
-// The key is prefixed so that a caller identifier can never collide with a
-// subject identifier: the two namespaces are unrelated and both are attacker
-// influenced, and one budget answering for the other is a limit that can be
-// spent by someone it was not measuring.
+// The key is the caller identifier unprefixed, because the table it goes in
+// holds nothing else. A caller identifier and a subject identifier are unrelated
+// strings from unrelated namespaces and both are attacker influenced, so one
+// bucket answering for both would be a budget spendable by someone it was not
+// measuring — that guarantee used to be a `\x1f` prefix on a shared table's key
+// and is now the separation of the tables themselves. Merging them back
+// reintroduces both the collision and the crowding out above it.
 func (l *decideLimiter) allowCaller(callerID string) bool {
-	return l.limiter.Allow("caller\x1f"+callerID, l.caller, 1)
+	return l.callers.Allow(callerID, l.caller, 1)
 }
 
 // allowSubject charges one decide against the subject's budget.
@@ -178,7 +210,7 @@ func (l *decideLimiter) allowCaller(callerID string) bool {
 // identifier be charged twice as much by being called two things. No caller, for
 // the reason at the top of this file.
 func (l *decideLimiter) allowSubject(subjectID string) bool {
-	return l.limiter.Allow("subject\x1f"+subjectID, l.subject, 1)
+	return l.subjects.Allow(subjectID, l.subject, 1)
 }
 
 // rateRefusal is everything the surface has to say about a request it shed.
