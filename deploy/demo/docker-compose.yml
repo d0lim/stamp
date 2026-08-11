@@ -1,0 +1,209 @@
+# The demo bundle's default profile: Postgres, Keycloak, one STAMP process.
+#
+# There is no broker here. Velocity limits are fed over the HTTP ingest route,
+# which every install has, and Kafka is docker-compose.kafka.yml — an optional
+# overlay, so that both ingestion adapters are exercised and neither is required
+# (D11). The two profiles have to produce the same velocity deny; the quickstart
+# asserts that against both.
+#
+# Every credential this file needs is required with no default. They live in
+# deploy/demo/.env, which scripts/quickstart.sh generates with fresh random
+# values on first run and which is not tracked. That is deliberate and it is
+# this bundle's answer to R42's "a demo credential must not start a non-demo
+# deployment": there is no demo credential in the repository to start one with.
+# A bare `docker compose up` before the script has run fails naming the script.
+
+name: stamp-demo
+
+services:
+  # ---------------------------------------------------------------------------
+  # state: the one-shot that creates what the demo cannot ship.
+  #
+  # The audit checkpoint signing key is generated here rather than committed,
+  # for the same reason the client secrets are. It also owns the state volume's
+  # permissions: the STAMP image is distroless and runs as uid 65532, and a
+  # named volume arrives root-owned, so somebody with a shell has to hand it
+  # over before the checkpointer can write.
+  # ---------------------------------------------------------------------------
+  state:
+    image: alpine/openssl:3.5.7
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ ! -f /state/checkpoint.key ]; then
+          openssl genpkey -algorithm ed25519 -out /state/checkpoint.key
+          openssl pkey -in /state/checkpoint.key -pubout -out /state/checkpoint.pub
+        fi
+        mkdir -p /state/export
+        chmod 600 /state/checkpoint.key
+        chmod 644 /state/checkpoint.pub
+        chown -R 65532:65532 /state
+        echo "state ready"
+    volumes:
+      - state:/state
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: stamp
+      POSTGRES_PASSWORD: ${DEMO_POSTGRES_PASSWORD:?run scripts/quickstart.sh once; it generates deploy/demo/.env}
+      POSTGRES_DB: stamp
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stamp -d stamp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      # The demo's database is disposable on purpose: `docker compose down`
+      # leaves nothing behind, so "a clean environment" is one command and not a
+      # volume-pruning ritual.
+      - /var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # keycloak: the demo IdP, confirmed by U0's spike.
+  #
+  # KC_HOSTNAME is the browser-facing origin, so `iss` is the address the
+  # quickstart and the console both reach it at. STAMP is given that issuer to
+  # pin and the container-internal address to fetch JWKS from — which is exactly
+  # what STAMP_OIDC_JWKS_URL exists for, and why the demo needs no DNS tricks.
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.7
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${DEMO_KEYCLOAK_ADMIN_PASSWORD:?run scripts/quickstart.sh once; it generates deploy/demo/.env}
+      KC_HOSTNAME: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      # Read by the realm import's ${...} placeholders. Nothing in the realm
+      # file is a credential; every credential in it is one of these.
+      DEMO_CONSOLE_URL: http://localhost:${DEMO_CONSOLE_PORT:-18782}
+      DEMO_CALLBACK_URL: http://localhost:${DEMO_CALLBACK_PORT:-18783}
+      DEMO_USER_PASSWORD: ${DEMO_USER_PASSWORD:?run scripts/quickstart.sh once; it generates deploy/demo/.env}
+      DEMO_PEP_CLIENT_SECRET: ${DEMO_PEP_CLIENT_SECRET:?run scripts/quickstart.sh once; it generates deploy/demo/.env}
+      DEMO_INGEST_CLIENT_SECRET: ${DEMO_INGEST_CLIENT_SECRET:?run scripts/quickstart.sh once; it generates deploy/demo/.env}
+    volumes:
+      - ./keycloak/stamp-demo-realm.json:/opt/keycloak/data/import/stamp-demo-realm.json:ro
+    ports:
+      - "${DEMO_KEYCLOAK_PORT:-18780}:8080"
+    healthcheck:
+      # The image carries no curl and no wget. bash and the management listener
+      # are what it does have, which is the check Keycloak's own documentation
+      # reaches for.
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  stamp:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: stamp:demo
+    command: ["--roles=all"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      state:
+        condition: service_completed_successfully
+    environment:
+      STAMP_DSN: postgres://stamp:${DEMO_POSTGRES_PASSWORD}@postgres:5432/stamp?sslmode=disable
+
+      # The trust boundary. The issuer is the browser-facing origin because that
+      # is what lands in `iss`; the JWKS URL is the container-internal one.
+      STAMP_OIDC_ISSUER: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo
+      STAMP_OIDC_JWKS_URL: http://keycloak:8080/realms/stamp-demo/protocol/openid-connect/certs
+      STAMP_OIDC_AUDIENCE: stamp
+      STAMP_OIDC_WORKLOAD_CLIENTS: stamp-pep,stamp-ingest
+      # Plaintext OIDC endpoints. This is the flag that makes the demo a demo,
+      # and docs/security.md lists it first among the settings a real
+      # deployment must not carry over.
+      STAMP_OIDC_ALLOW_INSECURE_TRANSPORT: "true"
+      STAMP_APPROVER_ISSUER: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo
+
+      STAMP_PEP_ADDR: ":8080"
+      STAMP_CONSOLE_ADDR: ":8081"
+      # The callback surface carries the delegated-MFA completion and the HTTP
+      # ingest route, so the demo binds it. A deployment that runs neither
+      # leaves it unbound, which is the default.
+      STAMP_CALLBACK_ADDR: ":8082"
+      STAMP_CALLBACK_BASE_URL: http://localhost:${DEMO_CALLBACK_PORT:-18783}
+
+      # Velocity. One source, fed over HTTP ingest; the Kafka overlay replaces
+      # both of these with the broker-fed equivalents and nothing else changes.
+      STAMP_STREAM_SOURCES: >-
+        [{"name":"transferred_today","metric":"transfer_amount","adapter":"http-ingest",
+          "window":"24h","bucket_width":"1h",
+          "params":[{"name":"account","type":"string"}],"returns":"double","on_error":"deny"}]
+      STAMP_INGEST_CREDENTIALS: >-
+        [{"caller_id":"workload:http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo#svc-ingest",
+          "scope":[{"source":"transferred_today","metric":"transfer_amount"}],
+          "rate":{"per_second":100,"burst":200}}]
+
+      # Delegated MFA, step-up redirect (D26). CIBA is deliberately unset: U0
+      # established that Keycloak's CIBA grant needs an external authentication
+      # device server this bundle does not ship.
+      STAMP_MFA_ACR_VALUES: "1"
+      STAMP_MFA_AUTHORIZATION_ENDPOINT: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo/protocol/openid-connect/auth
+      STAMP_MFA_CLIENT_ID: stamp-stepup
+      STAMP_MFA_REDIRECT_URI: http://localhost:${DEMO_CALLBACK_PORT:-18783}/decisions/
+      STAMP_MFA_TOKEN_CLIENT_ID: stamp-stepup
+      STAMP_MFA_ALLOW_INSECURE_TRANSPORT: "true"
+
+      # The console. An empty API base address means same-origin, which is what
+      # a single-container install is.
+      STAMP_CONSOLE_API_BASE_URL: ""
+      STAMP_CONSOLE_OIDC_CLIENT_ID: stamp-console
+      STAMP_CONSOLE_OIDC_AUTHORIZATION_ENDPOINT: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo/protocol/openid-connect/auth
+      STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo/protocol/openid-connect/token
+      STAMP_CONSOLE_OIDC_END_SESSION_ENDPOINT: http://localhost:${DEMO_KEYCLOAK_PORT:-18780}/realms/stamp-demo/protocol/openid-connect/logout
+      STAMP_CONSOLE_ALLOW_INSECURE_TRANSPORT: "true"
+
+      # Audit checkpoints. Ten seconds rather than the five-minute default so
+      # that `stamp audit verify` has something signed to check within the
+      # quickstart's runtime; a real deployment leaves the default alone.
+      STAMP_AUDIT_CHECKPOINT_KEY_FILE: /var/lib/stamp/checkpoint.key
+      STAMP_AUDIT_CHECKPOINT_KEY_ID: demo-checkpoint
+      STAMP_AUDIT_CHECKPOINT_SINK_FILE: /var/lib/stamp/checkpoints.jsonl
+      STAMP_AUDIT_CHECKPOINT_INTERVAL: 10s
+      # STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS is deliberately not set here. It is
+      # the verifier's side of the arrangement and it names *retired* key
+      # identifiers; the active key's public half is derived from the signing
+      # key, and naming it here is a configuration warning. The quickstart runs
+      # `stamp audit verify` the way an auditor does — with the public key and
+      # no signing key at all.
+
+      # The check plane holds a snapshot and refreshes it on a timer, so a
+      # revision that is in force is not yet the set every replica is judging
+      # with. Two seconds rather than the default keeps the demo's "the answer
+      # changed" steps from being a wait; a real deployment has no reason to
+      # poll this hard.
+      STAMP_POLICY_REFRESH_INTERVAL: 2s
+
+      STAMP_INSTANCE_ID: stamp-demo
+      STAMP_AUDIT_WRITER_ID: stamp-demo
+    volumes:
+      - state:/var/lib/stamp
+      - ./policies:/demo/policies:ro
+    ports:
+      - "${DEMO_PEP_PORT:-18781}:8080"
+      - "${DEMO_CONSOLE_PORT:-18782}:8081"
+      - "${DEMO_CALLBACK_PORT:-18783}:8082"
+    # No healthcheck. The image is distroless — no shell, no curl — and the one
+    # probe it could run from inside is `/stamp --version`, which answers the
+    # same whether or not the listeners came up. A check that cannot fail is
+    # worse than none, so readiness is the quickstart polling /healthz from
+    # outside, where the answer means something.
+
+volumes:
+  state:

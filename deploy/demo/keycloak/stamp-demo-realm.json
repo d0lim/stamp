@@ -1,0 +1,223 @@
+{
+  "realm": "stamp-demo",
+  "displayName": "STAMP demo",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "accessTokenLifespan": 1800,
+  "ssoSessionIdleTimeout": 3600,
+  "ssoSessionMaxLifespan": 36000,
+
+  "roles": {
+    "realm": [
+      { "name": "approver", "description": "May act on the approval inbox." },
+      { "name": "operator", "description": "May author policy and read the audit views." }
+    ]
+  },
+
+  "clients": [
+    {
+      "clientId": "stamp-console",
+      "name": "STAMP operator console",
+      "description": "The embedded console. Authorization code with PKCE, public client, tokens held in memory only.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["${DEMO_CONSOLE_URL}/console/*"],
+      "webOrigins": ["${DEMO_CONSOLE_URL}"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${DEMO_CONSOLE_URL}/console/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "stamp-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "stamp",
+            "access.token.claim": "true",
+            "id.token.claim": "true"
+          }
+        },
+        {
+          "name": "stamp-capabilities",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "stamp_capabilities",
+            "claim.name": "stamp_capabilities",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "true"
+          }
+        },
+        {
+          "name": "stamp-roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "access.token.claim": "true",
+            "id.token.claim": "true"
+          }
+        }
+      ]
+    },
+
+    {
+      "clientId": "stamp-stepup",
+      "name": "STAMP delegated MFA (step-up redirect)",
+      "description": "D26's default delegation path. The redirect target is the callback surface's per-challenge path.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["${DEMO_CALLBACK_URL}/decisions/*"],
+      "webOrigins": ["${DEMO_CALLBACK_URL}"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "stamp-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "stamp",
+            "access.token.claim": "true",
+            "id.token.claim": "true"
+          }
+        }
+      ]
+    },
+
+    {
+      "clientId": "stamp-pep",
+      "name": "Demo policy enforcement point",
+      "description": "The workload that calls check() and decide(). Client credentials; the secret is generated per installation.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "secret": "${DEMO_PEP_CLIENT_SECRET}",
+      "protocolMappers": [
+        {
+          "name": "stamp-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "stamp",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+
+    {
+      "clientId": "stamp-ingest",
+      "name": "Demo event producer",
+      "description": "Writes velocity events over the HTTP ingest route. Scoped by STAMP_INGEST_CREDENTIALS, not by anything in the token.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "secret": "${DEMO_INGEST_CLIENT_SECRET}",
+      "protocolMappers": [
+        {
+          "name": "stamp-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "stamp",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+
+  "users": [
+    {
+      "id": "ann",
+      "username": "ann",
+      "email": "ann@stamp.demo",
+      "firstName": "Ann",
+      "lastName": "Ansell",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "${DEMO_USER_PASSWORD}", "temporary": false }
+      ],
+      "realmRoles": ["approver", "operator"],
+      "attributes": {
+        "stamp_capabilities": ["policy.author", "audit.read"]
+      }
+    },
+    {
+      "id": "bob",
+      "username": "bob",
+      "email": "bob@stamp.demo",
+      "firstName": "Bob",
+      "lastName": "Bhatt",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "${DEMO_USER_PASSWORD}", "temporary": false }
+      ],
+      "realmRoles": ["approver"]
+    },
+    {
+      "id": "cid",
+      "username": "cid",
+      "email": "cid@stamp.demo",
+      "firstName": "Cid",
+      "lastName": "Cortez",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "${DEMO_USER_PASSWORD}", "temporary": false }
+      ],
+      "realmRoles": ["approver"]
+    },
+    {
+      "id": "dana",
+      "username": "dana",
+      "email": "dana@stamp.demo",
+      "firstName": "Dana",
+      "lastName": "Dorsey",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        { "type": "password", "value": "${DEMO_USER_PASSWORD}", "temporary": false }
+      ]
+    },
+    {
+      "id": "svc-pep",
+      "username": "service-account-stamp-pep",
+      "enabled": true,
+      "serviceAccountClientId": "stamp-pep"
+    },
+    {
+      "id": "svc-ingest",
+      "username": "service-account-stamp-ingest",
+      "enabled": true,
+      "serviceAccountClientId": "stamp-ingest"
+    }
+  ]
+}
