@@ -19,15 +19,23 @@ import (
 
 // missOfferedRPS paces the forced-miss scenario.
 //
-// It is not a tuning knob, it is the boundary of what the miss path can be
-// asked on a single host. Every miss opens a TCP connection, because the fact
-// plane's egress client leaves MaxIdleConnsPerHost at Go's default of two, and
-// the sustainable connection rate over loopback is ephemeral ports divided by
-// TIME_WAIT: about 550/s on this macOS host and about 470/s on a stock Linux
-// runner. 300 sits below both with room for the connections the rest of the
-// process needs, and the unpaced attempt is what taught us the number — driven
-// flat out, the third repeat of this scenario stops measuring the check path
-// and starts reporting `connect: cannot assign requested address` at 30k/s.
+// It is not a tuning knob, it is the boundary of what the miss path could be
+// asked on a single host when this number was measured. At that time every miss
+// opened a TCP connection, because the fact plane's egress client left
+// MaxIdleConnsPerHost at Go's default of two, and the sustainable connection
+// rate over loopback is ephemeral ports divided by TIME_WAIT: about 550/s on
+// this macOS host and about 470/s on a stock Linux runner. 300 sits below both
+// with room for the connections the rest of the process needs, and the unpaced
+// attempt is what taught us the number — driven flat out, the third repeat of
+// this scenario stopped measuring the check path and started reporting
+// `connect: cannot assign requested address` at 30k/s.
+//
+// The egress client now keeps up to egressMaxIdleConns idle connections per
+// host, so the premise this number rests on no longer holds. 300 is left
+// unchanged anyway: what the new ceiling is has not been measured, and a paced
+// number that is merely conservative still reports a valid latency
+// distribution, while an unmeasured higher one would report a number nobody
+// has stood behind. Raising it is a measurement, not an edit.
 //
 // The consequence is stated in the artifact rather than hidden: this scenario
 // reports a latency distribution at a known offered rate, and the maximum QPS

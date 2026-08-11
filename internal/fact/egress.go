@@ -27,6 +27,11 @@ var ErrBlocked = errors.New("destination is not permitted by the egress allowlis
 // cap of their own.
 const DefaultMaxResponseBytes int64 = 1 << 20
 
+// egressMaxIdleConns is the idle connection budget, and it is deliberately one
+// number serving as both the global cap and the per-host cap. The reasoning is
+// above newEgressClient, where the two are set.
+const egressMaxIdleConns = 32
+
 // EgressConfig is the operator's deployment configuration for outbound fact
 // calls. It is the whole of what a fact source is allowed to reach; nothing in
 // a policy document adds to it.
@@ -295,9 +300,11 @@ func (g *Gate) DialContext(ctx context.Context, network, addr string) (net.Conn,
 // Every field here is load-bearing.
 //
 // DialContext is the gate's, so the address pin applies to every connection.
-// TLSClientConfig is left without ServerName so the transport fills it in from
-// the request URL, and without InsecureSkipVerify because no configuration in
-// this package turns verification off.
+// Every connection, not every request — the difference is the subject of the
+// note below, and it is a real one. TLSClientConfig is left without ServerName
+// so the transport fills it in from the request URL, and without
+// InsecureSkipVerify because no configuration in this package turns
+// verification off.
 //
 // Proxy is nil rather than http.ProxyFromEnvironment. An environment proxy
 // would take the destination back out of the dialler's hands — the connection
@@ -307,6 +314,65 @@ func (g *Gate) DialContext(ctx context.Context, network, addr string) (net.Conn,
 // Jar is nil and there is no CheckRedirect that follows anything, for the same
 // reason: a fact call carries no ambient authority and takes no steps the
 // declaration did not name.
+//
+// # Why pooling connections does not weaken the pin
+//
+// A request that rides a pooled connection does not call DialContext, so it
+// does not resolve the name and does not run checkAll. That is not a hole, and
+// working out why is what settled the size of the pool rather than the other
+// way round.
+//
+// The check the dialler performs is a question about an address:
+// may this process open a socket to this peer? An established socket's peer
+// cannot be changed by anything that happens afterwards — not by a DNS record,
+// not by the remote end. So a reused connection carries the request to the
+// address the gate approved, which is the same thing the pin was there to
+// guarantee. It is the opposite of a bypass: a name whose meaning has drifted
+// is exactly what a pinned socket refuses to follow.
+//
+// The check is also a pure function of the address and the gate's ranges, both
+// of which are fixed for a gate's lifetime. An address the gate admitted cannot
+// become one it would refuse. There is no moment at which a pooled connection
+// is holding open something the gate has since decided against.
+//
+// What reuse does cost is promptness. If the operator's endpoint moves — a
+// legitimate DNS change, or a rebinding attempt — the pool keeps talking to the
+// old address until the connection is dialled again. IdleConnTimeout bounds
+// that for a deployment whose traffic is bursty enough to let the connection go
+// idle; under sustained load it does not, because http.Transport has no maximum
+// connection lifetime and a busy connection is never idle. The delay is
+// acceptable because what it delays is a change of destination among addresses
+// the gate permits, not an escape to one it does not. The per-request checks
+// that do still run every time — the allowlist, the scheme, the absence of
+// credentials in the URL — are in httpSource.Fetch, and they are the ones whose
+// answer an operator can change.
+//
+// Pooling is keyed by the requested host, so one host's request never inherits
+// another's connection; TestDifferentHostsDoNotShareAConnection and
+// TestABlockedHostCannotInheritAnApprovedConnection hold that premise down,
+// because if it were false the reasoning above would collapse.
+//
+// ForceAttemptHTTP2 is left off, and that is now a decision rather than an
+// accident of the field being unset. Supplying a DialContext and a
+// TLSClientConfig already disables the automatic HTTP/2 upgrade, so these are
+// HTTP/1.1 connections and the pool is the HTTP/1.1 pool the tests above
+// describe. Turning HTTP/2 on would put a different pool underneath the same
+// claim, and that claim would have to be re-established before it could be
+// relied on.
+//
+// # The size of the pool
+//
+// MaxIdleConnsPerHost is set rather than left at Go's default of 2, which is
+// what made every concurrent fact call past the second open and discard a
+// socket, and what exhausted the loopback ephemeral port range under load.
+//
+// It is set to the same number as MaxIdleConns, from one constant, because an
+// egress allowlist is a list somebody wrote by hand and the ordinary deployment
+// has one or two fact origins on it. A per-host cap below the global one would
+// mean the common deployment can never use the budget it was given. Sharing the
+// budget costs a host nothing it can fail on: the per-host cap governs how many
+// idle connections are kept, not how many may be open, so a host that finds the
+// pool empty dials — it pays a handshake, it is not refused.
 func newEgressClient(g *Gate) *http.Client {
 	transport := &http.Transport{
 		Proxy:       nil,
@@ -315,7 +381,8 @@ func newEgressClient(g *Gate) *http.Client {
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    g.rootCAs,
 		},
-		MaxIdleConns:          32,
+		MaxIdleConns:          egressMaxIdleConns,
+		MaxIdleConnsPerHost:   egressMaxIdleConns,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: time.Second,
