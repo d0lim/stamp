@@ -427,32 +427,68 @@ describe('승인 바인딩 해시', () => {
 })
 
 // ---------------------------------------------------------------------------
-// R21: the four submission failures
+// R21: the submission failures
 // ---------------------------------------------------------------------------
 
-describe('제출 실패 4종', () => {
-  const cases: readonly (readonly [string, string])[] = [
-    ['expired', '만료되었습니다'],
-    ['not_collecting', '더 이상 제출을 받지 않습니다'],
-    ['not_an_approver', '기다리고 있지 않습니다'],
-    ['material_changed', '결정 내용이 바뀌어'],
+describe('제출 실패', () => {
+  // Status and code together, because they are what the server sends together.
+  // The one that changed is the last: `403 not_an_approver` is gone, and being
+  // outside the approver set now arrives as the same `404 not_found` a decision
+  // that never existed answers with (#38). The old case here stubbed a code the
+  // server no longer sends, and passed — a stub asserts against itself, so it
+  // stayed green while the branch it exercised became dead.
+  const cases: readonly (readonly [number, string, string])[] = [
+    [409, 'expired', '만료되었습니다'],
+    [409, 'not_collecting', '더 이상 제출을 받지 않습니다'],
+    [409, 'material_changed', '결정 내용이 바뀌어'],
+    [404, 'not_found', '존재하지 않거나, 당신에게 열려 있지 않습니다'],
   ]
 
-  for (const [code, phrase] of cases) {
+  for (const [status, code, phrase] of cases) {
     it(`${code}는 전용 문구와 후속 동작을 보여준다`, async () => {
       const user = userEvent.setup()
-      renderApproval({ submit: { status: 409, body: { error: code, message: 'server wording' } } })
+      renderApproval({ submit: { status, body: { error: code, message: 'server wording' } } })
       await entryList(17)
       await user.click(screen.getByTestId('expand-all'))
       await user.click(screen.getByTestId('approve'))
 
       const failure = await screen.findByTestId('submit-failure')
       expect(failure).toHaveTextContent(phrase)
-      // Every one of the four names a next step; a refusal with no next step is
-      // a dead end an approver cannot act on.
+      // Every one of them names a next step; a refusal with no next step is a
+      // dead end an approver cannot act on.
       expect(failure.querySelectorAll('p')).toHaveLength(2)
     })
   }
+
+  it('404는 없는 결정인지 남의 결정인지 말하지 않고, 승인함으로 돌려보낸다', async () => {
+    // The server made the two indistinguishable on purpose, so the console must
+    // not word one of them. What it can do is point at the surface that still
+    // tells the truth: the inbox lists what is waiting on you, and omitting what
+    // is not leaks nothing.
+    const user = userEvent.setup()
+    renderApproval({ submit: { status: 404, body: { error: 'not_found', message: 'no such decision or challenge' } } })
+    await entryList(17)
+    await user.click(screen.getByTestId('expand-all'))
+    await user.click(screen.getByTestId('approve'))
+
+    const failure = await screen.findByTestId('submit-failure')
+    expect(failure).toHaveTextContent('승인함 목록을 다시 읽으십시오')
+    for (const forbidden of ['기다리고 있지 않습니다', '권한이 없습니다']) {
+      expect(failure).not.toHaveTextContent(forbidden)
+    }
+  })
+
+  it('열 수 없는 승인 화면은 오류가 아니라 거부로 말한다', async () => {
+    // The read surface collapsed the same way the submission did, so the first
+    // load of a decision that is not yours answers 404. "읽지 못했습니다" would
+    // read as an outage and invite a retry that cannot succeed.
+    renderApproval({ review: { status: 404, body: { error: 'not_found', message: 'no such decision or challenge' } } })
+
+    const notice = await screen.findByTestId('review-unavailable')
+    expect(notice).toHaveTextContent('존재하지 않거나, 당신에게 열려 있지 않습니다')
+    expect(screen.queryByTestId('review-error')).toBeNull()
+    expect(screen.queryByText('승인 자료를 읽는 중입니다…')).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------

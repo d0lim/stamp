@@ -34,6 +34,21 @@ export class ApiError extends Error {
   get isForbidden(): boolean {
     return this.status === 403
   }
+
+  /**
+   * The server has nothing to give under this identifier.
+   *
+   * On the surfaces that act on one named decision — the approval submission and
+   * its review, the delegated cancellation, the audit detail — this is also the
+   * answer to "you may not have it". The server collapsed the two deliberately
+   * (#38): telling them apart would make the status code an oracle for whether
+   * an identifier names anything, which is what R40 exists to prevent. So a
+   * screen that reads this cannot tell which one happened, and must not write
+   * copy that claims to know.
+   */
+  get isNotFound(): boolean {
+    return this.status === 404
+  }
 }
 
 export class NetworkError extends Error {
