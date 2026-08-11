@@ -344,14 +344,28 @@ kafka:
 # An empty secretName leaves the setting unset, which is how a deployment that
 # declares no fact sources runs.
 #
-# Every tier mounts every configured document, including the split topology's
-# check tier, and that is a property of the binary rather than a shortcut here:
-# the composition root builds the fact, stream, ingest, group and external
-# registries before roles are applied (internal/runtime/wiring.go), so a process
-# whose environment names a document it cannot read fails to boot, and one that
-# is missing a declaration refuses to load the policies that use it. Narrowing
-# the credential-bearing documents to the tiers that need them is a runtime
-# change, not a chart change.
+# A document reaches the tiers that read it and no others, and where the line
+# falls is a property of the binary rather than a choice here — the chart
+# follows internal/runtime/credentials.go, and templates/_helpers.tpl says so at
+# the point it decides.
+#
+#   ingestCredentials  the consumer role. The grants authenticate an event
+#                      producer against the ingest route, which no other role
+#                      mounts.
+#   externalTargets    the decide and api roles. The webhook signing secret is
+#                      presented by a tier that can open a challenge, and api
+#                      can: applying a revision re-issues the challenges of the
+#                      decisions still open under it.
+#   the other four     every tier. They carry the source *declarations*, and
+#                      every process loads the policy set at boot: the schema
+#                      gate refuses a source of a kind no plane in the process
+#                      answers for, so a tier missing them is a tier that cannot
+#                      start rather than a tier holding less.
+#
+# idpGroupSources is the one in the second group that also carries a credential,
+# because one document holds both halves. The narrowing for it happens inside
+# the binary: a role that never resolves a group gets a declaration-only gate
+# that verifies the same schemas and dials nothing.
 documents:
   factSources:
     secretName: ""

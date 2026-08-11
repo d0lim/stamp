@@ -7,12 +7,20 @@ package runtime
 // what happens here is only assembly — which is why the file reads as a list.
 // Two properties of the assembly are not incidental, though.
 //
-// The whole dependency graph is built whatever roles are selected, and only the
-// components are role-gated. A stamp process talks to one database and holds one
-// audit writer no matter which subsystems it runs, so building half a graph
-// would buy nothing and would mean every constructor had to tolerate a nil
-// neighbour. What --roles decides is which routes are mounted and which loops
-// run, and that decision is made once, by the registry.
+// Almost the whole dependency graph is built whatever roles are selected, and
+// what --roles decides is which routes are mounted and which loops run — a
+// decision made once, by the registry. A stamp process talks to one database
+// and holds one audit writer no matter which subsystems it runs, so building
+// half a graph would buy nothing and would mean every constructor had to
+// tolerate a nil neighbour.
+//
+// The exception is credentials, and it is R42's second clause rather than an
+// optimisation: a process does not hold a secret it has no use for. Which
+// secrets those are is stated in credentials.go, and the two things that follow
+// from it are here — the configuration is narrowed before anything is
+// constructed, and a role that never calls a group directory gets
+// [idpgroup.Gate] in place of [idpgroup.Sources]. The gate is not a weaker
+// check: it refuses every schema the caller refuses, from the same code.
 //
 // The audit writer claim is exclusive and its failure is fatal. Two processes
 // on one writer identifier collide on the audit chain's primary key, which is a
@@ -54,6 +62,9 @@ type App struct {
 	writer     *store.AuditWriter
 	checkpoint *checkpointPlane
 	facts      *fact.Registry
+	// groups is the calling group plane, and is nil on a process whose roles
+	// resolve no group: that one holds an [idpgroup.Gate] instead, which
+	// answers the schema gate and nothing else. See credentials.go.
 	groups     *idpgroup.Sources
 	events     *ingestPlane
 	buffer     *api.AuditBuffer
@@ -83,7 +94,10 @@ func Assemble(ctx context.Context, cfg Config, roles Set, logger *slog.Logger) (
 		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
 
-	app := &App{cfg: cfg, roles: roles, logger: logger}
+	// After validate and before anything is built: the whole deployment's
+	// configuration is checked wherever it is read, and only this process's
+	// share of its secrets survives into the graph below (R42).
+	app := &App{cfg: withoutUnusedCredentials(cfg, roles), roles: roles, logger: logger}
 	if err := app.build(ctx); err != nil {
 		app.Close()
 		return nil, err
@@ -226,22 +240,48 @@ func (a *App) build(ctx context.Context) error {
 		velocityGate = events.sources
 	}
 
-	groups, err := idpgroup.NewSources(cfg.IdPGroupSources, idpgroup.SourcesConfig{
-		Gate:          gate,
-		Issuers:       issuers,
-		AllowFailOpen: cfg.AllowFactFailOpen,
-		MaxTTL:        cfg.IdPGroupMaxTTL,
-		Fallback:      behindGroups,
-		Audit:         factAudit,
-	})
-	if err != nil {
-		return err
+	// The group plane is the one place a role decides what gets built, and the
+	// two halves answer the schema gate identically — see credentials.go. A
+	// process that never resolves a group holds no directory credential, opens
+	// no client to a directory and does not preflight one at boot; what it
+	// keeps is the refusal.
+	var groups challenge.GroupResolver
+	var groupGate schemaGate
+	sources := behindGroups
+	if callsDirectories(a.roles) {
+		full, gerr := idpgroup.NewSources(cfg.IdPGroupSources, idpgroup.SourcesConfig{
+			Gate:          gate,
+			Issuers:       issuers,
+			AllowFailOpen: cfg.AllowFactFailOpen,
+			MaxTTL:        cfg.IdPGroupMaxTTL,
+			Fallback:      behindGroups,
+			Audit:         factAudit,
+		})
+		if gerr != nil {
+			return gerr
+		}
+		a.groups = full
+		groups = full
+		groupGate = full
+		sources = full
+	} else {
+		gateOnly, gerr := idpgroup.NewGate(cfg.IdPGroupSources, idpgroup.GateConfig{
+			Issuers:       issuers,
+			AllowFailOpen: cfg.AllowFactFailOpen,
+			MaxTTL:        cfg.IdPGroupMaxTTL,
+		})
+		if gerr != nil {
+			return gerr
+		}
+		groupGate = gateOnly
 	}
-	a.groups = groups
-	sources := engine.SourceResolver(groups)
 
 	// --- evaluation --------------------------------------------------------
-	loader := &snapshotSource{store: s, gates: []schemaGate{facts, velocityGate, groups}}
+	//
+	// The gate list has one entry per source plane and never fewer, whatever
+	// this process's roles: snapshot.go's rule is that a plane missing from it
+	// is not a laxer check for its kind but no check at all.
+	loader := &snapshotSource{store: s, gates: []schemaGate{facts, velocityGate, groupGate}}
 	check, err := engine.NewCheckService(ctx, engine.CheckConfig{
 		Loader:            loader,
 		RefreshInterval:   cfg.PolicyRefreshInterval,

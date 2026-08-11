@@ -2,18 +2,28 @@
 {{- include "stamp.checkpointsValidated" . -}}
 {{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
 {{- $cp := .Values.audit.checkpoint -}}
-{{/* The configuration documents this release actually mounts. */}}
-{{- $mounted := dict -}}
+{{/*
+The configuration documents this release has at all. Which of them reach a
+given tier is decided per tier below: a document that carries only a credential
+goes to the tier that spends it and to no other (R42).
+*/}}
+{{- $configured := dict -}}
 {{- range $name, $doc := .Values.documents -}}
-{{- if not (has $name (list "factSources" "streamSources" "ingestCredentials" "externalTargets" "idpGroupSources" "kafkaTopics")) -}}
-{{- fail (printf "documents.%s is not a setting this chart knows" $name) -}}
-{{- end -}}
+{{/* Names the chart does not know are refused here, by the same helper that
+     maps the ones it does know to their variable. */}}
+{{- $_ := include "stamp.documentEnv" $name -}}
 {{- if $doc.secretName -}}
-{{- $_ := set $mounted $name $doc -}}
+{{- $_ := set $configured $name $doc -}}
 {{- end -}}
 {{- end -}}
 {{- range $tier := $tiers }}
 {{- $records := and $cp.enabled (include "stamp.tierRecordsCheckpoints" (dict "tier" $tier)) -}}
+{{- $mounted := dict -}}
+{{- range $name, $doc := $configured -}}
+{{- if include "stamp.tierReadsDocument" (dict "tier" $tier "document" $name) -}}
+{{- $_ := set $mounted $name $doc -}}
+{{- end -}}
+{{- end -}}
 {{- $sinkFile := and $records $cp.sink.file.enabled }}
 ---
 apiVersion: apps/v1
@@ -91,7 +101,22 @@ spec:
               value: {{ $tier.migrate | quote }}
             - name: STAMP_DB_APPLY_GRANTS
               value: {{ $tier.applyGrants | quote }}
-            {{- if $ctx.Values.mfa.ciba.clientSecret.secretName }}
+            {{- /*
+              The documents this tier reads, as paths into the Secret mounts
+              below. They are per-tier environment rather than ConfigMap entries
+              because the two credential-bearing ones do not reach every tier —
+              a variable naming a document the pod does not mount is a process
+              that fails to boot.
+            */}}
+            {{- range $name, $doc := $mounted }}
+            - name: {{ include "stamp.documentEnv" $name }}
+              value: {{ include "stamp.documentPath" $doc | quote }}
+            {{- end }}
+            {{- if and $ctx.Values.mfa.ciba.clientSecret.secretName (include "stamp.tierIssuesChallenges" (dict "tier" $tier)) }}
+            # R42 with R39: the CIBA client secret reaches the tiers that can
+            # open an mfa challenge and no other. A check tier compromised
+            # through the PEP surface holds no credential that could ask this
+            # deployment's IdP to authenticate somebody.
             - name: STAMP_MFA_CIBA_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -191,6 +216,10 @@ spec:
       # credential and none of them may appear in a manifest. The signing key is
       # mounted for the same reason and a stronger one — the chart has no field
       # its bytes could have been written into.
+      #
+      # Which of them this tier gets is stamp.tierReadsDocument's answer, and it
+      # follows the binary: a document a tier's roles never read is a credential
+      # sitting on a filesystem nothing in that pod consults.
       volumes:
         {{- range $name, $doc := $mounted }}
         - name: {{ printf "doc-%s" (kebabcase $name) }}
