@@ -596,7 +596,12 @@ func (x *External) Status(_ context.Context, req StatusRequest) (Status, error) 
 			state = StatePending
 		}
 	}
-	return Status{State: state, Deadline: deadline}, nil
+	// The one failure the decision layer has to be able to name. Every other
+	// word in this handler's vocabulary — a blocked egress, a timeout, a
+	// transport fault — is a round trip that was attempted and went wrong; this
+	// one is a round trip this deployment declined to make, so the target was
+	// never told and the decision's ground is load shedding rather than refusal.
+	return Status{State: state, Deadline: deadline, Shed: detail.Failure == ExternalFailureRateLimited}, nil
 }
 
 // externalState maps a recorded verdict to a challenge state. Anything that is

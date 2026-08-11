@@ -670,6 +670,13 @@ func TestStatusReportsPendingUntilConsumedAndFailsAnElapsedDeadline(t *testing.T
 	if elapsed.State != challenge.StateFailed {
 		t.Fatalf("state = %q at the deadline, want failed", elapsed.State)
 	}
+	// A prompt that was sent and not completed is not a prompt that was shed.
+	// The bit is what the decision reads to tell "the subject did not finish"
+	// from "the subject was never asked", so a failure that sets it everywhere
+	// would say nothing.
+	if elapsed.Shed {
+		t.Error("a step-up that timed out reported Shed: the subject was prompted and did not finish")
+	}
 
 	at := testNow.Add(time.Minute)
 	out, err := submit(t, h, raw, dec, goodCompletion(detail, at), detail.Correlator, at)
@@ -1158,6 +1165,16 @@ func TestARefusedIssueIsADenyWithItsOwnReason(t *testing.T) {
 	}
 	if status.State != challenge.StateFailed {
 		t.Errorf("status of a refused issue = %q, want failed", status.State)
+	}
+	// And it says *which* failure it was in the one form the decision layer can
+	// read. `issue_rate_limited` on this row is the whole word, but the lifecycle
+	// may not know this package's vocabulary (KTD1), so the contract's bit is how
+	// the distinction reaches the decision's `reason`. Without it the denied
+	// decision reads `challenge_failed` — the same word a subject who rejected
+	// the prompt produces.
+	if !status.Shed {
+		t.Error("status of a shed issue did not set Shed: the decision it denies " +
+			"would be indistinguishable from one the subject refused")
 	}
 
 	// And nothing can be submitted against it: there was no correlator to match

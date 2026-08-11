@@ -663,6 +663,74 @@ func decodeStepUpDetail(raw json.RawMessage) (stepUpDetail, error) {
 	return detail, nil
 }
 
+// countingStepUpHandler is stepUpHandler with a tally of how many times it was
+// asked to open a challenge.
+//
+// The tally is the assertion an idempotent retry is actually about. A retry that
+// returned the same decision identifier while quietly issuing a second challenge
+// would pass every test that only looks at rows, and would still have buzzed the
+// subject's phone twice — which is the failure the key exists to prevent, and the
+// one a unique index on the decision row cannot catch, because the push happens
+// before the row is written.
+type countingStepUpHandler struct {
+	stepUpHandler
+	issues atomic.Int64
+}
+
+func (c *countingStepUpHandler) Issue(ctx context.Context, req challenge.IssueRequest) (challenge.IssueResult, error) {
+	c.issues.Add(1)
+	return c.stepUpHandler.Issue(ctx, req)
+}
+
+func (c *countingStepUpHandler) count() int { return int(c.issues.Load()) }
+
+// refusingStepUpHandler is the shape a delegated MFA handler has when it opens
+// no challenge at all: the challenge is stored failed, nothing reached the IdP,
+// and the word for why travels on the row.
+//
+// It carries both branches because the branches are the point. `shed` is the
+// per-subject issuance budget refusing to prompt anybody (R43); the other is a
+// round trip that was attempted and went wrong. The lifecycle must tell them
+// apart without knowing either word, so the double publishes the contract's bit
+// exactly as the real handlers do.
+type refusingStepUpHandler struct{ shed bool }
+
+type refusedDetail struct {
+	Failure string `json:"failure"`
+	Shed    bool   `json:"shed"`
+}
+
+func (*refusingStepUpHandler) Kind() policy.ChallengeType { return policy.ChallengeMFA }
+
+func (r *refusingStepUpHandler) Issue(_ context.Context, _ challenge.IssueRequest) (challenge.IssueResult, error) {
+	failure := "transport"
+	if r.shed {
+		failure = "issue_rate_limited"
+	}
+	return challenge.IssueResult{
+		State:  challenge.StateFailed,
+		Detail: refusedDetail{Failure: failure, Shed: r.shed},
+	}, nil
+}
+
+func (*refusingStepUpHandler) Submit(_ context.Context, _ challenge.SubmitRequest) (challenge.SubmitResult, error) {
+	return challenge.SubmitResult{}, challenge.ErrNotSubmittable
+}
+
+// Status keeps a refused issue refused, which is what the lifecycle storing
+// every challenge pending obliges every handler to do.
+func (*refusingStepUpHandler) Status(_ context.Context, req challenge.StatusRequest) (challenge.Status, error) {
+	var detail refusedDetail
+	if err := json.Unmarshal(req.Detail, &detail); err != nil {
+		return challenge.Status{}, fmt.Errorf("%w: %w", challenge.ErrInvalidPayload, err)
+	}
+	state := req.Stored
+	if !state.Terminal() && detail.Failure != "" {
+		state = challenge.StateFailed
+	}
+	return challenge.Status{State: state, Have: 0, Need: 1, Shed: detail.Shed}, nil
+}
+
 // leakyStepUpHandler is stepUpHandler with the mistake this unit exists to
 // prevent: it publishes the stored detail instead of a chosen field. It is the
 // mutation the secret tests are pointed at.

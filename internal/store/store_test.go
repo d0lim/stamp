@@ -210,14 +210,25 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean migrate")
 	}
-	if version != 7 {
-		t.Fatalf("schema version = %d, want 7", version)
+	if version != 8 {
+		t.Fatalf("schema version = %d, want 8", version)
 	}
 
-	// The newest migration is index-only. Its indexes are the audit console's
-	// query axes, so their absence is a silently slow console rather than a
-	// failure, which is exactly the kind of regression a count assertion alone
-	// would not catch.
+	// 000008 is the idempotency key and the unique index that backstops it. The
+	// index is named here rather than counted, because its name is what the store
+	// reads off a 23505 to tell a repeated key from a collided identifier: an
+	// index that exists under another name is a conflict reported as the wrong
+	// thing.
+	if !columnExists(t, s, "decisions", "idempotency_key") {
+		t.Error("decisions.idempotency_key is missing after migrate")
+	}
+	if !indexExists(t, s, "decisions_unique_idempotency_key") {
+		t.Error("index \"decisions_unique_idempotency_key\" is missing after migrate")
+	}
+
+	// 000007 is index-only. Its indexes are the audit console's query axes, so
+	// their absence is a silently slow console rather than a failure, which is
+	// exactly the kind of regression a count assertion alone would not catch.
 	for _, index := range []string{
 		"decisions_history_idx", "decisions_policy_history_idx",
 		"decisions_subject_history_idx", "decisions_state_history_idx",
@@ -248,8 +259,34 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean rollback")
 	}
+	if version != 7 {
+		t.Fatalf("schema version after one rollback = %d, want 7", version)
+	}
+	// Rolling back a column takes the column, its index and its check, and
+	// leaves every decision row where it was. A rollback that dropped rows to
+	// drop a column would be a rollback nobody could run on a live deployment.
+	if columnExists(t, s, "decisions", "idempotency_key") {
+		t.Error("decisions.idempotency_key survived the rollback of its own migration")
+	}
+	if indexExists(t, s, "decisions_unique_idempotency_key") {
+		t.Error("decisions_unique_idempotency_key survived the rollback of its own migration")
+	}
+	if !tableExists(t, s, "decisions") {
+		t.Error("decisions was dropped by a rollback that only added a column to it")
+	}
+
+	if err := s.MigrateDown(ctx, 1); err != nil {
+		t.Fatalf("migrate down 1: %v", err)
+	}
+	version, dirty, ok, err = s.SchemaVersion(ctx)
+	if err != nil || !ok {
+		t.Fatalf("schema version after rollback: ok=%v err=%v", ok, err)
+	}
+	if dirty {
+		t.Fatal("schema is dirty after a clean rollback")
+	}
 	if version != 6 {
-		t.Fatalf("schema version after one rollback = %d, want 6", version)
+		t.Fatalf("schema version after two rollbacks = %d, want 6", version)
 	}
 	// Rolling back an index-only migration takes the indexes and leaves every
 	// row where it was.
@@ -271,7 +308,7 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 		t.Fatal("schema is dirty after a clean rollback")
 	}
 	if version != 5 {
-		t.Fatalf("schema version after two rollbacks = %d, want 5", version)
+		t.Fatalf("schema version after three rollbacks = %d, want 5", version)
 	}
 	// 000006 only adds columns to policy_revisions, so rolling it back leaves
 	// the table and takes the column.

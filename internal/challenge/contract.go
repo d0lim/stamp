@@ -59,7 +59,7 @@ import (
 
 // ContractVersion is the semantic version of the interfaces in this file. It is
 // bumped when the contract changes, not when a handler does.
-const ContractVersion = "1.2.0"
+const ContractVersion = "1.3.0"
 
 // Errors handlers and the registry return as sentinels. A handler may wrap them
 // with detail; callers branch with errors.Is.
@@ -261,6 +261,29 @@ type Status struct {
 	Deadline *time.Time
 	// Detail replaces the stored detail when non-nil.
 	Detail any
+
+	// Shed reports a challenge that failed because this system refused to open
+	// it — the issuance was shed by a rate limit (R43) — rather than because it
+	// was opened and then not met.
+	//
+	// It is one bit and not the handler's failure word, because the lifecycle
+	// must not learn a kind's vocabulary (KTD1): `issue_rate_limited` on a
+	// step-up row and `rate_limited` on an external one are the same event to a
+	// decision, and a decision layer that had to know both strings would have to
+	// be edited every time a kind is added.
+	//
+	// It exists because the two failures mean opposite things to the caller. A
+	// challenge that was answered "no" is a final judgement and retrying is
+	// pointless; a challenge that was never sent is load shedding, the subject
+	// was never asked, and retrying after the window is exactly right. Without
+	// this bit the decision reports `challenge_failed` for both, which reads as
+	// "the person rejected it" — the one thing that did not happen.
+	//
+	// It rides on Status rather than only on IssueResult because the decision's
+	// ground is recomputed on every read: the lifecycle stores every challenge
+	// pending and asks Status afterwards, so a bit that lived only in the issue
+	// return value would be gone by the time anyone read the decision back.
+	Shed bool
 }
 
 // Handler serves one challenge kind.

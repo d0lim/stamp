@@ -558,7 +558,17 @@ func (d *Delegated) Status(_ context.Context, req challenge.StatusRequest) (chal
 			state = challenge.StatePending
 		}
 	}
-	return challenge.Status{State: state, Have: have, Need: 1, Deadline: req.Deadline}, nil
+	// Shed is the one failure word that has to reach the decision, and it is
+	// translated into the contract's kind-agnostic bit here rather than read as a
+	// string there. A step-up that was shed never reached the IdP and the subject
+	// was never prompted, so the decision it denies is not "the person said no".
+	return challenge.Status{
+		State:    state,
+		Have:     have,
+		Need:     1,
+		Deadline: req.Deadline,
+		Shed:     detail.Failure == FailureIssueRateLimited,
+	}, nil
 }
 
 // View implements [challenge.Viewer]: it answers with the step-up destination
