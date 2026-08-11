@@ -161,3 +161,98 @@ variable is this path, never the document.
 {{- define "stamp.documentPath" -}}
 {{- printf "/etc/stamp/documents/%s" .key -}}
 {{- end -}}
+
+{{/*
+Audit checkpoints (R32, R42).
+
+The directories are constants rather than settings. The key directory is a
+read-only Secret mount and the sink directory is the one writable path in the
+container, and both of those are properties of the pod this chart writes — an
+operator who could move them could move the sink somewhere
+readOnlyRootFilesystem makes unwritable and learn about it from a crash loop.
+*/}}
+{{- define "stamp.checkpointKeyDir" -}}/etc/stamp/checkpoint{{- end -}}
+{{- define "stamp.checkpointVerifyDir" -}}/etc/stamp/checkpoint/verify{{- end -}}
+{{- define "stamp.checkpointSinkDir" -}}/var/lib/stamp/checkpoints{{- end -}}
+
+{{- define "stamp.checkpointKeyPath" -}}
+{{- printf "%s/%s" (include "stamp.checkpointKeyDir" .) .Values.audit.checkpoint.signingKey.key -}}
+{{- end -}}
+
+{{- define "stamp.checkpointSinkPath" -}}
+{{- printf "%s/%s" (include "stamp.checkpointSinkDir" .) .Values.audit.checkpoint.sink.file.name -}}
+{{- end -}}
+
+{{/*
+The retired public halves, in the binary's "key-id=/path,other-id=/path" form.
+Paths, not keys — the two halves of one rotation are configured the same way so
+that nobody has to remember which of them is a literal.
+*/}}
+{{- define "stamp.checkpointVerifyKeys" -}}
+{{- $dir := include "stamp.checkpointVerifyDir" . -}}
+{{- $out := list -}}
+{{- range $entry := .Values.audit.checkpoint.verifyKeys.keys -}}
+{{- if not $entry.id -}}
+{{- fail "stamp chart: an audit.checkpoint.verifyKeys.keys entry has no id. A checkpoint names the key it was signed under, and a public key with no identifier answers for nothing." -}}
+{{- end -}}
+{{- $out = append $out (printf "%s=%s/%s" $entry.id $dir $entry.key) -}}
+{{- end -}}
+{{- join "," $out -}}
+{{- end -}}
+
+{{/*
+stamp.tierRecordsCheckpoints reports whether one tier is the one that signs.
+
+It is the api role and only it, and the chart follows the composition root
+rather than offering a choice: internal/runtime/wiring.go registers the
+checkpointer with Roles: []Role{RoleAPI}. Every other tier gets no checkpoint
+environment and no signing key, which is the point — the key is mounted where it
+is used and nowhere else.
+*/}}
+{{- define "stamp.tierRecordsCheckpoints" -}}
+{{- if or (eq .tier.name "all") (eq .tier.name "api") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+stamp.checkpointsValidated is the render-time refusal.
+
+A release that asks for checkpoints and runs no api role produces a valid
+manifest, starts healthily and records nothing: `stamp audit verify` has nothing
+to check the log against, and the operator who wrote a signing key into these
+values has every reason to believe otherwise. That belief is the failure — a
+control that is absent is recoverable, and one that is believed present and is
+not is not — so it is refused here rather than warned about. helm template does
+not print NOTES.txt, and a warning nobody renders is not a warning.
+
+Disabling the api tier is otherwise legitimate: a data-plane-only release
+alongside a second release that runs api is a real shape. That release sets
+audit.checkpoint.enabled: false and the release with the api tier takes the
+checkpoints for the installation, which is what the remedy says.
+*/}}
+{{- define "stamp.checkpointsValidated" -}}
+{{- $cp := .Values.audit.checkpoint -}}
+{{- if $cp.enabled -}}
+  {{- if not $cp.keyId -}}
+    {{- fail "stamp chart: audit.checkpoint.enabled is set but audit.checkpoint.keyId is empty. Every checkpoint records the key it was signed under, and a key with no identifier cannot be rotated without invalidating everything the previous one signed, so the binary refuses to boot without it." -}}
+  {{- end -}}
+  {{- if not $cp.signingKey.secretName -}}
+    {{- fail "stamp chart: audit.checkpoint.enabled is set but audit.checkpoint.signingKey.secretName is empty. The signing key arrives as a mounted Secret and never as a value (R42), so there is nothing to mount and the checkpointer would have no key." -}}
+  {{- end -}}
+  {{- if and (not $cp.sink.file.enabled) (not $cp.sink.webhook) -}}
+    {{- fail "stamp chart: audit.checkpoint.enabled is set but no sink is. A checkpoint that never leaves the database is signed by a key the database does not hold and stored where the database can overwrite it. Enable audit.checkpoint.sink.file, or name a webhook." -}}
+  {{- end -}}
+  {{- if $cp.verifyKeys.keys -}}
+    {{- if not $cp.verifyKeys.secretName -}}
+      {{- fail "stamp chart: audit.checkpoint.verifyKeys.keys are listed but audit.checkpoint.verifyKeys.secretName is empty. The retired public halves are mounted from one Secret; there is nothing to mount them from." -}}
+    {{- end -}}
+  {{- end -}}
+  {{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
+  {{- $records := false -}}
+  {{- range $tier := $tiers -}}
+    {{- if include "stamp.tierRecordsCheckpoints" (dict "tier" $tier) -}}{{- $records = true -}}{{- end -}}
+  {{- end -}}
+  {{- if not $records -}}
+    {{- fail "stamp chart: audit.checkpoint.enabled is set and this release runs no api role, so nothing in it records a checkpoint. internal/runtime/wiring.go registers the checkpointer under the api role alone, so this release would render valid manifests, start healthy, publish no signed copy of its audit chain, and leave `stamp audit verify` with nothing to check the log against. Either set roles.api.enabled: true here, or set audit.checkpoint.enabled: false and configure checkpoints on the release that does run the api role." -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}

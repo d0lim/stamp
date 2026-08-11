@@ -33,6 +33,9 @@ what a first release would contain.
   public API with no backend of its own.
 - Postgres persistence with a hash-chained audit log and per-role database
   privileges.
+- Signed audit checkpoints: the chain's heads published outside the database
+  that stores them, under a rotatable Ed25519 key, verified offline by
+  `stamp audit verify`.
 - One image, five roles: `check`, `decide`, `consumer`, `api`, `console`,
   selected with `--roles`.
 - Packaging: a Helm chart with two topologies, a release workflow that publishes

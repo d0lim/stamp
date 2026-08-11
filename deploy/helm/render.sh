@@ -49,21 +49,50 @@ render() {
         > "${out}/${name}.yaml"
 }
 
+# A values file the chart must refuse. The refusal is a rendering outcome like
+# any other, so it is pinned like any other: the run has to fail, and the
+# chart's own message is written to a snapshot internal/release reads.
+#
+# Only the text after the sentinel is kept. Everything before it — helm's
+# wrapper, the template path, the line number — belongs to helm's version rather
+# than to this chart, and pinning it would turn a helm upgrade into a diff in a
+# file that is supposed to be about the chart.
+render_refusal() {
+    local name="$1" values="$2" err
+    err="$(mktemp)"
+    if helm template stamp "deploy/helm/stamp" \
+        --namespace stamp \
+        --values "deploy/helm/stamp/${values}" \
+        >/dev/null 2>"${err}"; then
+        echo "deploy/helm/stamp/${values} rendered successfully; the chart is supposed to refuse it" >&2
+        rm -f "${err}"
+        exit 1
+    fi
+    if ! grep -o 'stamp chart: .*' "${err}" > "${out}/${name}.err.txt"; then
+        echo "deploy/helm/stamp/${values} failed for a reason that is not the chart's own:" >&2
+        cat "${err}" >&2
+        rm -f "${err}"
+        exit 1
+    fi
+    rm -f "${err}"
+}
+
 mkdir -p "${out}"
 render all-in-one values-all-in-one.yaml
 render split values-split.yaml
+render_refusal split-no-api values-split-no-api.yaml
 
 helm lint "deploy/helm/stamp" --values "deploy/helm/stamp/values-all-in-one.yaml" >/dev/null
 helm lint "deploy/helm/stamp" --values "deploy/helm/stamp/values-split.yaml" >/dev/null
 
 if [ "${check}" = "1" ]; then
-    for name in all-in-one split; do
-        if ! diff -u "${repo_root}/deploy/helm/snapshots/${name}.yaml" "${out}/${name}.yaml"; then
-            echo "deploy/helm/snapshots/${name}.yaml is stale: run deploy/helm/render.sh" >&2
+    for name in all-in-one.yaml split.yaml split-no-api.err.txt; do
+        if ! diff -u "${repo_root}/deploy/helm/snapshots/${name}" "${out}/${name}"; then
+            echo "deploy/helm/snapshots/${name} is stale: run deploy/helm/render.sh" >&2
             exit 1
         fi
     done
     echo "snapshots are current"
 else
-    echo "rendered ${out}/all-in-one.yaml and ${out}/split.yaml"
+    echo "rendered ${out}/all-in-one.yaml, ${out}/split.yaml and ${out}/split-no-api.err.txt"
 fi

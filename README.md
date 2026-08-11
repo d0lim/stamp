@@ -194,6 +194,8 @@ helm install stamp deploy/helm/stamp -f deploy/helm/stamp/values-split.yaml
 
 `all-in-one` is one Deployment running `--roles=all`. `split` is one Deployment per role, each with its own database login and only the listeners its role serves bound — the check tier has no console listener to reach. No credential is templated: every one arrives as a Secret reference or a mounted file, and the rendered manifests of both topologies are committed under `deploy/helm/snapshots` and asserted in `internal/release`.
 
+Signed audit checkpoints are `audit.checkpoint`. The signing key is an Ed25519 PEM file mounted from a Secret — there is no chart value and no environment variable a key's bytes could be written into — and the checkpointer runs under the `api` role alone, so the chart renders the configuration and mounts the key on that tier and on no other. A `split` release that enables checkpoints and disables its api tier is refused at render time rather than installed: it would produce valid manifests, healthy pods and no tamper evidence at all.
+
 The chart's `NOTES` end with the two steps a fresh install still owes: take the one-time bootstrap token out of the api tier's log, and lock governance with it.
 
 ## Development

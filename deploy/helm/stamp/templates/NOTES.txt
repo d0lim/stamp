@@ -80,7 +80,42 @@ saturated, decisions are allowed to proceed unrecorded and the gap is marked in
 the chain rather than refused.
 {{- end }}
 
-R32's signed audit checkpoint sink has no configuration in this chart because
-the binary reads none yet: the signer and the file and webhook sinks exist in
-internal/store, but nothing wires them from the environment. Until that lands,
-checkpoints are not being exported anywhere, whatever this chart is set to.
+{{- if .Values.audit.checkpoint.enabled }}
+
+Audit checkpoints (R32) are recorded by {{ $apiTier }}, under key id
+{{ .Values.audit.checkpoint.keyId }}, every {{ default "5m" .Values.audit.checkpoint.interval }}.
+{{- if .Values.audit.checkpoint.sink.file.enabled }}
+The readable sink is {{ include "stamp.checkpointSinkPath" . }} on that pod.
+{{- if not .Values.audit.checkpoint.sink.file.volume }}
+It is an emptyDir: the file is rebuilt from the database by the repair pass at
+the head of each tick, so a replaced pod converges on the whole series. Set
+audit.checkpoint.sink.file.volume to a claim if you want the file to persist
+without that pass.
+{{- end }}
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ $apiTier }} -- \
+    cat {{ include "stamp.checkpointSinkPath" . }}
+
+Verify the chain against it with `stamp audit verify`. The signing key is
+mounted from Secret {{ .Values.audit.checkpoint.signingKey.secretName }} and
+appears in no manifest, no `helm get values` and no log — only its identifier
+does.
+{{- else }}
+
+WARNING: the only checkpoint sink is a webhook, which cannot be read back.
+Checkpoints are delivered and this deployment still cannot verify its own audit
+chain: `stamp audit verify` compares the log against a sink it can read. Enable
+audit.checkpoint.sink.file as well.
+{{- end }}
+
+Only the tier running the api role records checkpoints, so every other tier logs
+"audit checkpoints are not configured" at boot. That is this chart keeping the
+signing key off the tiers that do not sign, not a misconfiguration.
+{{- else }}
+
+WARNING: audit.checkpoint.enabled is off. This deployment publishes no signed
+copy of its audit chain outside the database that stores the chain, so a
+wholesale rewrite of the audit log re-chains cleanly and nothing disagrees with
+it, and `stamp audit verify` has nothing to check the log against. The control
+is absent rather than relaxed — no other setting compensates.
+{{- end }}

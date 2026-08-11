@@ -168,6 +168,23 @@ spec:
               value: "true"
             - name: STAMP_DB_APPLY_GRANTS
               value: "true"
+            # R32 and R42. The api role is the only one that registers the
+            # checkpointer, so these six variables are rendered on this tier and
+            # on no other — the key is mounted where it is used, and a check tier
+            # compromised through the PEP surface holds no key that could sign a
+            # replacement for the evidence of its own compromise.
+            #
+            # Every one of them is a path or a scalar. There is no variable here
+            # that a key's bytes could be written into, because the binary has
+            # none: a private key handed over in the environment is a key in the
+            # process listing, in `docker inspect` and in the values that
+            # produced this manifest.
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_FILE
+              value: "/etc/stamp/checkpoint/signing-key.pem"
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_ID
+              value: "stamp-2026-08"
+            - name: STAMP_AUDIT_CHECKPOINT_SINK_FILE
+              value: "/var/lib/stamp/checkpoints/checkpoints.jsonl"
             # STAMP_AUDIT_WRITER_ID is deliberately unset: exactly one live
             # process may hold a writer identifier, and the default derives one
             # from the pod's hostname. Setting it to a literal here would make
@@ -193,3 +210,35 @@ spec:
             requests:
               cpu: 500m
               memory: 512Mi
+          volumeMounts:
+            - name: checkpoint-key
+              mountPath: "/etc/stamp/checkpoint/signing-key.pem"
+              subPath: "signing-key.pem"
+              readOnly: true
+            # The one writable path in this container, and the reason
+            # readOnlyRootFilesystem can stay on. The sink is append-only and
+            # holds no credential — a checkpoint is a signature over public
+            # chain heads — so it is the only mount here that is not a Secret
+            # and not read-only.
+            - name: checkpoint-sink
+              mountPath: "/var/lib/stamp/checkpoints"
+      # The documents are mounted, not templated: three of the six may carry a
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
+      volumes:
+        - name: checkpoint-key
+          secret:
+            secretName: "stamp-checkpoint-key"
+            defaultMode: 0400
+            items:
+              - key: "signing-key.pem"
+                path: "signing-key.pem"
+        - name: checkpoint-sink
+          # An emptyDir loses the file when the pod is replaced, and the series
+          # survives anyway: the repair pass at the head of each tick
+          # republishes from the database every checkpoint this host's copy is
+          # missing, so a restarted pod converges on the whole series rather
+          # than starting a new one. Give sink.file.volume a claim if you want
+          # the file itself to persist.
+          emptyDir: {}

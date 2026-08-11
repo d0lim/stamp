@@ -71,6 +71,7 @@ egress:
   allow:
     - https://risk.internal.example
     - https://directory.internal.example
+    - https://audit-sink.internal.example
 
 # R49: this deployment authors policy from files and closes the console's
 # policy authoring. The approval inbox, the audit views, the dry run and the
@@ -80,6 +81,37 @@ authoring:
 
 governance:
   minApprovers: 2
+
+# R32 across five tiers. One of them records checkpoints — the api tier, because
+# that is the role the composition root registers the checkpointer under — and
+# the rendered manifest shows the signing key mounted there and nowhere else.
+# The rotation this deployment has already been through is in verifyKeys: the
+# checkpoints stamp-2026-05 signed stay verifiable without being re-signed.
+audit:
+  checkpoint:
+    enabled: true
+    keyId: stamp-2026-08
+    signingKey:
+      secretName: stamp-checkpoint-key
+      key: signing-key.pem
+    verifyKeys:
+      secretName: stamp-checkpoint-verify
+      keys:
+        - id: stamp-2026-05
+          key: stamp-2026-05.pub.pem
+    sink:
+      file:
+        enabled: true
+        # This tier's copy of the sink outlives the pod, so the repair pass has
+        # nothing to republish on a routine restart.
+        volume:
+          persistentVolumeClaim:
+            claimName: stamp-checkpoints
+      # An addition, never a replacement, and its origin is in egress.allow
+      # above because every outbound call this process makes goes through the
+      # same gate.
+      webhook: https://audit-sink.internal.example/checkpoints
+    interval: 1m
 
 console:
   # R51 with R50: the console tier serves no API, so the bundle is told where

@@ -38,7 +38,7 @@ data:
   STAMP_APPROVER_ISSUER: "https://idp.example"
 
   STAMP_DB_MAX_CONNS: "24"
-  STAMP_EGRESS_ALLOW: "https://risk.internal.example,https://directory.internal.example"
+  STAMP_EGRESS_ALLOW: "https://risk.internal.example,https://directory.internal.example,https://audit-sink.internal.example"
   STAMP_EGRESS_ALLOW_LOOPBACK: "false"
   STAMP_EGRESS_ALLOW_PRIVATE: "false"
   STAMP_FACT_ALLOW_FAIL_OPEN: "false"
@@ -254,7 +254,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: check
       annotations:
-        checksum/config: 9c1ce8280bc8a3cfc0c7991797af90f3ac6ea5967ab6f31e1ced39969b0d4a59
+        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -355,7 +355,9 @@ spec:
               subPath: "stream-sources.json"
               readOnly: true
       # The documents are mounted, not templated: three of the six may carry a
-      # credential and none of them may appear in a manifest.
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
       volumes:
         - name: doc-external-targets
           secret:
@@ -428,7 +430,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: decide
       annotations:
-        checksum/config: 9c1ce8280bc8a3cfc0c7991797af90f3ac6ea5967ab6f31e1ced39969b0d4a59
+        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -528,7 +530,9 @@ spec:
               subPath: "stream-sources.json"
               readOnly: true
       # The documents are mounted, not templated: three of the six may carry a
-      # credential and none of them may appear in a manifest.
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
       volumes:
         - name: doc-external-targets
           secret:
@@ -601,7 +605,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: consumer
       annotations:
-        checksum/config: 9c1ce8280bc8a3cfc0c7991797af90f3ac6ea5967ab6f31e1ced39969b0d4a59
+        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -698,7 +702,9 @@ spec:
               subPath: "stream-sources.json"
               readOnly: true
       # The documents are mounted, not templated: three of the six may carry a
-      # credential and none of them may appear in a manifest.
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
       volumes:
         - name: doc-external-targets
           secret:
@@ -771,7 +777,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: api
       annotations:
-        checksum/config: 9c1ce8280bc8a3cfc0c7991797af90f3ac6ea5967ab6f31e1ced39969b0d4a59
+        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -823,6 +829,29 @@ spec:
                 secretKeyRef:
                   name: "stamp-ciba"
                   key: "client-secret"
+            # R32 and R42. The api role is the only one that registers the
+            # checkpointer, so these six variables are rendered on this tier and
+            # on no other — the key is mounted where it is used, and a check tier
+            # compromised through the PEP surface holds no key that could sign a
+            # replacement for the evidence of its own compromise.
+            #
+            # Every one of them is a path or a scalar. There is no variable here
+            # that a key's bytes could be written into, because the binary has
+            # none: a private key handed over in the environment is a key in the
+            # process listing, in `docker inspect` and in the values that
+            # produced this manifest.
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_FILE
+              value: "/etc/stamp/checkpoint/signing-key.pem"
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_ID
+              value: "stamp-2026-08"
+            - name: STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS
+              value: "stamp-2026-05=/etc/stamp/checkpoint/verify/stamp-2026-05.pub.pem"
+            - name: STAMP_AUDIT_CHECKPOINT_SINK_FILE
+              value: "/var/lib/stamp/checkpoints/checkpoints.jsonl"
+            - name: STAMP_AUDIT_CHECKPOINT_SINK_WEBHOOK
+              value: "https://audit-sink.internal.example/checkpoints"
+            - name: STAMP_AUDIT_CHECKPOINT_INTERVAL
+              value: "1m"
             # STAMP_AUDIT_WRITER_ID is deliberately unset: exactly one live
             # process may hold a writer identifier, and the default derives one
             # from the pod's hostname. Setting it to a literal here would make
@@ -867,8 +896,24 @@ spec:
               mountPath: "/etc/stamp/documents/stream-sources.json"
               subPath: "stream-sources.json"
               readOnly: true
+            - name: checkpoint-key
+              mountPath: "/etc/stamp/checkpoint/signing-key.pem"
+              subPath: "signing-key.pem"
+              readOnly: true
+            - name: checkpoint-verify
+              mountPath: "/etc/stamp/checkpoint/verify"
+              readOnly: true
+            # The one writable path in this container, and the reason
+            # readOnlyRootFilesystem can stay on. The sink is append-only and
+            # holds no credential — a checkpoint is a signature over public
+            # chain heads — so it is the only mount here that is not a Secret
+            # and not read-only.
+            - name: checkpoint-sink
+              mountPath: "/var/lib/stamp/checkpoints"
       # The documents are mounted, not templated: three of the six may carry a
-      # credential and none of them may appear in a manifest.
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
       volumes:
         - name: doc-external-targets
           secret:
@@ -906,6 +951,23 @@ spec:
             items:
               - key: "stream-sources.json"
                 path: "stream-sources.json"
+        - name: checkpoint-key
+          secret:
+            secretName: "stamp-checkpoint-key"
+            defaultMode: 0400
+            items:
+              - key: "signing-key.pem"
+                path: "signing-key.pem"
+        - name: checkpoint-verify
+          secret:
+            secretName: "stamp-checkpoint-verify"
+            defaultMode: 0444
+            items:
+              - key: "stamp-2026-05.pub.pem"
+                path: "stamp-2026-05.pub.pem"
+        - name: checkpoint-sink
+          persistentVolumeClaim:
+            claimName: stamp-checkpoints
 ---
 # Source: stamp/templates/deployment.yaml
 apiVersion: apps/v1
@@ -941,7 +1003,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: console
       annotations:
-        checksum/config: 9c1ce8280bc8a3cfc0c7991797af90f3ac6ea5967ab6f31e1ced39969b0d4a59
+        checksum/config: 91507100d947dbf0c9abf1c5d6d50e8582ab48a3b1d018f11a3a062f04658555
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -1038,7 +1100,9 @@ spec:
               subPath: "stream-sources.json"
               readOnly: true
       # The documents are mounted, not templated: three of the six may carry a
-      # credential and none of them may appear in a manifest.
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
       volumes:
         - name: doc-external-targets
           secret:

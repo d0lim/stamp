@@ -18,6 +18,10 @@ import (
 const (
 	allInOneSnapshot = "../../deploy/helm/snapshots/all-in-one.yaml"
 	splitSnapshot    = "../../deploy/helm/snapshots/split.yaml"
+	// The chart's own message when it refuses to render a release that asks
+	// for audit checkpoints and runs no api role. deploy/helm/render.sh writes
+	// it, and requires the render to have failed to produce it.
+	splitNoAPIRefusal = "../../deploy/helm/snapshots/split-no-api.err.txt"
 )
 
 // --- the rendered model ---------------------------------------------------
@@ -42,11 +46,30 @@ type container struct {
 			Name string `yaml:"name"`
 		} `yaml:"configMapRef"`
 	} `yaml:"envFrom"`
-	VolumeMounts []struct {
-		Name      string `yaml:"name"`
-		MountPath string `yaml:"mountPath"`
-		ReadOnly  bool   `yaml:"readOnly"`
-	} `yaml:"volumeMounts"`
+	VolumeMounts []volumeMount `yaml:"volumeMounts"`
+}
+
+type volumeMount struct {
+	Name      string `yaml:"name"`
+	MountPath string `yaml:"mountPath"`
+	SubPath   string `yaml:"subPath"`
+	ReadOnly  bool   `yaml:"readOnly"`
+}
+
+type volume struct {
+	Name   string `yaml:"name"`
+	Secret struct {
+		SecretName string `yaml:"secretName"`
+	} `yaml:"secret"`
+	EmptyDir              map[string]any `yaml:"emptyDir"`
+	PersistentVolumeClaim map[string]any `yaml:"persistentVolumeClaim"`
+}
+
+// writable reports whether a volume is one a process can append to. It is the
+// distinction the checkpoint sink turns on: a Secret projection is read-only
+// whatever the mount says, and the sink has to be written.
+func (v volume) writable() bool {
+	return v.Secret.SecretName == "" && (v.EmptyDir != nil || v.PersistentVolumeClaim != nil)
 }
 
 type doc struct {
@@ -67,12 +90,7 @@ type doc struct {
 		Template struct {
 			Spec struct {
 				Containers []container `yaml:"containers"`
-				Volumes    []struct {
-					Name   string `yaml:"name"`
-					Secret struct {
-						SecretName string `yaml:"secretName"`
-					} `yaml:"secret"`
-				} `yaml:"volumes"`
+				Volumes    []volume    `yaml:"volumes"`
 			} `yaml:"spec"`
 		} `yaml:"template"`
 	} `yaml:"spec"`
@@ -401,7 +419,15 @@ func TestConsoleAndAPISeparateAndAuthoringModeIsRendered(t *testing.T) {
 // credentialNamed matches the settings whose value would be credential
 // material. Endpoint and identifier settings that merely contain the word token
 // are not in it — STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT is a URL.
-var credentialNamed = regexp.MustCompile(`(?i)(^STAMP_DSN$|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|_TOKEN$)`)
+//
+// _KEY_FILE and _VERIFY_KEYS are here for the audit checkpoint signing key
+// (R42). Their values are paths and never keys, and that is exactly what makes
+// them worth scanning: the requirement is not "the key is not in this variable"
+// but "this variable names a Secret this pod mounts", so a path pointing
+// somewhere else — a key written into the image, or into an emptyDir by some
+// other means — is caught by the same rule.
+var credentialNamed = regexp.MustCompile(
+	`(?i)(^STAMP_DSN$|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE_KEY|_TOKEN$|_KEY_FILE$|_VERIFY_KEYS$)`)
 
 // materialInText matches credential material wherever it appears in a rendered
 // document, including in a place the environment scan does not reach.
@@ -414,9 +440,57 @@ var materialInText = []struct {
 	{"a PEM block", regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)},
 }
 
-// documentMount is the one shape a credential-named setting may carry as a
-// literal: the path of a file mounted from a Secret.
-const documentMount = "/etc/stamp/documents/"
+// The one shape a credential-named setting may carry as a literal: the path of
+// a file this pod mounts from a Secret. There are two such directories and they
+// are both read-only Secret projections — the configuration documents, and the
+// audit checkpoint keys.
+const (
+	documentMount       = "/etc/stamp/documents/"
+	checkpointKeyMount  = "/etc/stamp/checkpoint/"
+	checkpointSinkMount = "/var/lib/stamp/checkpoints"
+)
+
+var secretMounts = []string{documentMount, checkpointKeyMount}
+
+// settingPaths is the file paths one setting's value names. Most of them are one
+// path; STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS is "key-id=/path,other-id=/path",
+// which is the binary's form and so has to be the scan's.
+func settingPaths(value string) []string {
+	var out []string
+	for _, entry := range strings.Split(value, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if _, path, ok := strings.Cut(entry, "="); ok {
+			entry = strings.TrimSpace(path)
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// underSecretMounts reports whether every path a setting names is inside a
+// directory this chart mounts from a Secret.
+func underSecretMounts(value string) bool {
+	paths := settingPaths(value)
+	if len(paths) == 0 {
+		return false
+	}
+	for _, p := range paths {
+		var ok bool
+		for _, root := range secretMounts {
+			if strings.HasPrefix(p, root) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
 
 func plaintextSecrets(m manifest) []string {
 	var found []string
@@ -433,9 +507,19 @@ func plaintextSecrets(m manifest) []string {
 				m.path, d.Metadata.Name)
 		case "ConfigMap":
 			for k, v := range d.Data {
-				if credentialNamed.MatchString(k) && !strings.HasPrefix(v, documentMount) {
+				if credentialNamed.MatchString(k) && !underSecretMounts(v) {
 					report("ConfigMap %s carries %s as a literal", d.Metadata.Name, k)
 				}
+			}
+		}
+		// The mount roots the scan lets a credential-named setting name. A
+		// setting whose value is a path is only as good as the mount behind it:
+		// "/tmp/key.pem" is a key somebody put in the filesystem by some means
+		// this chart cannot see.
+		mounted := map[string]bool{}
+		for _, c := range d.Spec.Template.Spec.Containers {
+			for _, mnt := range c.VolumeMounts {
+				mounted[mnt.MountPath] = true
 			}
 		}
 		for _, c := range d.Spec.Template.Spec.Containers {
@@ -446,10 +530,16 @@ func plaintextSecrets(m manifest) []string {
 				if e.Value == "" {
 					continue // a reference, or unset
 				}
-				if strings.HasPrefix(e.Value, documentMount) {
+				if !underSecretMounts(e.Value) {
+					report("%s carries %s as a literal value", d.Metadata.Name, e.Name)
 					continue
 				}
-				report("%s carries %s as a literal value", d.Metadata.Name, e.Name)
+				for _, p := range settingPaths(e.Value) {
+					if !mounted[p] && !mounted[filepath.Dir(p)] {
+						report("%s: %s names %s, which this pod does not mount from a Secret",
+							d.Metadata.Name, e.Name, p)
+					}
+				}
 			}
 		}
 	}
@@ -483,6 +573,10 @@ func TestPlaintextSecretScanCatchesAPlantedOne(t *testing.T) {
 		"carries STAMP_MFA_CIBA_CLIENT_SECRET as a literal",
 		"renders a Secret",
 		"contains a connection string",
+		// R42's two: a signing key that reached the manifest as bytes, and a
+		// key path that names something this pod does not mount.
+		"contains a PEM block",
+		"carries STAMP_AUDIT_CHECKPOINT_KEY_FILE as a literal value",
 	}
 	for _, w := range want {
 		var hit bool
@@ -510,19 +604,45 @@ func TestCredentialsArriveByReference(t *testing.T) {
 		if _, ok := c.env("STAMP_MFA_CIBA_CLIENT_SECRET"); ok {
 			c.secretRef(t, "STAMP_MFA_CIBA_CLIENT_SECRET")
 		}
+		volumes := map[string]volume{}
+		for _, v := range d.Spec.Template.Spec.Volumes {
+			volumes[v.Name] = v
+		}
 		mounted := map[string]bool{}
 		for _, mnt := range c.VolumeMounts {
+			mounted[mnt.Name] = true
+			// The audit checkpoint sink is the single writable mount, and it
+			// has to be one: the file is appended to, and
+			// readOnlyRootFilesystem leaves no other path that can be. It is
+			// also the only mount that is not a Secret, which is what keeps
+			// "writable" and "holds a credential" from ever being the same
+			// volume.
+			if mnt.MountPath == checkpointSinkMount {
+				if mnt.ReadOnly {
+					t.Errorf("%s mounts the checkpoint sink read-only; nothing could be written to it",
+						d.Metadata.Name)
+				}
+				if volumes[mnt.Name].Secret.SecretName != "" {
+					t.Errorf("%s backs the writable checkpoint sink with a Secret", d.Metadata.Name)
+				}
+				continue
+			}
 			if !mnt.ReadOnly {
 				t.Errorf("%s mounts %s writable", d.Metadata.Name, mnt.MountPath)
 			}
-			if !strings.HasPrefix(mnt.MountPath, documentMount) {
-				t.Errorf("%s mounts %s outside %s", d.Metadata.Name, mnt.MountPath, documentMount)
+			if !strings.HasPrefix(mnt.MountPath, documentMount) &&
+				!strings.HasPrefix(mnt.MountPath, checkpointKeyMount) {
+				t.Errorf("%s mounts %s outside %s and %s",
+					d.Metadata.Name, mnt.MountPath, documentMount, checkpointKeyMount)
 			}
-			mounted[mnt.Name] = true
+			if volumes[mnt.Name].Secret.SecretName == "" {
+				t.Errorf("%s mounts %s read-only from something that is not a Secret",
+					d.Metadata.Name, mnt.MountPath)
+			}
 		}
 		for _, v := range d.Spec.Template.Spec.Volumes {
-			if v.Secret.SecretName == "" {
-				t.Errorf("%s volume %s is not a Secret", d.Metadata.Name, v.Name)
+			if v.Secret.SecretName == "" && !v.writable() {
+				t.Errorf("%s volume %s is neither a Secret nor a writable volume", d.Metadata.Name, v.Name)
 			}
 			if !mounted[v.Name] {
 				t.Errorf("%s carries volume %s that nothing mounts", d.Metadata.Name, v.Name)
@@ -535,6 +655,194 @@ func TestCredentialsArriveByReference(t *testing.T) {
 			if v, ok := cm.Data[name]; ok && !strings.HasPrefix(v, documentMount) {
 				t.Errorf("%s = %q, want a path into %s", name, v, documentMount)
 			}
+		}
+	}
+}
+
+// --- audit checkpoints (R32 with R42) ------------------------------------
+
+// checkpointEnv are the settings that only appear on a tier that signs.
+var checkpointEnv = []string{
+	"STAMP_AUDIT_CHECKPOINT_KEY_FILE",
+	"STAMP_AUDIT_CHECKPOINT_KEY_ID",
+	"STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS",
+	"STAMP_AUDIT_CHECKPOINT_SINK_FILE",
+	"STAMP_AUDIT_CHECKPOINT_SINK_WEBHOOK",
+	"STAMP_AUDIT_CHECKPOINT_INTERVAL",
+}
+
+// R42 on the one credential the binary refuses to take as a value. The signing
+// key reaches the process as a path into a mounted Secret, and the whole of
+// what the manifest knows about the key is its name.
+func TestCheckpointSigningKeyIsMountedAndNeverRendered(t *testing.T) {
+	for _, tc := range []struct {
+		snapshot string
+		tier     string
+	}{
+		{allInOneSnapshot, "stamp"},
+		{splitSnapshot, "stamp-api"},
+	} {
+		t.Run(tc.tier, func(t *testing.T) {
+			m := load(t, tc.snapshot)
+			d := m.deployment(t, tc.tier)
+			c := d.container(t)
+
+			keyFile, ok := c.env("STAMP_AUDIT_CHECKPOINT_KEY_FILE")
+			if !ok {
+				t.Fatalf("%s records no checkpoints: the chart's values enable them and the "+
+					"api-bearing tier is where they are signed", tc.tier)
+			}
+			if !strings.HasPrefix(keyFile.Value, checkpointKeyMount) {
+				t.Errorf("the signing key path is %q, want a path into the mounted Secret at %s",
+					keyFile.Value, checkpointKeyMount)
+			}
+			// The identifier is what makes a rotation a restart rather than an
+			// outage, and the binary refuses to boot with a key and no id.
+			if id, ok := c.env("STAMP_AUDIT_CHECKPOINT_KEY_ID"); !ok || id.Value == "" {
+				t.Errorf("a signing key with no identifier: checkpoints signed under it could not "+
+					"survive a rotation (%s)", tc.tier)
+			}
+			// A sink that can be read back, because that is the only kind
+			// `stamp audit verify` can compare the log against.
+			sink, ok := c.env("STAMP_AUDIT_CHECKPOINT_SINK_FILE")
+			if !ok || sink.Value == "" {
+				t.Errorf("%s signs checkpoints into no readable sink", tc.tier)
+			}
+
+			// The key arrives as a read-only projection of a Secret the chart
+			// does not create, mounted at exactly the path the setting names.
+			volumes := map[string]volume{}
+			for _, v := range d.Spec.Template.Spec.Volumes {
+				volumes[v.Name] = v
+			}
+			var keyMount *volumeMount
+			for i, mnt := range c.VolumeMounts {
+				if mnt.MountPath == keyFile.Value {
+					keyMount = &c.VolumeMounts[i]
+				}
+			}
+			if keyMount == nil {
+				t.Fatalf("%s names a signing key at %s that it does not mount", tc.tier, keyFile.Value)
+			}
+			if !keyMount.ReadOnly {
+				t.Errorf("%s mounts the signing key writable", tc.tier)
+			}
+			if volumes[keyMount.Name].Secret.SecretName == "" {
+				t.Errorf("%s mounts the signing key from something that is not a Secret", tc.tier)
+			}
+
+			// And the bytes are nowhere. plaintextSecrets already refuses a PEM
+			// block anywhere in the document; this says the same thing about the
+			// two encodings a values file could smuggle one in as, so that
+			// "there is no field for it" stays a property of the rendering and
+			// not only of the chart as it is written today.
+			assertNoKeyMaterial(t, m)
+		})
+	}
+}
+
+// keyMaterial are encodings an Ed25519 private key could reach a manifest as.
+// The PEM header is the one the binary's loader accepts; the other two are what
+// an operator reaches for when a chart offers a field that takes "the key".
+var keyMaterial = []struct {
+	name string
+	re   *regexp.Regexp
+}{
+	{"a PEM private key block", regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)},
+	{"a 64-character hex seed", regexp.MustCompile(`(?i)\b[0-9a-f]{64}\b`)},
+	{"a base64 Ed25519 PKCS#8 key", regexp.MustCompile(`MC4CAQAwBQYDK2Vw`)},
+}
+
+// checksumAnnotation is the one 64-hex string a rendering is allowed to carry:
+// the digest of the ConfigMap, which is what makes a settings change roll the
+// pods. It is skipped by name rather than by loosening the pattern, so a second
+// hex blob appearing anywhere else is still a finding.
+const checksumAnnotation = "checksum/config:"
+
+func assertNoKeyMaterial(t *testing.T, m manifest) {
+	t.Helper()
+	for n, line := range bytes.Split(m.raw, []byte("\n")) {
+		if bytes.Contains(line, []byte(checksumAnnotation)) {
+			continue
+		}
+		for _, pattern := range keyMaterial {
+			if pattern.re.Match(line) {
+				t.Errorf("%s:%d contains %s", m.path, n+1, pattern.name)
+			}
+		}
+	}
+}
+
+// The signing key goes to the tier that signs and to no other.
+//
+// internal/runtime/wiring.go registers the checkpointer under the api role
+// alone, so every other tier would hold a key it never uses — and a check tier
+// holding the audit signing key can forge the evidence that its own compromise
+// would be detected by, which is the opposite of what the per-tier database
+// credentials beside it are for.
+func TestOnlyTheSigningTierHoldsCheckpointConfiguration(t *testing.T) {
+	split := load(t, splitSnapshot)
+
+	for _, d := range split.byKind("Deployment") {
+		c := d.container(t)
+		signs := d.Metadata.Name == "stamp-api"
+		for _, name := range checkpointEnv {
+			_, present := c.env(name)
+			if present && !signs {
+				t.Errorf("%s carries %s: it does not run the api role, so it would hold "+
+					"checkpoint configuration it never acts on", d.Metadata.Name, name)
+			}
+			if !present && signs && name != "STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS" {
+				t.Errorf("stamp-api carries no %s", name)
+			}
+		}
+		for _, mnt := range c.VolumeMounts {
+			under := strings.HasPrefix(mnt.MountPath, checkpointKeyMount) ||
+				strings.HasPrefix(mnt.MountPath, checkpointSinkMount)
+			if under && !signs {
+				t.Errorf("%s mounts %s, and records no checkpoints", d.Metadata.Name, mnt.MountPath)
+			}
+		}
+	}
+
+	// The all-in-one topology runs every role in one process, so that tier is
+	// the signing tier and there is nowhere else for the key to be.
+	all := load(t, allInOneSnapshot)
+	if got := len(all.byKind("Deployment")); got != 1 {
+		t.Fatalf("all-in-one rendered %d Deployments", got)
+	}
+}
+
+// The chart refuses a release that asks for checkpoints and runs no api role.
+//
+// Such a release renders valid manifests and produces no tamper evidence at
+// all, which is the failure mode a warning does not address: `helm template`
+// never prints NOTES.txt, and an operator who wrote a signing key into their
+// values has every reason to believe the control is on. The refusal is
+// exercised by deploy/helm/render.sh, which requires the render to fail and
+// keeps the message here; this asserts what the message has to say.
+func TestSplitWithoutAnAPITierIsRefused(t *testing.T) {
+	raw, err := os.ReadFile(splitNoAPIRefusal)
+	if err != nil {
+		t.Fatalf("read %s: %v (run deploy/helm/render.sh)", splitNoAPIRefusal, err)
+	}
+	msg := strings.TrimSpace(string(raw))
+	if msg == "" {
+		t.Fatalf("%s is empty: the chart rendered a release it is supposed to refuse, or the "+
+			"refusal no longer names itself", splitNoAPIRefusal)
+	}
+	// The three things the message has to carry: what is wrong, why it is not
+	// visible any other way, and both remedies — one of which is legitimate,
+	// because a data-plane-only release beside a release that runs api is a
+	// real deployment shape.
+	for _, want := range []string{
+		"api role",
+		"records a checkpoint",
+		"roles.api.enabled: true",
+		"audit.checkpoint.enabled: false",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal does not mention %q:\n  %s", want, msg)
 		}
 	}
 }

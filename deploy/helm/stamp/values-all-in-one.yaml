@@ -30,6 +30,17 @@ egress:
 authoring:
   mode: both
 
+# R32 in the shape the single-container install has to hold it: the file sink is
+# the only one verification can read back, and this is the deployment with no
+# second system configured. The key is a Secret this release does not create.
+audit:
+  checkpoint:
+    enabled: true
+    keyId: stamp-2026-08
+    signingKey:
+      secretName: stamp-checkpoint-key
+      key: signing-key.pem
+
 console:
   # Empty: the bundle and the API are the same origin here, which is what makes
   # this the single-container install.

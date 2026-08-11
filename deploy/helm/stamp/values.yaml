@@ -181,14 +181,95 @@ governance:
 audit:
   # Deny on the check path while the audit buffer is saturated. On by default.
   failClosed: true
-  # R32's signed checkpoint sink — the sink path, the signing key and its
-  # identifier — is deliberately NOT exposed here. internal/store carries the
-  # signer, the file sink and the webhook sink, but nothing in
-  # internal/runtime/config.go reads a checkpoint setting from the environment
-  # yet, so there is no variable for this chart to set. A values block here
-  # would render into a manifest the binary ignores, which is worse than its
-  # absence: it would read as a configured control. It arrives with the unit
-  # that wires the checkpointer.
+
+  # R32's signed audit checkpoint sink.
+  #
+  # A checkpoint is a signed statement of every writer's chain head at a moment,
+  # published outside the database that holds the chain. Without one, a wholesale
+  # rewrite of the audit log re-chains cleanly and nothing disagrees with it.
+  #
+  # Off by default, and the binary says so loudly at boot rather than quietly:
+  # the control is absent, not relaxed, and no other setting compensates.
+  #
+  # ONE TIER RECORDS THEM. internal/runtime/wiring.go registers the checkpointer
+  # under the api role alone — one row describes the whole installation, so one
+  # producer says everything there is to say, and running it on check or decide
+  # would put a global advisory lock on the tiers that scale horizontally. This
+  # chart therefore renders the checkpoint environment, and mounts the signing
+  # key, on the api-bearing tier and on no other. A check tier that held the
+  # signing key could forge the evidence that its own compromise would be
+  # detected by, which is the opposite of what R39's per-tier credentials are
+  # for. The cost of that choice is that a non-api tier logs "audit checkpoints
+  # are not configured" at boot even in a release that takes them; the tier that
+  # records them logs "audit checkpoints are configured" with the key identifier
+  # and the sink.
+  #
+  # In topology: split this means enabled:true needs roles.api.enabled:true in
+  # the same release. The chart refuses to render otherwise rather than emit a
+  # deployment that asks for tamper evidence and produces none.
+  checkpoint:
+    enabled: false
+
+    # Names the signing key. Stamped on every checkpoint this deployment
+    # produces, and required whenever a key is configured: a rotation is "point
+    # signingKey at the new key, give it a new id, leave the retired public half
+    # in verifyKeys", and reusing one identifier for two keys is what makes the
+    # previously signed checkpoints unreadable.
+    keyId: ""
+
+    # The Ed25519 signing key, PEM PKCS#8 — what
+    # `openssl genpkey -algorithm ed25519` writes.
+    #
+    # R42: this chart has no field a key's bytes could be written into, and the
+    # binary has no environment variable that takes one. The Secret is mounted
+    # and the environment carries the path, so a rendered manifest, a `helm get
+    # values` and a startup log carry the name of the key and never the key.
+    # The Secret already exists in the namespace; the chart creates none.
+    signingKey:
+      secretName: ""
+      key: signing-key.pem
+
+    # The public halves verification also accepts, by identifier: the retired
+    # keys of previous rotations. Checkpoints signed before a rotation stay
+    # verifiable, which is what makes the rotation a restart and not an outage.
+    #
+    # One Secret holding one entry per retired key. A public key is not a
+    # secret and could have been carried inline; it is a path anyway so that the
+    # two halves of one rotation are configured the same way.
+    verifyKeys:
+      secretName: ""
+      # - id: 2026-01
+      #   key: 2026-01.pub.pem
+      keys: []
+
+    sink:
+      # The append-only file signed checkpoints are written to. It is the
+      # default because it is the only sink shape verification can read back:
+      # `stamp audit verify` compares the log against a sink it can read.
+      file:
+        enabled: true
+        # The directory is fixed because it has to agree with the volume mounted
+        # below, and a path outside that volume is unwritable under
+        # securityContext.readOnlyRootFilesystem. Only the file name is yours.
+        name: checkpoints.jsonl
+        # The writable volume the sink lives on. Empty renders an emptyDir,
+        # which is not the data loss it looks like: each tick's repair pass
+        # republishes from the database every checkpoint the sink is missing, so
+        # a restarted pod converges on the whole series. Give a PVC here if you
+        # want the file to survive without that pass — e.g.
+        #   volume:
+        #     persistentVolumeClaim:
+        #       claimName: stamp-checkpoints
+        volume: {}
+      # An optional additional destination, delivered through the egress gate —
+      # so its origin must also appear in egress.allow, exactly (R35). It is an
+      # addition and not a replacement: a webhook cannot be read back, so a
+      # deployment whose only sink is one cannot verify itself.
+      webhook: ""
+
+    # How often a checkpoint is taken, as a Go duration. Empty selects the
+    # binary's default (5m).
+    interval: ""
 
 # --- console (D19, R50, R51) ---------------------------------------------
 console:

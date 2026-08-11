@@ -1,5 +1,7 @@
 {{- $ctx := . -}}
+{{- include "stamp.checkpointsValidated" . -}}
 {{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
+{{- $cp := .Values.audit.checkpoint -}}
 {{/* The configuration documents this release actually mounts. */}}
 {{- $mounted := dict -}}
 {{- range $name, $doc := .Values.documents -}}
@@ -11,6 +13,8 @@
 {{- end -}}
 {{- end -}}
 {{- range $tier := $tiers }}
+{{- $records := and $cp.enabled (include "stamp.tierRecordsCheckpoints" (dict "tier" $tier)) -}}
+{{- $sinkFile := and $records $cp.sink.file.enabled }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -94,6 +98,39 @@ spec:
                   name: {{ $ctx.Values.mfa.ciba.clientSecret.secretName | quote }}
                   key: {{ $ctx.Values.mfa.ciba.clientSecret.key | quote }}
             {{- end }}
+            {{- if $records }}
+            # R32 and R42. The api role is the only one that registers the
+            # checkpointer, so these six variables are rendered on this tier and
+            # on no other — the key is mounted where it is used, and a check tier
+            # compromised through the PEP surface holds no key that could sign a
+            # replacement for the evidence of its own compromise.
+            #
+            # Every one of them is a path or a scalar. There is no variable here
+            # that a key's bytes could be written into, because the binary has
+            # none: a private key handed over in the environment is a key in the
+            # process listing, in `docker inspect` and in the values that
+            # produced this manifest.
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_FILE
+              value: {{ include "stamp.checkpointKeyPath" $ctx | quote }}
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_ID
+              value: {{ $cp.keyId | quote }}
+            {{- if $cp.verifyKeys.keys }}
+            - name: STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS
+              value: {{ include "stamp.checkpointVerifyKeys" $ctx | quote }}
+            {{- end }}
+            {{- if $sinkFile }}
+            - name: STAMP_AUDIT_CHECKPOINT_SINK_FILE
+              value: {{ include "stamp.checkpointSinkPath" $ctx | quote }}
+            {{- end }}
+            {{- with $cp.sink.webhook }}
+            - name: STAMP_AUDIT_CHECKPOINT_SINK_WEBHOOK
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $cp.interval }}
+            - name: STAMP_AUDIT_CHECKPOINT_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- with $ctx.Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -120,7 +157,7 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- if $mounted }}
+          {{- if or $mounted $records }}
           volumeMounts:
             {{- range $name, $doc := $mounted }}
             - name: {{ printf "doc-%s" (kebabcase $name) }}
@@ -128,10 +165,32 @@ spec:
               subPath: {{ $doc.key | quote }}
               readOnly: true
             {{- end }}
+            {{- if $records }}
+            - name: checkpoint-key
+              mountPath: {{ include "stamp.checkpointKeyPath" $ctx | quote }}
+              subPath: {{ $cp.signingKey.key | quote }}
+              readOnly: true
+            {{- if $cp.verifyKeys.keys }}
+            - name: checkpoint-verify
+              mountPath: {{ include "stamp.checkpointVerifyDir" $ctx | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if $sinkFile }}
+            # The one writable path in this container, and the reason
+            # readOnlyRootFilesystem can stay on. The sink is append-only and
+            # holds no credential — a checkpoint is a signature over public
+            # chain heads — so it is the only mount here that is not a Secret
+            # and not read-only.
+            - name: checkpoint-sink
+              mountPath: {{ include "stamp.checkpointSinkDir" $ctx | quote }}
+            {{- end }}
+            {{- end }}
           {{- end }}
-      {{- if $mounted }}
+      {{- if or $mounted $records }}
       # The documents are mounted, not templated: three of the six may carry a
-      # credential and none of them may appear in a manifest.
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
       volumes:
         {{- range $name, $doc := $mounted }}
         - name: {{ printf "doc-%s" (kebabcase $name) }}
@@ -140,6 +199,40 @@ spec:
             items:
               - key: {{ $doc.key | quote }}
                 path: {{ $doc.key | quote }}
+        {{- end }}
+        {{- if $records }}
+        - name: checkpoint-key
+          secret:
+            secretName: {{ $cp.signingKey.secretName | quote }}
+            defaultMode: 0400
+            items:
+              - key: {{ $cp.signingKey.key | quote }}
+                path: {{ $cp.signingKey.key | quote }}
+        {{- if $cp.verifyKeys.keys }}
+        - name: checkpoint-verify
+          secret:
+            secretName: {{ $cp.verifyKeys.secretName | quote }}
+            defaultMode: 0444
+            items:
+              {{- range $entry := $cp.verifyKeys.keys }}
+              - key: {{ $entry.key | quote }}
+                path: {{ $entry.key | quote }}
+              {{- end }}
+        {{- end }}
+        {{- if $sinkFile }}
+        - name: checkpoint-sink
+          {{- if $cp.sink.file.volume }}
+          {{- toYaml $cp.sink.file.volume | nindent 10 }}
+          {{- else }}
+          # An emptyDir loses the file when the pod is replaced, and the series
+          # survives anyway: the repair pass at the head of each tick
+          # republishes from the database every checkpoint this host's copy is
+          # missing, so a restarted pod converges on the whole series rather
+          # than starting a new one. Give sink.file.volume a claim if you want
+          # the file itself to persist.
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
         {{- end }}
       {{- end }}
       {{- with $tier.tier.nodeSelector }}
