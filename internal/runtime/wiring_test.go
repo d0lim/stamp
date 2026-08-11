@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -601,6 +602,224 @@ func sameInstant(a, b *time.Time) bool {
 }
 
 // ---------------------------------------------------------------------------
+// F5 — decide over HTTP (R2, R40)
+// ---------------------------------------------------------------------------
+
+// TestF5TheDecideSurfaceCreatesAndServesDecisions is the decide path driven the
+// way a PEP drives it: over the wire, with a workload credential, against the
+// assembled process.
+//
+// Every other flow in this file reaches the lifecycle in process, through
+// [App.Decisions]. That is enough to demonstrate what a decision does and not
+// enough to demonstrate that anything outside this binary can make one — which
+// is the whole of what this unit adds, and the reason the check for it is here
+// rather than only in the api package's own tests.
+func TestF5TheDecideSurfaceCreatesAndServesDecisions(t *testing.T) {
+	h := newHarness(t, harnessOptions{writerID: "f4-writer"})
+	h.seed(tenantSchema(), closurePolicy("closure-approval", 1, "carol"), whitelistPolicy("whitelist-transfer"))
+
+	pep := h.idp.workload(t, "svc-payments")
+	other := h.idp.workload(t, "svc-someone-else")
+
+	var created decision.Result
+	t.Run("a workload creates a pending decision", func(t *testing.T) {
+		code, body := h.do(http.MethodPost, api.SurfacePEP, api.DecisionsPath, pep,
+			decideRequest("acct-src", "close", 5000, "45m"), nil)
+		if code != http.StatusCreated {
+			t.Fatalf("POST %s = %d: %s", api.DecisionsPath, code, body)
+		}
+		h.decode(body, &created)
+
+		// R2: the object carries its state, the challenge it is waiting on with
+		// the progress of collection, when it stops waiting, and its obligations.
+		if !created.Pending() || created.ID == "" {
+			t.Fatalf("the decision is %+v, want a pending object with an identifier", created)
+		}
+		if len(created.Challenges) != 1 {
+			t.Fatalf("challenges = %+v, want the quorum the policy demands", created.Challenges)
+		}
+		if got := created.Challenges[0]; got.Kind != policy.ChallengeQuorum || got.Have != 0 || got.Need != 1 {
+			t.Errorf("challenge = %+v, want a quorum collecting 0 of 1", got)
+		}
+		if created.Obligations == nil {
+			t.Error("the decision reports no obligation list at all, not even an empty one")
+		}
+		if created.ExpiresAt.IsZero() || created.PolicyID != "closure-approval" {
+			t.Errorf("decision = %+v, want it pinned to the policy that gated it, with a deadline", created)
+		}
+		// The lifetime the caller asked for is the lifetime it got.
+		if lived := created.ExpiresAt.Sub(created.CreatedAt); lived < 44*time.Minute || lived > 46*time.Minute {
+			t.Errorf("the decision lives %s, want the 45m the request asked for", lived)
+		}
+	})
+
+	t.Run("the creator reads it back", func(t *testing.T) {
+		code, body := h.do(http.MethodGet, api.SurfacePEP, api.DecisionsPath+"/"+created.ID, pep, "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("the creator's read = %d: %s", code, body)
+		}
+		var got decision.Result
+		h.decode(body, &got)
+		if got.ID != created.ID || !got.Pending() {
+			t.Errorf("read back %+v, want the decision that was created", got)
+		}
+	})
+
+	t.Run("another workload is refused, and cannot tell that from a decision that is not there", func(t *testing.T) {
+		// R40. This is the assertion the endpoint exists to satisfy: a workload
+		// holding a perfectly good credential must not be able to use this
+		// surface to learn which decision identifiers name anything.
+		refusedCode, refused := h.do(http.MethodGet, api.SurfacePEP,
+			api.DecisionsPath+"/"+created.ID, other, "", nil)
+		missingCode, missing := h.do(http.MethodGet, api.SurfacePEP,
+			api.DecisionsPath+"/3f1b0f2a-0000-4000-8000-00000000f4f4", other, "", nil)
+		if refusedCode != http.StatusNotFound || missingCode != http.StatusNotFound {
+			t.Fatalf("refused = %d and missing = %d, want both %d", refusedCode, missingCode, http.StatusNotFound)
+		}
+		if string(refused) != string(missing) {
+			t.Errorf("a refused read answers %q and a missing one %q; the two must not be tellable apart",
+				refused, missing)
+		}
+
+		// And the refusal is in the chain, which is what makes it a refusal
+		// somebody can be shown rather than a silence.
+		rows := h.auditPayloadsFor(decision.AuditKindAccessRefused, created.ID)
+		if len(rows) != 1 {
+			t.Fatalf("%d %s rows, want the one refused read", len(rows), decision.AuditKindAccessRefused)
+		}
+		if rows[0]["operation"] != "read" || rows[0]["decision_id"] != created.ID {
+			t.Errorf("the refusal row is %v, want it to name the read and the decision", rows[0])
+		}
+		if caller, _ := rows[0]["caller_id"].(string); !strings.HasSuffix(caller, "#svc-someone-else") {
+			t.Errorf("the refusal row names %q, want the workload that was turned away", caller)
+		}
+	})
+
+	t.Run("the targeted approver reads it on the console surface instead", func(t *testing.T) {
+		// KTD2: the creator is a workload and the approver is a person, and the
+		// mount table admits one credential kind per surface — so the two reads
+		// are two routes over one rule, not one route serving both.
+		code, body := h.do(http.MethodGet, api.SurfaceConsole,
+			"/audit/decisions/"+created.ID, h.idp.user(t, "carol"), "", nil)
+		if code != http.StatusOK {
+			t.Fatalf("the approver's console read = %d: %s", code, body)
+		}
+		if code, _ := h.do(http.MethodGet, api.SurfaceConsole,
+			"/audit/decisions/"+created.ID, h.idp.user(t, "mallory"), "", nil); code == http.StatusOK {
+			t.Error("a person who is not an approver read the decision on the console surface")
+		}
+		// The approver's own token buys nothing on the PEP surface: it is not a
+		// workload credential, and the route does not admit one.
+		if code, _ := h.do(http.MethodGet, api.SurfacePEP,
+			api.DecisionsPath+"/"+created.ID, h.idp.user(t, "carol"), "", nil); code != http.StatusForbidden {
+			t.Errorf("an approver's token on the PEP read = %d, want %d", code, http.StatusForbidden)
+		}
+	})
+
+	t.Run("a decide that needs nothing resolves at once and is still an object", func(t *testing.T) {
+		// The body is F1's check fixture, unchanged. That is KTD1 as an
+		// executable claim: a PEP asks the two questions with one value, and the
+		// second one reaches the same fact source and the same policy the first
+		// one did.
+		code, body := h.do(http.MethodPost, api.SurfacePEP, api.DecisionsPath, pep,
+			evaluation("1001", "2002", "transfer"), nil)
+		if code != http.StatusCreated {
+			t.Fatalf("an immediate allow = %d: %s", code, body)
+		}
+		var allowed decision.Result
+		h.decode(body, &allowed)
+		if !allowed.Allowed() || allowed.ID == "" {
+			t.Fatalf("the decision is %+v, want an allow with an identifier", allowed)
+		}
+		if len(allowed.Challenges) != 0 || allowed.PolicyID != "whitelist-transfer" {
+			t.Errorf("decision = %+v, want it resolved by the ungated policy with no challenges", allowed)
+		}
+		// R2's promise is about the object, not about the moment: a decision
+		// that needed nothing is still there to be read afterwards.
+		readCode, read := h.do(http.MethodGet, api.SurfacePEP, api.DecisionsPath+"/"+allowed.ID, pep, "", nil)
+		if readCode != http.StatusOK {
+			t.Fatalf("reading back a resolved decision = %d: %s", readCode, read)
+		}
+		var got decision.Result
+		h.decode(read, &got)
+		if got.ID != allowed.ID || !got.Allowed() || got.ResolvedAt == nil {
+			t.Errorf("read back %+v, want the resolved decision with the instant it resolved", got)
+		}
+	})
+
+	t.Run("a deny creates no decision and is recorded anyway", func(t *testing.T) {
+		before := h.countDecisions()
+		code, body := h.do(http.MethodPost, api.SurfacePEP, api.DecisionsPath, pep,
+			decideRequest("acct-small", "close", 10, ""), nil)
+		if code != http.StatusOK {
+			t.Fatalf("a denied decide = %d, want %d: %s", code, http.StatusOK, body)
+		}
+		var denied decision.Result
+		h.decode(body, &denied)
+		if denied.ID != "" {
+			t.Errorf("the deny carries the identifier %q of a decision that should not exist", denied.ID)
+		}
+		if denied.State != store.DecisionDenied {
+			t.Errorf("state = %q, want %q", denied.State, store.DecisionDenied)
+		}
+		if after := h.countDecisions(); after != before {
+			t.Errorf("the decisions table grew by %d on a deny, want 0", after-before)
+		}
+		refusals := h.auditPayloadsFor(decision.AuditKindDecisionRefused, "acct-small")
+		if len(refusals) != 1 {
+			t.Fatalf("%d %s rows, want the one deny", len(refusals), decision.AuditKindDecisionRefused)
+		}
+		if refusals[0]["reason"] != string(denied.Reason) {
+			t.Errorf("the audit row's ground is %v and the answer's is %q; they have to be the same",
+				refusals[0]["reason"], denied.Reason)
+		}
+	})
+
+	t.Run("a request the policy set cannot map is refused, not decided", func(t *testing.T) {
+		before := h.countDecisions()
+		body := `{
+			"subject":  {"type": "account", "id": "acct-src", "properties": {"number": "1001"}},
+			"resource": {"type": "account", "id": "acct-dst", "properties": {"amount": "a lot"}},
+			"action":   {"name": "close"}
+		}`
+		code, resp := h.do(http.MethodPost, api.SurfacePEP, api.DecisionsPath, pep, body, nil)
+		if code != http.StatusBadRequest {
+			t.Fatalf("a mistyped declared property = %d, want %d: %s", code, http.StatusBadRequest, resp)
+		}
+		if after := h.countDecisions(); after != before {
+			t.Errorf("the decisions table grew on a refused request")
+		}
+	})
+
+	t.Run("the audit chain still verifies", func(t *testing.T) { h.verifyChain() })
+}
+
+// decideRequest is one decide body: the AuthZEN evaluation body the check
+// surface takes, plus the lifetime only a decision has.
+func decideRequest(subjectID, action string, amount int, ttl string) string {
+	body := fmt.Sprintf(`{
+		"subject":  {"type": "account", "id": %q, "properties": {"number": "1001"}},
+		"resource": {"type": "account", "id": "acct-dst", "properties": {"amount": %d}},
+		"action":   {"name": %q}`, subjectID, amount, action)
+	if ttl != "" {
+		body += fmt.Sprintf(",\n\t\t\"ttl\": %q", ttl)
+	}
+	return body + "\n\t}"
+}
+
+// countDecisions is how many decision rows exist, for the assertions about what
+// a deny does not leave behind.
+func (h *harness) countDecisions() int {
+	h.t.Helper()
+	var n int
+	if err := h.app.Store().Pool().QueryRow(context.Background(),
+		`SELECT count(*) FROM decisions`).Scan(&n); err != nil {
+		h.t.Fatalf("count decisions: %v", err)
+	}
+	return n
+}
+
+// ---------------------------------------------------------------------------
 // the composition root, for the three kinds M2 adds
 // ---------------------------------------------------------------------------
 
@@ -807,6 +1026,11 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 			want: map[api.Surface]map[string]int{
 				api.SurfacePEP: {
 					"POST " + api.EvaluationPath: http.StatusUnauthorized,
+					// The two halves of the PEP surface are separately mounted:
+					// a check tier answers the AuthZEN endpoint and has no way to
+					// create a decision, which is what the role split is for.
+					"POST " + api.DecisionsPath:       http.StatusNotFound,
+					"GET " + api.DecisionsPath + "/1": http.StatusNotFound,
 				},
 				api.SurfaceConsole: {
 					"POST " + approvalPath: http.StatusNotFound,
@@ -820,6 +1044,11 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 			want: map[api.Surface]map[string]int{
 				api.SurfacePEP: {
 					"POST " + api.EvaluationPath: http.StatusNotFound,
+					// R2 and R40's creation and read: mounted here, and behind a
+					// workload credential, so an unauthenticated caller is refused
+					// a credential rather than told the route does not exist.
+					"POST " + api.DecisionsPath:       http.StatusUnauthorized,
+					"GET " + api.DecisionsPath + "/1": http.StatusUnauthorized,
 				},
 				api.SurfaceConsole: {
 					"POST " + approvalPath: http.StatusUnauthorized,

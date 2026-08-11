@@ -344,6 +344,26 @@ func (a *App) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The decide surface takes the plane and not `plane.Service()`. The plane
+	// rebuilds its service when the effective policy set moves, so a surface
+	// holding the service this process booted with would keep creating decisions
+	// — and issuing challenges — from a revision that is no longer in force.
+	//
+	// It reads its schema from the same plane for the same reason, and because a
+	// decide-only process runs no check tier to borrow one from.
+	decisions, err := api.NewDecisions(api.DecisionsConfig{
+		Decisions: plane,
+		Access:    plane,
+		Schema:    plane,
+		// The same two knobs the check surface reads, from the same
+		// configuration: a PEP that asks the two questions with one body must
+		// have the body mean one thing.
+		ContextEntity:   cfg.CheckContextEntity,
+		PropertyAliases: cfg.CheckPropertyAliases,
+	})
+	if err != nil {
+		return err
+	}
 	// Every collecting surface submits through the same seam: an approval, an
 	// mfa completion, a delay cancellation and a webhook verdict are one code
 	// path with four doors, and the revision reconcile that has to follow the
@@ -366,8 +386,17 @@ func (a *App) build(ctx context.Context) error {
 		return err
 	}
 	auditConsole, err := api.NewAuditConsole(api.AuditConsoleConfig{
-		History:  store.NewHistory(s.Pool()),
-		Access:   plane.Service(),
+		History: store.NewHistory(s.Pool()),
+		// The plane, not the service it currently holds. Capturing the service
+		// here would pin this surface to the one this process booted with, and
+		// the two reads of R40's rule — this one and the PEP's — would be asking
+		// two different services the same question. Nothing observable turns on
+		// it today, because every method a read reaches goes to the store, the
+		// audit writer and the challenge registry, which a rebuild carries over
+		// unchanged; the evaluator is the only thing that moves and no read
+		// touches it. It is written this way so that stays true by construction
+		// rather than by inspection.
+		Access:   plane,
 		Auditors: api.AuditorRule{Claim: cfg.AuditorClaim, Values: cfg.AuditorValues},
 		Audit:    writer,
 	})
@@ -439,6 +468,17 @@ func (a *App) build(ctx context.Context) error {
 		Name:  "policy-refresh",
 		Roles: []Role{RoleCheck},
 		Run:   check.Run,
+	}); err != nil {
+		return err
+	}
+	if err := registry.Add(Component{
+		// The decide tier's own half of the PEP surface, and the only routes
+		// this role puts there: creating a decision is what the decide tier is,
+		// and a check tier that could create one would hold the state the split
+		// exists to keep out of it.
+		Name:   "decide-api",
+		Roles:  []Role{RoleDecide},
+		Routes: decisions.Routes(),
 	}); err != nil {
 		return err
 	}

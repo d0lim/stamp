@@ -25,12 +25,15 @@ import (
 
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/engine"
+	"github.com/d0lim/stamp/internal/identity"
+	"github.com/d0lim/stamp/internal/policy"
 )
 
 // DecisionPath is the decide-side entry points a surface or a test drives.
 type DecisionPath interface {
 	Decide(ctx context.Context, req decision.Request) (decision.Result, error)
 	Submit(ctx context.Context, sub decision.Submission) (decision.Result, error)
+	Get(ctx context.Context, caller *identity.Subject, id string) (decision.Result, error)
 }
 
 // decidePlane is a decision service that follows the effective policy set.
@@ -43,6 +46,11 @@ type decidePlane struct {
 	mu       sync.RWMutex
 	revision engine.Revision
 	svc      *decision.Service
+	// schema is the held snapshot's schema. It is kept rather than discarded
+	// with the snapshot because a surface that takes an access request has to
+	// interpret its properties against the declarations the evaluation will
+	// read, and the decide path had no way to see them.
+	schema *policy.Schema
 }
 
 var _ DecisionPath = (*decidePlane)(nil)
@@ -96,7 +104,7 @@ func (p *decidePlane) refresh(ctx context.Context) error {
 	}
 
 	p.mu.Lock()
-	p.svc, p.revision = svc, rev
+	p.svc, p.revision, p.schema = svc, rev, snap.Schema()
 	p.mu.Unlock()
 	return nil
 }
@@ -124,6 +132,21 @@ func (p *decidePlane) Service() *decision.Service {
 	return p.svc
 }
 
+// Schema returns the schema of the policy set the plane currently judges on, so
+// that a surface interprets a request against the same declarations the
+// evaluation will read. The caller must not modify it. Nil means no policy set
+// is held, which a constructed plane never reports — the initial load must
+// succeed — and which a surface still has to answer for rather than crash on.
+//
+// It deliberately does not reach for the check tier's schema. A decide-only
+// process runs no check service, and asking for one here would make the two
+// roles inseparable to serve one read.
+func (p *decidePlane) Schema() *policy.Schema {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.schema
+}
+
 // Decide creates a decision against the currently held policy set.
 func (p *decidePlane) Decide(ctx context.Context, req decision.Request) (decision.Result, error) {
 	return p.Service().Decide(ctx, req)
@@ -132,4 +155,14 @@ func (p *decidePlane) Decide(ctx context.Context, req decision.Request) (decisio
 // Submit hands evidence to a challenge.
 func (p *decidePlane) Submit(ctx context.Context, sub decision.Submission) (decision.Result, error) {
 	return p.Service().Submit(ctx, sub)
+}
+
+// Get returns a decision to a caller R40 entitles to see it.
+//
+// The rule itself — creator or targeted approver, and the audited refusal — is
+// [decision.Service.Get]'s, and going through the plane rather than through a
+// captured service is what keeps the read on the same service the writes use
+// after a revision swaps it.
+func (p *decidePlane) Get(ctx context.Context, caller *identity.Subject, id string) (decision.Result, error) {
+	return p.Service().Get(ctx, caller, id)
 }

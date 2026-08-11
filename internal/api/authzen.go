@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"strconv"
@@ -67,11 +68,30 @@ type ActionRef struct {
 }
 
 // EvaluationRequest is the AuthZEN Access Evaluation request body.
+//
+// It is a package-level type rather than one of [CheckAPI]'s, because the decide
+// surface takes the same body (KTD1): a PEP that has asked a check question has
+// to be able to ask the decide question with the value it already built.
 type EvaluationRequest struct {
 	Subject  Entity         `json:"subject"`
 	Resource Entity         `json:"resource"`
 	Action   ActionRef      `json:"action"`
 	Context  map[string]any `json:"context,omitempty"`
+}
+
+// validate is the shape check every surface that takes this body runs. It is
+// stated once so that check and decide cannot come to disagree about what a
+// well-formed access request is.
+func (req EvaluationRequest) validate() error {
+	switch {
+	case req.Subject.Type == "" || req.Subject.ID == "":
+		return errors.New("subject needs a type and an id")
+	case req.Action.Name == "":
+		return errors.New("action needs a name")
+	case req.Resource.Type == "" || req.Resource.ID == "":
+		return errors.New("resource needs a type and an id")
+	}
+	return nil
 }
 
 // EvaluationResponse is the AuthZEN Access Evaluation response body.
@@ -240,25 +260,36 @@ func (a *CheckAPI) respond(w http.ResponseWriter, result engine.CheckResult, rev
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// inputFor turns an AuthZEN request into an evaluation input.
+func (a *CheckAPI) inputFor(schema *policy.Schema, req EvaluationRequest) (engine.Input, error) {
+	return evaluationInput(schema, req, a.ctxType, a.aliases)
+}
+
+// evaluationInput turns an AuthZEN request into an evaluation input.
 //
 // The mapping is where the two models meet. AuthZEN entities carry an
 // identifier in the envelope and everything else in a free-form property bag;
 // STAMP conditions read declared, typed attributes. So the identifier becomes
 // the declared `id` attribute when the schema has one, declared properties are
 // converted to their declared types, and undeclared properties are dropped.
-func (a *CheckAPI) inputFor(schema *policy.Schema, req EvaluationRequest) (engine.Input, error) {
-	subject, err := entityInput(schema, req.Subject, a.aliases)
+//
+// It is one function and not one per surface. check and decide take the same
+// body and must reach the same input from it — a decision issued against
+// attributes that a check of the same request would not have seen is the
+// divergence that makes the two calls untrustworthy as a pair.
+func evaluationInput(schema *policy.Schema, req EvaluationRequest,
+	ctxType string, aliases map[string]string,
+) (engine.Input, error) {
+	subject, err := entityInput(schema, req.Subject, aliases)
 	if err != nil {
 		return engine.Input{}, fmt.Errorf("subject: %w", err)
 	}
-	resource, err := entityInput(schema, req.Resource, a.aliases)
+	resource, err := entityInput(schema, req.Resource, aliases)
 	if err != nil {
 		return engine.Input{}, fmt.Errorf("resource: %w", err)
 	}
 	in := engine.Input{Action: req.Action.Name, Subject: subject, Resource: resource}
-	if a.ctxType != "" {
-		context, err := entityInput(schema, Entity{Type: a.ctxType, Properties: req.Context}, a.aliases)
+	if ctxType != "" {
+		context, err := entityInput(schema, Entity{Type: ctxType, Properties: req.Context}, aliases)
 		if err != nil {
 			return engine.Input{}, fmt.Errorf("context: %w", err)
 		}
@@ -380,20 +411,26 @@ func attributeValue(t policy.Type, raw any) (any, error) {
 	return nil, fmt.Errorf("expected %s, got %T", t, raw)
 }
 
+// jsonDecoder is how every body whose values reach [attributeValue] is read.
+//
+// UseNumber is not a preference: an int attribute read through float64 is an
+// attribute a policy can compare wrongly, and a surface that forgot the call
+// would fail only on the values large enough to matter. Stating it once is what
+// keeps a second surface from forgetting it.
+func jsonDecoder(r io.Reader) *json.Decoder {
+	dec := json.NewDecoder(r)
+	dec.UseNumber()
+	return dec
+}
+
 func decodeEvaluationRequest(w http.ResponseWriter, r *http.Request, maxBytes int64) (EvaluationRequest, error) {
 	var req EvaluationRequest
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
-	dec.UseNumber()
+	dec := jsonDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 	if err := dec.Decode(&req); err != nil {
 		return EvaluationRequest{}, fmt.Errorf("request body is not a valid evaluation request: %w", err)
 	}
-	switch {
-	case req.Subject.Type == "" || req.Subject.ID == "":
-		return EvaluationRequest{}, errors.New("subject needs a type and an id")
-	case req.Action.Name == "":
-		return EvaluationRequest{}, errors.New("action needs a name")
-	case req.Resource.Type == "" || req.Resource.ID == "":
-		return EvaluationRequest{}, errors.New("resource needs a type and an id")
+	if err := req.validate(); err != nil {
+		return EvaluationRequest{}, err
 	}
 	return req, nil
 }
