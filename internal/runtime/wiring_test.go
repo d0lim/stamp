@@ -1172,6 +1172,78 @@ func TestAuditWriterCollisionFailsTheBoot(t *testing.T) {
 	}
 }
 
+// TestAuditAlertThresholdMovesWhenTheLossAlertFires is R32's alert sensitivity,
+// observed rather than cross-referenced.
+//
+// The consumption check in consumption_test.go proves the composition root reads
+// AuditAlertThreshold. It cannot prove the value reaches the counter the alert
+// is compared against — that is the difference between the two shapes of check
+// Open Question 3 named, and this test is the second shape for the one field
+// this unit adds. It drives the assembled process's own buffer, so what it
+// observes is the deployment configuration arriving at the behaviour, with no
+// seam built for the test to look through.
+//
+// The two subtests are the whole of the claim: the same losses must not alert
+// under a raised threshold and must alert under the default. A wiring that
+// dropped the field would pass the first half of one of them and fail the other.
+func TestAuditAlertThresholdMovesWhenTheLossAlertFires(t *testing.T) {
+	// saturate fills the buffer's queue and then loses `losses` events, which
+	// is deterministic because the queue holds one and nothing drains it: the
+	// flush interval is longer than the test and the batch never fills.
+	saturate := func(t *testing.T, buffer *api.AuditBuffer, losses int64) api.AuditStats {
+		t.Helper()
+		ctx := context.Background()
+		start := buffer.Stats().Dropped
+		for buffer.Stats().Queued < 1 {
+			buffer.Record(ctx, api.Event{Kind: api.EventCheck, CallerID: "filler"})
+		}
+		for i := int64(0); i < losses; i++ {
+			buffer.Record(ctx, api.Event{Kind: api.EventCheck, CallerID: "lost"})
+		}
+		stats := buffer.Stats()
+		if got := stats.Dropped - start; got != losses {
+			t.Fatalf("the buffer lost %d events, want exactly %d: the saturation is not deterministic", got, losses)
+		}
+		return stats
+	}
+
+	starve := func(c *Config) {
+		c.AuditCapacity = 1
+		c.AuditBatchSize = 1 << 20
+		c.AuditFlushInterval = time.Hour
+	}
+
+	// The threshold an operator raised: R32's sensitivity. Four losses are not
+	// yet the alert; the fifth is.
+	t.Run("a raised threshold holds the alert until the count reaches it", func(t *testing.T) {
+		const threshold = 5
+		h := newHarness(t, harnessOptions{writerID: "alert-raised", mutate: func(c *Config) {
+			starve(c)
+			c.AuditAlertThreshold = threshold
+		}})
+		buffer := h.app.buffer
+
+		if stats := saturate(t, buffer, threshold-1); stats.Alerting {
+			t.Fatalf("the loss alert fired after %d of %d lost events: the configured threshold is not "+
+				"reaching the buffer", stats.Dropped, threshold)
+		}
+		if stats := saturate(t, buffer, 1); !stats.Alerting {
+			t.Fatalf("the loss alert did not fire after %d lost events, with a threshold of %d",
+				stats.Dropped, threshold)
+		}
+	})
+
+	// The same losses against the default, which is what every deployment got
+	// while nothing carried the setting: the first lost event alerts.
+	t.Run("the default alerts on the first lost event", func(t *testing.T) {
+		h := newHarness(t, harnessOptions{writerID: "alert-default", mutate: starve})
+		if stats := saturate(t, h.app.buffer, 1); !stats.Alerting {
+			t.Fatalf("the loss alert did not fire on the first lost event, which is the default of %d",
+				api.DefaultAuditAlertThreshold)
+		}
+	})
+}
+
 // TestMissingDSNFailsStartup is the configuration rule: nothing that would be a
 // trust decision gets a default.
 func TestMissingDSNFailsStartup(t *testing.T) {
