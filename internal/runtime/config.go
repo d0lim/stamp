@@ -212,6 +212,23 @@ type Config struct {
 	DecisionTTL    time.Duration
 	MaxOutstanding int
 
+	// DecideRate and DecideSubjectRate are R43's rate limits on decide creation,
+	// per caller and per subject. A zero field selects the api package's default
+	// for that field; a negative rate removes the limit.
+	//
+	// They are the shape [stream.RateLimit] already gave the four
+	// `STAMP_INGEST_RATE_*` variables, because this deployment has one way of
+	// writing down a token bucket and a second would be a second thing to learn.
+	//
+	// The limit they configure is **per instance**: the buckets live in this
+	// process, so a fleet of N replicas admits N times what is written here. That
+	// is the price of not putting a query on the decide path, and it is bounded
+	// by the fact that MaxOutstanding — the absolute cap on what a subject can
+	// accumulate — is counted in the database and does bind across the fleet.
+	// An operator sizing a fleet divides these by the replica count.
+	DecideRate        stream.RateLimit
+	DecideSubjectRate stream.RateLimit
+
 	// GovernanceFloor is R33's operator lower bound on a revision quorum.
 	GovernanceFloor revision.Floor
 	// RevisionTTL bounds how long a revision may stay pending. Zero selects
@@ -646,6 +663,11 @@ const (
 	EnvDecisionTTL    = "STAMP_DECISION_TTL"
 	EnvMaxOutstanding = "STAMP_MAX_OUTSTANDING_DECISIONS"
 
+	EnvDecideRate             = "STAMP_DECIDE_RATE_PER_SECOND"
+	EnvDecideBurst            = "STAMP_DECIDE_RATE_BURST"
+	EnvDecideSubjectRate      = "STAMP_DECIDE_SUBJECT_RATE_PER_SECOND"
+	EnvDecideSubjectRateBurst = "STAMP_DECIDE_SUBJECT_RATE_BURST"
+
 	EnvFloorMinApprovers       = "STAMP_GOVERNANCE_MIN_APPROVERS"
 	EnvFloorProposerMayApprove = "STAMP_GOVERNANCE_PROPOSER_MAY_APPROVE"
 	EnvRevisionTTL             = "STAMP_REVISION_TTL"
@@ -736,13 +758,21 @@ func ConfigFromEnv() (Config, error) {
 		PolicyStalenessDeadline: envDuration(EnvPolicyStalenessDeadline, 0, fail),
 		DecisionTTL:             envDuration(EnvDecisionTTL, 0, fail),
 		MaxOutstanding:          envInt(EnvMaxOutstanding, 0, fail),
-		RevisionTTL:             envDuration(EnvRevisionTTL, 0, fail),
-		ReconcileInterval:       envDuration(EnvReconcileInterval, DefaultReconcileInterval, fail),
-		BootstrapWarnInterval:   envDuration(EnvBootstrapWarnInterval, 0, fail),
-		AuditorClaim:            strings.TrimSpace(os.Getenv(EnvAuditorClaim)),
-		AuditorValues:           splitList(os.Getenv(EnvAuditorValues)),
-		CheckContextEntity:      strings.TrimSpace(os.Getenv(EnvCheckContextEntity)),
-		CapabilityClaim:         strings.TrimSpace(os.Getenv(EnvCapabilityClaim)),
+		DecideRate: stream.RateLimit{
+			PerSecond: envFloat(EnvDecideRate, fail),
+			Burst:     envFloat(EnvDecideBurst, fail),
+		},
+		DecideSubjectRate: stream.RateLimit{
+			PerSecond: envFloat(EnvDecideSubjectRate, fail),
+			Burst:     envFloat(EnvDecideSubjectRateBurst, fail),
+		},
+		RevisionTTL:           envDuration(EnvRevisionTTL, 0, fail),
+		ReconcileInterval:     envDuration(EnvReconcileInterval, DefaultReconcileInterval, fail),
+		BootstrapWarnInterval: envDuration(EnvBootstrapWarnInterval, 0, fail),
+		AuditorClaim:          strings.TrimSpace(os.Getenv(EnvAuditorClaim)),
+		AuditorValues:         splitList(os.Getenv(EnvAuditorValues)),
+		CheckContextEntity:    strings.TrimSpace(os.Getenv(EnvCheckContextEntity)),
+		CapabilityClaim:       strings.TrimSpace(os.Getenv(EnvCapabilityClaim)),
 		RevisionRate: revision.Rate{
 			Window: envDuration(EnvRevisionRateWindow, 0, fail),
 			Burst:  envInt(EnvRevisionRateBurst, 0, fail),
@@ -867,6 +897,15 @@ func ConfigFromEnv() (Config, error) {
 		fail("%s: %w", EnvAuthoringMode, err)
 	}
 	cfg.AuthoringMode = mode
+
+	// A decide rate that cannot mean anything is a startup failure rather than a
+	// value quietly resolved into one of the two things it might have meant. The
+	// two shapes that cannot mean anything are a negative bucket size, and a
+	// bucket size configured alongside a rate that turns the limit off — the
+	// second is an operator who wrote down a limit and got none, which is the
+	// direction worth refusing to boot in.
+	checkDecideRate(EnvDecideRate, EnvDecideBurst, cfg.DecideRate, fail)
+	checkDecideRate(EnvDecideSubjectRate, EnvDecideSubjectRateBurst, cfg.DecideSubjectRate, fail)
 
 	aliases, err := aliasesFrom(os.Getenv(EnvCheckPropertyAliases))
 	if err != nil {
@@ -1544,6 +1583,17 @@ func envFloat(key string, fail func(string, ...any)) float64 {
 		return 0
 	}
 	return v
+}
+
+// checkDecideRate refuses the two decide-rate spellings that have no meaning.
+func checkDecideRate(rateKey, burstKey string, r stream.RateLimit, fail func(string, ...any)) {
+	if r.Burst < 0 {
+		fail("%s: %g is negative, and a bucket cannot hold less than nothing", burstKey, r.Burst)
+	}
+	if r.Burst > 0 && r.PerSecond < 0 {
+		fail("%s: %g turns the limit off, so the %s of %g would never be charged",
+			rateKey, r.PerSecond, burstKey, r.Burst)
+	}
 }
 
 func envDuration(key string, fallback time.Duration, fail func(string, ...any)) time.Duration {

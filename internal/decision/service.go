@@ -56,6 +56,19 @@ const (
 	// subject already holds the configured number of unresolved decisions.
 	ReasonOutstandingCap engine.Reason = "outstanding_cap"
 
+	// ReasonRateLimited is the ground for a decide refused because the caller or
+	// the subject was over its rate (R43).
+	//
+	// It lives here rather than where it is produced. The refusal is raised at
+	// the HTTP surface, ahead of this service — that is the point of it, since a
+	// limit applied after the evaluation has not protected the evaluation — but
+	// the vocabulary a decide answer speaks belongs to the package that owns the
+	// answer. A PEP reading `reason` must be able to find every value it can
+	// receive in one list, and R43 is explicit that a refusal under a limit is a
+	// deny: a status code would say the request failed, when what happened is
+	// that the request was judged and the judgment was no.
+	ReasonRateLimited engine.Reason = "rate_limited"
+
 	// ReasonChallengeSatisfied is the ground for a decision that resolved
 	// because its challenges were met.
 	ReasonChallengeSatisfied engine.Reason = "challenge_satisfied"

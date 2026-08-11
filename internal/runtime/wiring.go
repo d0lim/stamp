@@ -360,6 +360,14 @@ func (a *App) build(ctx context.Context) error {
 		// have the body mean one thing.
 		ContextEntity:   cfg.CheckContextEntity,
 		PropertyAliases: cfg.CheckPropertyAliases,
+		// The same buffer the check surface writes through. A rate-limit refusal
+		// never reaches the decision service — that is what makes it cheap — so
+		// the surface is the only place it can be recorded, and the buffer is the
+		// seam that does not put a transaction on the path taken by a caller who
+		// is already sending too much.
+		Audit:       buffer,
+		Rate:        cfg.DecideRate,
+		SubjectRate: cfg.DecideSubjectRate,
 	})
 	if err != nil {
 		return err

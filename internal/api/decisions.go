@@ -44,6 +44,7 @@ import (
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // The decide endpoints.
@@ -121,6 +122,22 @@ type DecisionsConfig struct {
 	// MaxTTL bounds the lifetime a caller may ask for. Zero selects
 	// DefaultMaxDecisionTTL.
 	MaxTTL time.Duration
+	// Audit records rate-limit refusals. Required: R43 asks for the refusal to be
+	// audited, and a surface that cannot record one would be shedding load
+	// invisibly — which is indistinguishable, from outside, from not being asked.
+	Audit EventRecorder
+	// Rate and SubjectRate are R43's rate limits (see ratelimit.go). A zero field
+	// selects the default for that field; a negative rate removes the limit,
+	// which is how an operator says they mean it.
+	Rate        stream.RateLimit
+	SubjectRate stream.RateLimit
+	// MaxRateEntries bounds the limiter's table. Zero selects
+	// [stream.DefaultMaxRateEntries]. It is not on the deployment surface: it is
+	// a memory bound rather than a policy, and the sweep-or-refuse behaviour when
+	// it fills is what makes leaving it alone safe.
+	MaxRateEntries int
+	// Now overrides the clock, for tests.
+	Now func() time.Time
 }
 
 // Decisions serves the decide endpoints.
@@ -132,6 +149,9 @@ type Decisions struct {
 	aliases   map[string]string
 	maxBytes  int64
 	maxTTL    time.Duration
+	audit     EventRecorder
+	limits    *decideLimiter
+	now       func() time.Time
 }
 
 var _ Provider = (*Decisions)(nil)
@@ -147,6 +167,9 @@ func NewDecisions(cfg DecisionsConfig) (*Decisions, error) {
 	if cfg.Schema == nil {
 		return nil, errors.New("api: the decide surface requires a policy schema source")
 	}
+	if cfg.Audit == nil {
+		return nil, errors.New("api: the decide surface requires an audit event recorder")
+	}
 	d := &Decisions{
 		decisions: cfg.Decisions,
 		access:    cfg.Access,
@@ -155,6 +178,8 @@ func NewDecisions(cfg DecisionsConfig) (*Decisions, error) {
 		aliases:   maps.Clone(cfg.PropertyAliases),
 		maxBytes:  cfg.MaxRequestBytes,
 		maxTTL:    cfg.MaxTTL,
+		audit:     cfg.Audit,
+		now:       cfg.Now,
 	}
 	if d.maxBytes <= 0 {
 		d.maxBytes = DefaultMaxRequestBytes
@@ -162,6 +187,14 @@ func NewDecisions(cfg DecisionsConfig) (*Decisions, error) {
 	if d.maxTTL <= 0 {
 		d.maxTTL = DefaultMaxDecisionTTL
 	}
+	if d.now == nil {
+		d.now = time.Now
+	}
+	maxEntries := cfg.MaxRateEntries
+	if maxEntries <= 0 {
+		maxEntries = stream.DefaultMaxRateEntries
+	}
+	d.limits = newDecideLimiter(cfg.Rate, cfg.SubjectRate, maxEntries, d.now)
 	return d, nil
 }
 
@@ -198,6 +231,15 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The caller's budget is charged before the body is read, because reading a
+	// bounded body is still work and the caller is the one thing already known
+	// at this point. A caller that trips here never reaches the decoder.
+	callerID := caller.CallerID()
+	if !d.limits.allowCaller(callerID) {
+		d.refuseRate(w, r, callerID, rateRefusal{scope: rateScopeCaller, limit: d.limits.caller})
+		return
+	}
+
 	req, err := decodeDecisionRequest(w, r, d.maxBytes)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
@@ -208,6 +250,22 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+
+	// The subject's budget is charged as soon as the subject is known, which is
+	// the earliest this charge can happen, and still ahead of every expensive
+	// thing below: the schema resolution, the evaluation, the fact lookups the
+	// evaluation makes and the outstanding-cap query the lifecycle runs. Neither
+	// charge is refunded when something further down refuses the request — a
+	// refused request that costs nothing is a request that can be sent forever.
+	if !d.limits.allowSubject(req.Subject.ID) {
+		d.refuseRate(w, r, callerID, rateRefusal{
+			scope: rateScopeSubject,
+			limit: d.limits.subject,
+			req:   req.EvaluationRequest,
+		})
+		return
+	}
+
 	ttl, err := req.ttl(d.maxTTL)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())

@@ -182,7 +182,7 @@ type Ingest struct {
 	maxBatch int
 	now      func() time.Time
 	lag      LagTracker
-	limiter  *rateLimiter
+	limiter  *Limiter
 }
 
 type resolvedCredential struct {
@@ -225,7 +225,7 @@ func NewIngest(cfg IngestConfig) (*Ingest, error) {
 	if maxEntries <= 0 {
 		maxEntries = DefaultMaxRateEntries
 	}
-	i.limiter = newRateLimiter(maxEntries, i.now)
+	i.limiter = NewLimiter(maxEntries, i.now)
 
 	for _, cred := range cfg.Credentials {
 		if cred.CallerID == "" {
@@ -380,7 +380,7 @@ func (i *Ingest) Submit(ctx context.Context, callerID string, batch IngestBatch)
 // that is free to send is a batch that can be sent forever.
 func (i *Ingest) charge(cred resolvedCredential, callerID string, events []Event) error {
 	if !cred.Rate.unlimited() {
-		if !i.limiter.allow("caller\x1f"+callerID, cred.Rate, float64(len(events))) {
+		if !i.limiter.Allow("caller\x1f"+callerID, cred.Rate, float64(len(events))) {
 			return fmt.Errorf("%w: caller %s", ErrRateLimited, callerID)
 		}
 	}
@@ -395,14 +395,14 @@ func (i *Ingest) charge(cred resolvedCredential, callerID string, events []Event
 		// The key includes the caller so that one caller flooding a subject
 		// cannot exhaust another caller's budget for the same subject, which
 		// would turn a rate limit into a denial-of-service tool.
-		if !i.limiter.allow("subject\x1f"+callerID+"\x1f"+subject, cred.SubjectRate, n) {
+		if !i.limiter.Allow("subject\x1f"+callerID+"\x1f"+subject, cred.SubjectRate, n) {
 			return fmt.Errorf("%w: subject %s", ErrRateLimited, subject)
 		}
 	}
 	return nil
 }
 
-// rateLimiter is a bounded table of token buckets.
+// Limiter is a bounded table of token buckets.
 //
 // The bound is the security-relevant part. Keys derive from request content —
 // the subject identifier in particular — so an unbounded table would let an
@@ -410,7 +410,16 @@ func (i *Ingest) charge(cred resolvedCredential, callerID string, events []Event
 // the table is full it is swept of buckets that have refilled to full, and a
 // sweep that frees nothing refuses the request: a limiter that cannot record a
 // charge has not applied a limit.
-type rateLimiter struct {
+//
+// It is exported, and it is exported here rather than moved somewhere neutral,
+// because the decide surface needs the same limiter and already speaks this
+// package's [RateLimit] — the shape four `STAMP_INGEST_RATE_*` variables are
+// written in and the one the decide path was told to reuse rather than reinvent.
+// Two copies of a sweep-or-refuse table is the thing worth avoiding: the refusal
+// on a full table is the subtle half, and a second copy of it would be a second
+// chance to get it wrong. Nothing about the type is stream-specific; it charges
+// a key a cost against a rate.
+type Limiter struct {
 	mu      sync.Mutex
 	max     int
 	now     func() time.Time
@@ -427,11 +436,16 @@ type tokenBucket struct {
 	limit RateLimit
 }
 
-func newRateLimiter(max int, now func() time.Time) *rateLimiter {
-	return &rateLimiter{max: max, now: now, entries: make(map[string]*tokenBucket)}
+// NewLimiter builds a limiter whose table holds at most max buckets.
+func NewLimiter(max int, now func() time.Time) *Limiter {
+	return &Limiter{max: max, now: now, entries: make(map[string]*tokenBucket)}
 }
 
-func (l *rateLimiter) allow(key string, limit RateLimit, cost float64) bool {
+// Allow charges key the given cost against limit and reports whether the budget
+// covered it. It never refunds: a charge that a later check rejects still costs
+// the caller, because a rejected request that is free is a request that can be
+// sent forever.
+func (l *Limiter) Allow(key string, limit RateLimit, cost float64) bool {
 	if limit.unlimited() {
 		return true
 	}
@@ -467,7 +481,7 @@ func (l *rateLimiter) allow(key string, limit RateLimit, cost float64) bool {
 // sweepLocked drops buckets that have refilled to full and therefore carry no
 // information: recreating one costs nothing an attacker could exploit, because
 // a full bucket is what a new key would get anyway.
-func (l *rateLimiter) sweepLocked(now time.Time) int {
+func (l *Limiter) sweepLocked(now time.Time) int {
 	freed := 0
 	for key, b := range l.entries {
 		refilled := b.tokens + now.Sub(b.at).Seconds()*b.limit.PerSecond

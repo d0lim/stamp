@@ -31,6 +31,7 @@ func clearEnv(t *testing.T) {
 		EnvCheckpointSinkFile, EnvCheckpointSinkWebhook, EnvCheckpointInterval,
 		EnvPolicyRefreshInterval, EnvPolicyStalenessDeadline,
 		EnvDecisionTTL, EnvMaxOutstanding,
+		EnvDecideRate, EnvDecideBurst, EnvDecideSubjectRate, EnvDecideSubjectRateBurst,
 		EnvFloorMinApprovers, EnvFloorProposerMayApprove,
 		EnvRevisionTTL, EnvReconcileInterval, EnvBootstrapWarnInterval,
 		EnvAuthoringMode, EnvCapabilityClaim,
@@ -612,6 +613,103 @@ func TestApproverIssuerDesignation(t *testing.T) {
 		}
 		if cfg.ApproverIssuer != "https://idp.example" {
 			t.Errorf("approver issuer = %q", cfg.ApproverIssuer)
+		}
+	})
+}
+
+// R43's decide rate limits on the deployment surface.
+//
+// They are written in the shape [stream.RateLimit] already gave the four
+// `STAMP_INGEST_RATE_*` variables, because this deployment has one way of
+// writing a token bucket down. What matters here is the reading: unset means
+// the api package's default rather than "no limit", and the two spellings that
+// cannot mean anything are startup failures rather than values quietly resolved
+// into one of the things they might have meant.
+func TestConfigFromEnvReadsTheDecideRateLimits(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		clearEnv(t)
+		t.Setenv(EnvDSN, "postgres://stamp@localhost/stamp")
+		t.Setenv(EnvOIDCIssuer, "https://idp.example")
+		t.Setenv(EnvOIDCJWKSURL, "https://idp.example/jwks")
+		t.Setenv(EnvOIDCAudience, "stamp")
+	}
+
+	t.Run("unset leaves the defaults to the surface", func(t *testing.T) {
+		base(t)
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		// Zero here is not "no limit": it is "the operator said nothing", and the
+		// decide surface reads it as its default. An operator who means no limit
+		// writes a negative rate.
+		if cfg.DecideRate != (stream.RateLimit{}) || cfg.DecideSubjectRate != (stream.RateLimit{}) {
+			t.Errorf("decide rates = %+v / %+v, want zero so the surface defaults them",
+				cfg.DecideRate, cfg.DecideSubjectRate)
+		}
+	})
+
+	t.Run("the four variables are read", func(t *testing.T) {
+		base(t)
+		t.Setenv(EnvDecideRate, "25")
+		t.Setenv(EnvDecideBurst, "40")
+		t.Setenv(EnvDecideSubjectRate, "2.5")
+		t.Setenv(EnvDecideSubjectRateBurst, "6")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		if want := (stream.RateLimit{PerSecond: 25, Burst: 40}); cfg.DecideRate != want {
+			t.Errorf("caller rate = %+v, want %+v", cfg.DecideRate, want)
+		}
+		if want := (stream.RateLimit{PerSecond: 2.5, Burst: 6}); cfg.DecideSubjectRate != want {
+			t.Errorf("subject rate = %+v, want %+v", cfg.DecideSubjectRate, want)
+		}
+	})
+
+	t.Run("a rate that is not a number is a startup failure", func(t *testing.T) {
+		base(t)
+		t.Setenv(EnvDecideRate, "fast")
+		if _, err := ConfigFromEnv(); err == nil {
+			t.Fatal("an unparseable decide rate was accepted")
+		} else if !strings.Contains(err.Error(), EnvDecideRate) {
+			t.Errorf("the refusal does not name %s:\n%v", EnvDecideRate, err)
+		}
+	})
+
+	t.Run("a negative burst is a startup failure", func(t *testing.T) {
+		base(t)
+		t.Setenv(EnvDecideSubjectRateBurst, "-1")
+		if _, err := ConfigFromEnv(); err == nil {
+			t.Fatal("a bucket that holds less than nothing was accepted")
+		} else if !strings.Contains(err.Error(), EnvDecideSubjectRateBurst) {
+			t.Errorf("the refusal does not name %s:\n%v", EnvDecideSubjectRateBurst, err)
+		}
+	})
+
+	t.Run("a burst alongside a disabled rate is a startup failure", func(t *testing.T) {
+		base(t)
+		t.Setenv(EnvDecideRate, "-1")
+		t.Setenv(EnvDecideBurst, "10")
+		// This is an operator who wrote down a limit and would have got none.
+		// Booting anyway would leave them believing the decide path is bounded.
+		if _, err := ConfigFromEnv(); err == nil {
+			t.Fatal("a burst configured alongside a rate that turns the limit off was accepted")
+		} else if !strings.Contains(err.Error(), EnvDecideBurst) {
+			t.Errorf("the refusal does not name %s:\n%v", EnvDecideBurst, err)
+		}
+	})
+
+	t.Run("a negative rate on its own removes the limit", func(t *testing.T) {
+		base(t)
+		t.Setenv(EnvDecideRate, "-1")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("saying no limit out loud was refused: %v", err)
+		}
+		if cfg.DecideRate.PerSecond != -1 {
+			t.Errorf("caller rate = %v, want the operator's -1 carried through", cfg.DecideRate.PerSecond)
 		}
 	})
 }

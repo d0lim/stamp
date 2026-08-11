@@ -42,15 +42,39 @@ type Event struct {
 	Path   string `json:"path,omitempty"`
 	// Allowed is whether an authentication attempt was let through.
 	Allowed bool `json:"allowed,omitempty"`
+	// Scope and Limit describe a rate-limit refusal: which budget ran out
+	// ("caller" or "subject") and what that budget was. R43 asks the record to
+	// carry the caller, the subject and the limit, and the first two are already
+	// above — what a reader cannot reconstruct from those is which of the two
+	// limits was the one that bound, and what it was set to at the time.
+	//
+	// Both are omitempty, which is what keeps this addition from disturbing the
+	// chain: an event of any other kind marshals to exactly the bytes it did
+	// before, so its leaf digest and the roots computed over it are unchanged.
+	Scope string `json:"scope,omitempty"`
+	Limit string `json:"limit,omitempty"`
 }
 
-// The event kinds the check surface produces.
+// The event kinds the served surfaces produce.
 const (
 	// EventCheck is one check-path judgment.
 	EventCheck = "check"
 	// EventAuth is one authentication attempt at a served surface.
 	EventAuth = "auth"
+	// EventRateLimited is one decide refused under a rate limit (R43).
+	EventRateLimited = "rate_limited"
 )
+
+// EventRecorder is the slice of the audit buffer a surface writes one event at
+// a time through.
+//
+// It is an interface rather than *AuditBuffer — which is what the check surface
+// takes — because the decide surface's use of it is one call wide and a test of
+// that surface should not have to stand up a chain writer and a flusher to read
+// back the one event it cares about.
+type EventRecorder interface {
+	Record(ctx context.Context, e Event)
+}
 
 // Leaf renders the event as the Merkle leaf its batch is rooted over.
 //
@@ -437,4 +461,5 @@ func (b *AuditBuffer) statsLocked() AuditStats {
 var (
 	_ identity.AuditSink = (*AuditBuffer)(nil)
 	_ ChainWriter        = (*store.AuditWriter)(nil)
+	_ EventRecorder      = (*AuditBuffer)(nil)
 )
