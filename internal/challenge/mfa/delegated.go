@@ -178,9 +178,9 @@ type Delegated struct {
 	initiations int
 
 	// The per-subject issue budget, charged at the instant the lifecycle
-	// supplies rather than at wall time — see [stream.ClockedLimiter] for why
+	// supplies rather than at wall time — see [stream.Limiter.AllowAt] for why
 	// that needs more than a bare limiter.
-	limiter   *stream.ClockedLimiter
+	limiter   *stream.Limiter
 	issueRate stream.RateLimit
 }
 
@@ -249,7 +249,7 @@ func NewDelegated(cfg Config) (*Delegated, error) {
 	if tracked <= 0 {
 		tracked = DefaultMaxTrackedSubjects
 	}
-	d.limiter = stream.NewClockedLimiter(tracked)
+	d.limiter = stream.NewLimiter(tracked, time.Now)
 	return d, nil
 }
 
@@ -406,7 +406,7 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 // decision, because keying on the decision is exactly what [Delegated.reuse]
 // does, and it is why that key cannot see this attack.
 func (d *Delegated) allowIssue(subjectID string, now time.Time) bool {
-	return d.limiter.Allow("subject\x1f"+subjectID, d.issueRate, 1, now)
+	return d.limiter.AllowAt("subject\x1f"+subjectID, d.issueRate, 1, now)
 }
 
 // callbackFor asks where a completion for this challenge should land.

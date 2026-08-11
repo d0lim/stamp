@@ -214,9 +214,9 @@ type External struct {
 	maxBytes    int64
 
 	// The per-subject dispatch budget, charged at the instant the lifecycle
-	// supplies rather than at wall time — see [stream.ClockedLimiter] for why
+	// supplies rather than at wall time — see [stream.Limiter.AllowAt] for why
 	// that needs more than a bare limiter.
-	limiter     *stream.ClockedLimiter
+	limiter     *stream.Limiter
 	subjectRate stream.RateLimit
 }
 
@@ -252,7 +252,7 @@ func NewExternal(cfg ExternalConfig) (*External, error) {
 	if tracked <= 0 {
 		tracked = DefaultMaxTrackedSubjects
 	}
-	x.limiter = stream.NewClockedLimiter(tracked)
+	x.limiter = stream.NewLimiter(tracked, time.Now)
 	if cfg.CallbackBaseURL != "" {
 		u, err := url.Parse(cfg.CallbackBaseURL)
 		if err != nil || !u.IsAbs() || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -419,7 +419,7 @@ func (x *External) allowNotify(subjectID string, now time.Time) bool {
 	if subjectID == "" {
 		return true
 	}
-	return x.limiter.Allow("subject\x1f"+subjectID, x.subjectRate, 1, now)
+	return x.limiter.AllowAt("subject\x1f"+subjectID, x.subjectRate, 1, now)
 }
 
 // notify performs the outbound leg.

@@ -104,8 +104,14 @@ func (r RateLimit) unlimited() bool { return r.PerSecond <= 0 }
 // limit" — a statement, not an omission, and one [RateLimit.unlimited] then
 // honours.
 //
-// Every budget R43 asks for normalises this way, in four packages, so it lives
-// beside the type rather than beside any one of them.
+// The four budgets R43 asks for on the decide, approval, step-up and dispatch
+// surfaces normalise this way, across three packages, so it lives beside the
+// type rather than beside any one of them. Ingest is deliberately not among
+// them and does not use this: NewIngest replaces a rate whole when it is
+// non-positive, so a burst-only ingest credential loses its burst and a
+// negative ingest rate does not mean "no limit" the way it does everywhere
+// else. That divergence predates this helper and is left alone here rather
+// than changed underneath deployments that configured against it.
 func (r RateLimit) WithZeroDefault(fallback RateLimit) RateLimit {
 	if r.PerSecond == 0 {
 		r.PerSecond = fallback.PerSecond
@@ -462,57 +468,29 @@ func NewLimiter(max int, now func() time.Time) *Limiter {
 	return &Limiter{max: max, now: now, entries: make(map[string]*tokenBucket)}
 }
 
-// ClockedLimiter is a [Limiter] charged at an instant the caller supplies
-// rather than at wall time.
-//
-// [NewLimiter] takes its clock once, at construction, which fits a surface that
-// can read the clock itself when the request arrives. A challenge handler
-// cannot: it is charged at the instant the decision is being evaluated at,
-// which arrives as an argument and which tests move. Getting that instant to a
-// constructor-time closure means storing it where the closure can see it, and
-// the store and the charge have to be one indivisible step — otherwise two
-// concurrent charges interleave and one of them is measured against the other's
-// clock.
-//
-// So this mutex is not protecting the table; [Limiter] has its own for that. It
-// is what makes "set the clock, then charge against it" atomic. Two handlers
-// needed exactly this and wrote it twice, which is why it lives here now.
-type ClockedLimiter struct {
-	mu      sync.Mutex
-	at      time.Time
-	limiter *Limiter
-}
-
-// NewClockedLimiter builds one whose table holds at most max buckets.
-func NewClockedLimiter(max int) *ClockedLimiter {
-	c := &ClockedLimiter{}
-	c.limiter = NewLimiter(max, c.charged)
-	return c
-}
-
-// charged is the clock the wrapped limiter reads. It runs only from inside
-// [Limiter.Allow], which runs only from [ClockedLimiter.Allow], with mu held.
-func (c *ClockedLimiter) charged() time.Time { return c.at }
-
-// Allow charges key the given cost against limit as of now, and reports whether
-// the budget covered it.
-func (c *ClockedLimiter) Allow(key string, limit RateLimit, cost float64, now time.Time) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.at = now
-	return c.limiter.Allow(key, limit, cost)
-}
-
 // Allow charges key the given cost against limit and reports whether the budget
 // covered it. It never refunds: a charge that a later check rejects still costs
 // the caller, because a rejected request that is free is a request that can be
 // sent forever.
 func (l *Limiter) Allow(key string, limit RateLimit, cost float64) bool {
+	return l.AllowAt(key, limit, cost, l.now())
+}
+
+// AllowAt is [Limiter.Allow] charged at an instant the caller supplies.
+//
+// It exists because not every caller can read the clock at the moment it
+// charges. A challenge handler is charged with the instant the decision is
+// being evaluated at, which arrives as an argument and which tests move; the
+// surfaces that own their own clock use [Limiter.Allow] and never think about
+// it. Taking the instant as a parameter is the whole of what that needs — an
+// earlier version of this reached the same end by storing the instant behind a
+// second mutex so the constructor-time closure could read it back, which bought
+// an invariant no compiler checks in exchange for nothing.
+func (l *Limiter) AllowAt(key string, limit RateLimit, cost float64, now time.Time) bool {
 	if limit.unlimited() {
 		return true
 	}
 	limit = limit.withDefaults()
-	now := l.now()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
