@@ -168,10 +168,13 @@ type DecisionsConfig struct {
 	// which is how an operator says they mean it.
 	Rate        stream.RateLimit
 	SubjectRate stream.RateLimit
-	// MaxRateEntries bounds the limiter's table. Zero selects
-	// [stream.DefaultMaxRateEntries]. It is not on the deployment surface: it is
-	// a memory bound rather than a policy, and the sweep-or-refuse behaviour when
-	// it fills is what makes leaving it alone safe.
+	// MaxRateEntries bounds each of the limiter's two tables — the caller
+	// budget's and the subject budget's — rather than a total shared between
+	// them, so the configured number is what either namespace may hold and the
+	// memory cost is twice it. Zero selects [stream.DefaultMaxRateEntries]. It is
+	// not on the deployment surface: it is a memory bound rather than a policy,
+	// and the sweep-or-refuse behaviour when it fills is what makes leaving it
+	// alone safe.
 	MaxRateEntries int
 	// Now overrides the clock, for tests.
 	Now func() time.Time
