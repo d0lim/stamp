@@ -22,6 +22,7 @@ import (
 	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/policy/revision"
 	"github.com/d0lim/stamp/internal/store"
 	"github.com/d0lim/stamp/internal/stream"
 )
@@ -899,11 +900,78 @@ func TestDecidingWithNoPolicySetIsAnExplicitRefusal(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode %q: %v", rec.Body.String(), err)
 	}
-	if body.Error != string(engine.ReasonPolicySetStale) {
-		t.Errorf("error = %q, want the ground the check surface uses for the same state", body.Error)
+	if body.Error != api.CodeNotInstalled {
+		t.Errorf("error = %q, want %q", body.Error, api.CodeNotInstalled)
 	}
 	if f.life.decided() != 0 {
 		t.Errorf("a request reached the lifecycle with no policy set to judge it")
+	}
+}
+
+// TestNotInstalledIsOneCodeOnEverySurface is #45's second half.
+//
+// `error` and `reason` are different vocabularies. `reason` is the ground a
+// decision was reached on and belongs to the engine; `error` is what a surface
+// says when it produced no decision at all, and it is read by clients that never
+// see an engine reason. A server state that both surfaces are describing — this
+// deployment holds no policy set — must arrive under one word, because a client
+// that learns to recognise it from one surface will meet it on another.
+//
+// It used to arrive as `policy_set_stale` from decide and `not_installed` from
+// the policy surface, which made the same state two states to anyone writing
+// against both. Nothing about the engine's reason changed: `policy_set_stale` is
+// still what the check path answers *inside a decision*, where it is a ground and
+// not an error code.
+func TestNotInstalledIsOneCodeOnEverySurface(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{noSchema: true})
+	// The policy surface, mounted on the same server, in the same state: nothing
+	// installed. Its two reads reach the same answer by two different routes —
+	// the listing through the revision table, the schema read past it — and both
+	// are surfaces a console meets before the first policy exists.
+	policies, err := api.NewPolicies(api.PoliciesConfig{
+		Governance: &recordingGovernor{},
+		Policies: api.PolicyListerFunc(func(context.Context) ([]store.PolicyRecord, error) {
+			return nil, revision.ErrNotInstalled
+		}),
+		Schema: api.SchemaReaderFunc(func(context.Context) (store.SchemaRecord, error) {
+			return store.SchemaRecord{}, store.ErrNotFound
+		}),
+	})
+	if err != nil {
+		t.Fatalf("build the policy surface: %v", err)
+	}
+	if err := f.server.Mount(policies); err != nil {
+		t.Fatalf("mount the policy surface: %v", err)
+	}
+
+	codeOf := func(t *testing.T, what string, rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s with nothing installed = %d, want 503: %s", what, rec.Code, rec.Body.String())
+		}
+		var body api.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s: decode %q: %v", what, rec.Body.String(), err)
+		}
+		return body.Error
+	}
+
+	user := f.idp.token(t, "alice", "console")
+	decide := codeOf(t, "decide", f.create(t, f.workload(t, "svc-payments"), decideBody("")))
+	listing := codeOf(t, "GET /policies", f.do(api.SurfaceConsole, http.MethodGet, "/policies", user, ""))
+	schema := codeOf(t, "GET /policies/schema",
+		f.do(api.SurfaceConsole, http.MethodGet, api.SchemaReadPath, user, ""))
+
+	if decide != listing || decide != schema {
+		t.Errorf("one server state, three codes: decide %q, listing %q, schema %q", decide, listing, schema)
+	}
+	if decide != api.CodeNotInstalled {
+		t.Errorf("the shared code is %q, want %q", decide, api.CodeNotInstalled)
+	}
+	// The engine's reason is untouched by any of this. It is the word a decision
+	// carries, and a decision is not what any of these three answered with.
+	if api.CodeNotInstalled == string(engine.ReasonPolicySetStale) {
+		t.Error("the error code and the engine reason have become the same word")
 	}
 }
 

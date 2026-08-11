@@ -278,7 +278,7 @@ func (p *Policies) readSchema(w http.ResponseWriter, r *http.Request) {
 		// Answered here rather than through the revision table, which reads a
 		// missing row as a missing revision. Before installation there is no
 		// schema, and that is a deployment state and not a bad request.
-		writeError(w, http.StatusServiceUnavailable, "not_installed", "no policy schema is in force yet")
+		writeError(w, http.StatusServiceUnavailable, CodeNotInstalled, "no policy schema is in force yet")
 		return
 	}
 	if err != nil {
@@ -515,7 +515,7 @@ func writeRevisionError(w http.ResponseWriter, err error) {
 		errors.Is(err, revision.ErrDecodeDelta):
 		writeError(w, http.StatusBadRequest, "invalid_revision", err.Error())
 	case errors.Is(err, revision.ErrNotInstalled):
-		writeError(w, http.StatusServiceUnavailable, "not_installed", "governance is not installed yet")
+		writeError(w, http.StatusServiceUnavailable, CodeNotInstalled, "governance is not installed yet")
 	case errors.Is(err, revision.ErrNotApproved), errors.Is(err, decision.ErrNotPending):
 		writeError(w, http.StatusConflict, "not_pending", err.Error())
 	case errors.Is(err, store.ErrNotFound):

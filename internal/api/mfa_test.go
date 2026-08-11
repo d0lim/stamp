@@ -323,6 +323,69 @@ func TestMFACallbackDistinguishesTheRefusals(t *testing.T) {
 	}
 }
 
+// TestTheMFAForbiddenCodesStayDistinct is the exception to #38, held down so
+// that a later pass at "one refusal, one answer" does not take this table with
+// it.
+//
+// Everywhere else, a caller who may not have a thing is told what a caller
+// asking about a thing that does not exist is told — the audience there is a
+// stranger probing for existence, and the difference between the two answers is
+// the leak. Here the audience is an operator with a challenge nobody can satisfy,
+// and every one of these codes is a different diagnosis they have to reach:
+// `acr_not_allowed` says the deployment's allowlist does not admit what the IdP
+// asserts, `acr_unsatisfied` says the policy asks for more than the subject did,
+// `stale_authentication` says they answered from a session that was already
+// open. Folding them together would leave a deployment with a step-up that never
+// completes and no way to learn why.
+//
+// Nothing is leaked by the split that the split is meant to protect: none of
+// these is reached before the `state` check, so none of them answers "does this
+// decision exist" — that question is already one uniform 403 (see the landing
+// tests), and this table's forbidden codes are what the *operator* reads out of
+// the logs behind it.
+func TestTheMFAForbiddenCodesStayDistinct(t *testing.T) {
+	t.Parallel()
+	// The seven strength-and-binding refusals the table has always separated.
+	// Named individually rather than counted from the code, because a test that
+	// derived the list from the thing it is pinning would agree with any change
+	// to it.
+	forbidden := map[string]error{
+		"acr_not_allowed":      mfa.ErrACRNotAllowed,
+		"acr_unsatisfied":      mfa.ErrACRUnsatisfied,
+		"amr_mismatch":         mfa.ErrAMRMismatch,
+		"stale_authentication": mfa.ErrStaleAuthentication,
+		"correlator_mismatch":  mfa.ErrCorrelatorMismatch,
+		"credential_mismatch":  mfa.ErrCredentialMismatch,
+		"nonce_mismatch":       mfa.ErrNonceMismatch,
+	}
+
+	seen := make(map[string]string, len(forbidden))
+	for want, sentinel := range forbidden {
+		f := newMFAFixture(t)
+		f.collector.submitErr = fmt.Errorf("decision: submit: %w", sentinel)
+		rec := f.post(t, api.SurfaceCallback, completionBody("c", "a.b.c"))
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s = %d, want 403: %s", want, rec.Code, rec.Body.String())
+			continue
+		}
+		var body api.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Errorf("%s: decode %q: %v", want, rec.Body.String(), err)
+			continue
+		}
+		if body.Error != want {
+			t.Errorf("code = %q, want %q", body.Error, want)
+		}
+		if other, dup := seen[body.Error]; dup {
+			t.Errorf("%s and %s now answer with the same code %q", want, other, body.Error)
+		}
+		seen[body.Error] = want
+	}
+	if len(seen) != len(forbidden) {
+		t.Errorf("%d distinct forbidden codes remain, want %d", len(seen), len(forbidden))
+	}
+}
+
 func TestMFACallbackBoundsTheBody(t *testing.T) {
 	t.Parallel()
 	f := newMFAFixture(t)
