@@ -27,6 +27,7 @@ func clearEnv(t *testing.T) {
 		EnvOIDCAlgorithms, EnvOIDCACRValues, EnvOIDCAllowInsecure,
 		EnvFactSources, EnvEgressAllow, EnvEgressLoopback, EnvEgressPrivate, EnvFactAllowFailOpen,
 		EnvAuditFailClosed, EnvAuditCapacity, EnvAuditBatchSize, EnvAuditFlushInterval,
+		EnvAuditAlertThreshold,
 		EnvCheckpointKeyFile, EnvCheckpointKeyID, EnvCheckpointVerifyKeys,
 		EnvCheckpointSinkFile, EnvCheckpointSinkWebhook, EnvCheckpointInterval,
 		EnvPolicyRefreshInterval, EnvPolicyStalenessDeadline,
@@ -117,6 +118,95 @@ func TestConfigFromEnvReadsADeployment(t *testing.T) {
 	}
 	if cfg.GovernanceFloor.MinApprovers != 2 {
 		t.Errorf("operator floor = %d, want 2", cfg.GovernanceFloor.MinApprovers)
+	}
+}
+
+// TestAuditAlertThresholdIsReadFromTheEnvironment is R32's sensitivity arriving
+// on the deployment surface. What it does once it gets there is
+// TestAuditAlertThresholdMovesWhenTheLossAlertFires.
+func TestAuditAlertThresholdIsReadFromTheEnvironment(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvDSN, "postgres://stamp@localhost/stamp")
+	t.Setenv(EnvOIDCIssuer, "https://idp.example")
+	t.Setenv(EnvOIDCJWKSURL, "https://idp.example/jwks")
+	t.Setenv(EnvOIDCAudience, "stamp")
+
+	t.Run("an unset variable takes the api package's default", func(t *testing.T) {
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		if cfg.AuditAlertThreshold != 0 {
+			t.Errorf("threshold = %d with nothing set, want 0 so the buffer selects its own default of %d",
+				cfg.AuditAlertThreshold, api.DefaultAuditAlertThreshold)
+		}
+	})
+
+	t.Run("a raised threshold is read", func(t *testing.T) {
+		t.Setenv(EnvAuditAlertThreshold, "512")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		if cfg.AuditAlertThreshold != 512 {
+			t.Errorf("threshold = %d, want 512", cfg.AuditAlertThreshold)
+		}
+	})
+}
+
+// TestAuditAlertThresholdRefusesAValueItCannotMean is the boot failure.
+//
+// Both refusals are the same argument: an operator who wrote this variable down
+// is trying to move the sensitivity, and every alternative to refusing leaves
+// them with the default and no indication that their setting did nothing. That
+// is the state this unit exists to end, so resolving a bad value into the
+// default here would be reintroducing it at the parser.
+func TestAuditAlertThresholdRefusesAValueItCannotMean(t *testing.T) {
+	for _, raw := range []string{"0", "-1", "-4096", "one", "3.5", "1e3"} {
+		t.Run(raw, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv(EnvDSN, "postgres://stamp@localhost/stamp")
+			t.Setenv(EnvOIDCIssuer, "https://idp.example")
+			t.Setenv(EnvOIDCJWKSURL, "https://idp.example/jwks")
+			t.Setenv(EnvOIDCAudience, "stamp")
+			t.Setenv(EnvAuditAlertThreshold, raw)
+
+			_, err := ConfigFromEnv()
+			if err == nil {
+				t.Fatalf("%s=%q produced a configuration, want a startup failure", EnvAuditAlertThreshold, raw)
+			}
+			if !strings.Contains(err.Error(), EnvAuditAlertThreshold) {
+				t.Errorf("the refusal does not name %s, so an operator cannot find it:\n%v",
+					EnvAuditAlertThreshold, err)
+			}
+		})
+	}
+}
+
+// TestAuditAlertThresholdIsValidatedOnAConfigBuiltInCode covers the path that
+// does not pass through the environment reader at all: an embedder, or a test,
+// handing Assemble a Config directly.
+func TestAuditAlertThresholdIsValidatedOnAConfigBuiltInCode(t *testing.T) {
+	base := Config{
+		DSN:       "postgres://stamp@localhost/stamp",
+		Addresses: map[api.Surface]string{api.SurfacePEP: "127.0.0.1:0"},
+		OIDC: OIDCConfig{
+			Issuers:  []IssuerConfig{{Issuer: "https://idp.example", JWKSURL: "https://idp.example/jwks"}},
+			Audience: "stamp",
+		},
+	}
+	if err := base.withDefaults().validate(); err != nil {
+		t.Fatalf("the baseline configuration is already invalid, so this test proves nothing: %v", err)
+	}
+
+	negative := base
+	negative.AuditAlertThreshold = -1
+	err := negative.withDefaults().validate()
+	if err == nil {
+		t.Fatal("a negative alert threshold validated, want a startup failure")
+	}
+	if !strings.Contains(err.Error(), EnvAuditAlertThreshold) {
+		t.Errorf("the refusal does not name %s:\n%v", EnvAuditAlertThreshold, err)
 	}
 }
 

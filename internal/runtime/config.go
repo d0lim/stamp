@@ -195,6 +195,17 @@ type Config struct {
 	AuditCapacity      int
 	AuditBatchSize     int
 	AuditFlushInterval time.Duration
+	// AuditAlertThreshold is how many events the buffer may lose before it
+	// raises the operator alert. Zero selects [api.DefaultAuditAlertThreshold],
+	// which is one.
+	//
+	// R32 makes the sensitivity the operator's, and one is only the right
+	// default for a deployment that has not yet measured its own saturation. A
+	// deployment that has — U17 measured 34k check/s filling the default buffer
+	// and losing most of it — is one where an alert on the first lost event
+	// fires continuously and stops being read, which is the failure mode of an
+	// alarm nobody can retune.
+	AuditAlertThreshold int64
 
 	// Checkpoint is the audit chain's tamper-evidence half: the signing key,
 	// where signed checkpoints are published and how often one is taken. R32
@@ -641,10 +652,11 @@ const (
 
 	EnvApproverIssuer = "STAMP_APPROVER_ISSUER"
 
-	EnvAuditFailClosed    = "STAMP_AUDIT_FAIL_CLOSED"
-	EnvAuditCapacity      = "STAMP_AUDIT_CAPACITY"
-	EnvAuditBatchSize     = "STAMP_AUDIT_BATCH_SIZE"
-	EnvAuditFlushInterval = "STAMP_AUDIT_FLUSH_INTERVAL"
+	EnvAuditFailClosed     = "STAMP_AUDIT_FAIL_CLOSED"
+	EnvAuditCapacity       = "STAMP_AUDIT_CAPACITY"
+	EnvAuditBatchSize      = "STAMP_AUDIT_BATCH_SIZE"
+	EnvAuditFlushInterval  = "STAMP_AUDIT_FLUSH_INTERVAL"
+	EnvAuditAlertThreshold = "STAMP_AUDIT_ALERT_THRESHOLD"
 
 	// The audit checkpoint surface. The signing key is named by a path and
 	// never by its value: there is deliberately no variable that carries key
@@ -878,6 +890,25 @@ func ConfigFromEnv() (Config, error) {
 		PollRecords: envInt(EnvKafkaPollRecords, 0, fail),
 	}
 
+	// The alert threshold is read on its own rather than through envInt because
+	// the two values envInt would accept and this setting cannot express have to
+	// be refused rather than resolved. Zero is already how an absent variable
+	// spells "take the default", so an operator who wrote it meant something
+	// else; a negative count would raise the alert before a single event had
+	// been lost. Either one leaves an operator believing they moved a
+	// sensitivity they did not, which is the direction R32 exists to close.
+	if raw := strings.TrimSpace(os.Getenv(EnvAuditAlertThreshold)); raw != "" {
+		switch n, err := strconv.Atoi(raw); {
+		case err != nil:
+			fail("%s: %q is not an integer", EnvAuditAlertThreshold, raw)
+		case n <= 0:
+			fail("%s: %q is not a positive number of lost events. leave it unset for the default of %d",
+				EnvAuditAlertThreshold, raw, api.DefaultAuditAlertThreshold)
+		default:
+			cfg.AuditAlertThreshold = int64(n)
+		}
+	}
+
 	cfg.Checkpoint = checkpointFromEnv(fail)
 
 	groups, err := idpGroupSourcesFrom(os.Getenv(EnvIdPGroupSources))
@@ -1049,6 +1080,15 @@ func (c Config) validate() error {
 	// in code — a test, an embedder — reaches Assemble without passing through
 	// ConfigFromEnv, and the one thing this setting must never do is resolve an
 	// unrecognized value to the permissive mode.
+	// Negative is checked here as well as at the environment reader, for the
+	// same reason the authoring mode is: a Config built in code reaches Assemble
+	// without passing through ConfigFromEnv, and a threshold below zero would
+	// put the buffer into the alert on its first drop while reading as a
+	// deliberately raised one.
+	if c.AuditAlertThreshold < 0 {
+		errs = append(errs, fmt.Errorf("%s is %d: an alert threshold cannot be a negative number of lost events",
+			EnvAuditAlertThreshold, c.AuditAlertThreshold))
+	}
 	if !c.AuthoringMode.OrDefault().Valid() {
 		errs = append(errs, fmt.Errorf("%s is %q, want one of %v",
 			EnvAuthoringMode, c.AuthoringMode, revision.AuthoringModes()))

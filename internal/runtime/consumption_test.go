@@ -33,11 +33,11 @@ package runtime
 //	(b) observable difference — require that setting each field to something
 //	    other than its default produces a difference something can observe.
 //	    A far stronger claim, and far more expensive: it needs an observation
-//	    point per field, and this Config has 63 of them.
+//	    point per field, and this Config has 88 of them.
 //
-// This file is (a), made as strong as (a) can be made, and TestAuditAlert-
-// ThresholdMovesWhenTheAlertFires in wiring_test.go is (b) for the one field
-// this unit adds. The reasoning for the split:
+// This file is (a), made as strong as (a) can be made, and
+// TestAuditAlertThresholdMovesWhenTheLossAlertFires in wiring_test.go is (b) for
+// the one field this unit adds. The reasoning for the split:
 //
 //   - (a) is exhaustive and (b) is not affordable exhaustively. Exhaustive is
 //     the property that matters here, because the failure mode is a field
@@ -56,6 +56,13 @@ package runtime
 //     consumption. And a struct read whole never covers its own fields, so
 //     `cfg := a.cfg.Console` does not vouch for the nine fields of
 //     ConsoleConfig.
+//
+// One direction of imprecision is deliberate. A field the composition root
+// touches only through a method on its own struct — `cfg.Kafka.Configured()`
+// rather than `cfg.Kafka.Brokers` — is reported as unconsumed, because the scan
+// does not follow the method into config.go. No field is in that position today
+// and the report would be a false alarm rather than a missed one, which is the
+// side of the trade a check like this has to be wrong on.
 //
 // A field that cannot pass belongs in exceptedFields with a reason, and the
 // reason has to be a fact about the field rather than a note that it fails.
@@ -144,29 +151,23 @@ func TestEveryConfigFieldIsConsumedAtTheCompositionRoot(t *testing.T) {
 func TestConfigConsumptionCheckDetectsAnUnwiredField(t *testing.T) {
 	leaves, typePaths := configLeaves(t)
 
-	// Each case names a field and the exact source line that delivers it. The
-	// line is deleted from the in-memory copy of the file, the scan is rerun,
-	// and the field must come back unconsumed.
+	// Each case names a field and the fragment that identifies the one source
+	// line delivering it. That whole line is deleted from an in-memory copy of
+	// the file, the scan is rerun, and the field must come back unconsumed.
+	//
+	// Three cases rather than one, because they exercise three different ways
+	// the scan has to resolve a read: a field of Config read straight off the
+	// build step's local copy, a field of a nested struct reached through an
+	// alias (`cfg := a.cfg.Console`), and a field reached through a parameter
+	// typed with a nested struct in another file.
 	cases := []struct {
 		field    string
 		file     string
 		delivery string
 	}{
-		{
-			field:    "AuditCapacity",
-			file:     "wiring.go",
-			delivery: "Capacity:      cfg.AuditCapacity,",
-		},
-		{
-			field:    "Console.RoleClaim",
-			file:     "wiring.go",
-			delivery: "RoleClaim:             cfg.RoleClaim,",
-		},
-		{
-			field:    "Checkpoint.Interval",
-			file:     "checkpoint.go",
-			delivery: "interval:     cfg.Interval,",
-		},
+		{field: "AuditCapacity", file: "wiring.go", delivery: "cfg.AuditCapacity,"},
+		{field: "Console.RoleClaim", file: "wiring.go", delivery: "cfg.RoleClaim,"},
+		{field: "Checkpoint.Interval", file: "checkpoint.go", delivery: "cfg.Interval,"},
 	}
 
 	for _, tc := range cases {
@@ -285,10 +286,30 @@ func consumedBy(reads map[string]bool, leaf string) bool {
 // ---------------------------------------------------------------------------
 
 // mutation removes one line from one file before it is parsed, for the check on
-// the check.
+// the check. remove is a fragment of that line rather than the whole of it, so
+// that a reformatting of the file does not silently turn the mutation into a
+// no-op — which would leave the case passing for the wrong reason.
 type mutation struct {
 	file   string
 	remove string
+}
+
+// applyMutation deletes the single line holding the fragment.
+func applyMutation(t *testing.T, name, text string, m mutation) string {
+	t.Helper()
+	lines := strings.Split(text, "\n")
+	var hits []int
+	for i, line := range lines {
+		if strings.Contains(line, m.remove) {
+			hits = append(hits, i)
+		}
+	}
+	if len(hits) != 1 {
+		t.Fatalf("the mutation case expects exactly one line of %s to hold %q and %d do: the case has "+
+			"drifted from the code it mutates", name, m.remove, len(hits))
+	}
+	lines[hits[0]] = ""
+	return strings.Join(lines, "\n")
 }
 
 // compositionRootReads returns every configuration path the assembly reads.
@@ -326,11 +347,7 @@ func compositionRootReads(t *testing.T, leaves []string, typePaths map[reflect.T
 			if m.file != name {
 				continue
 			}
-			if !strings.Contains(text, m.remove) {
-				t.Fatalf("the mutation case expects %s to contain %q and it does not: the case has "+
-					"drifted from the code it mutates", name, m.remove)
-			}
-			text = strings.Replace(text, m.remove, "", 1)
+			text = applyMutation(t, name, text, m)
 		}
 		file, err := parser.ParseFile(token.NewFileSet(), name, text, 0)
 		if err != nil {
