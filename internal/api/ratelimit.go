@@ -158,6 +158,17 @@ type decideLimiter struct {
 // is paid by a process that already holds a policy set, a schema cache and a
 // database pool.
 //
+// That arithmetic is only true because the keys are bounded, and it used not to
+// be. A map key retains its own bytes, the subject table's key is the subject
+// identifier the caller sent, and until [MaxEntityIDBytes] existed the only
+// ceiling on one was the 1 MiB body cap — so the sentence above was a
+// measurement of what well-behaved callers happened to send, and the same 8192
+// entries could be made to hold gigabytes by a caller who chose to. The worst
+// case is now stated rather than assumed: an entry whose key sits at the
+// 255-byte bound costs the 136 above plus the difference, which is roughly 365
+// bytes, so a table an adversary filled holds under 3 MiB and the pair under 6.
+// The 1.06 MiB is what it costs in practice; this is what it cannot exceed.
+//
 // The alternative was to divide the existing 8192 between the two tables, and it
 // is the wrong trade in the direction that matters. The caller table needs one
 // entry per credential — a deployment has as many as it has PEPs — while the

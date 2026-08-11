@@ -451,12 +451,15 @@ func decodeDecisionRequest(w http.ResponseWriter, r *http.Request, maxBytes int6
 
 // decisionError maps a lifecycle failure to a status a PEP can act on.
 //
-// It is a table for the same reason [approvalError] is, and it differs from that
-// one in a single deliberate place: there, a caller who may not act is told so
-// with a 403, because the caller is a named person on the console surface who
-// has to be able to tell "not yours" from "gone". Here the caller is any
-// workload holding a valid credential, and telling it apart is exactly what must
-// not be possible — so refusal and absence are one answer.
+// It is a table for the same reason [approvalError] is, and it answers "you may
+// not have this" and "there is no such decision" with the same bytes for the
+// same reason that one does: a caller that can tell them apart can ask about an
+// identifier and learn whether it names anything. This description used to say
+// the console's table differed here — that it answered 403 to a named person who
+// has to tell "not yours" from "gone" — and that stopped being true when #38
+// collapsed the two there as well. What the console keeps that this surface has
+// no use for is the 409s, and they are kept for callers who already have
+// standing rather than for everyone.
 func decisionError(err error) (status int, code, message string) {
 	switch {
 	case errors.Is(err, decision.ErrUnauthenticated):

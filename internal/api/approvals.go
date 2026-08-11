@@ -385,6 +385,15 @@ func approvalError(err error) (status int, code, message string) {
 		// omitting what is not.
 		return http.StatusNotFound, "not_found", "no such decision or challenge"
 	case errors.Is(err, store.ErrDecisionExpired):
+		// The two 409s below are only reachable by a caller who already has
+		// standing on the decision, and that is a property of the lifecycle
+		// rather than of this table: decision.Service.Submit settles standing
+		// before it judges state, and challenge.Quorum.Review does the same. A
+		// table cannot enforce it — mapping ErrNotTarget to 404 says nothing
+		// about whether a caller with no standing ever reaches ErrNotTarget, and
+		// for two releases they did not, which left the oracle above open one
+		// status code further down (#38). Moving either check back behind a state
+		// check reopens it; internal/runtime/oracle_test.go is what notices.
 		return http.StatusConflict, "expired", "this decision has expired"
 	case errors.Is(err, decision.ErrNotPending), errors.Is(err, challenge.ErrNotSubmittable):
 		return http.StatusConflict, "not_collecting", "this challenge is not collecting submissions"

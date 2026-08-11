@@ -568,14 +568,55 @@ type Submission struct {
 // whole reason the sweeper is allowed to be late: an approval that arrives
 // after the deadline but before the sweep is refused here, so it cannot satisfy
 // a quorum that a background job has not gotten around to closing yet.
+//
+// # Standing is settled before state, and that ordering is the security property
+//
+// The two checks are in this order and not the other one. Whether the caller has
+// any standing on this decision does not depend on what state the decision is
+// in, but the answer a caller *reads* does: "not collecting" and "expired" are
+// 409s, "you may not have this" and "there is no such decision" are one 404
+// (#38), so asking the state first hands a caller with no standing a 404 while
+// the decision is pending and a 409 the moment it resolves. That is the
+// existence oracle R40 forbids, with the resolution time thrown in, and it
+// survived the fix to the error table because the error table never saw it — the
+// only authorization signal on this path came from the challenge handler, which
+// ran after the state check had already answered.
+//
+// The 409s are kept for callers who do have standing, and that is deliberate
+// rather than an oversight: an approver being waited on has to be able to tell
+// "you are too late" from "there is nothing here", and folding their answer into
+// the stranger's 404 would degrade the person this endpoint exists for in order
+// to protect against a person who is now getting one answer either way.
 func (s *Service) Submit(ctx context.Context, sub Submission) (Result, error) {
 	if sub.Caller == nil {
 		return Result{}, ErrUnauthenticated
 	}
 	now := s.Now()
 
-	d, target, err := s.collecting(ctx, sub.DecisionID, sub.Ordinal, now)
+	d, progress, err := s.decisionWithProgress(ctx, sub.DecisionID)
 	if err != nil {
+		return Result{}, err
+	}
+	// Resolving which challenge was named is not judging its state: an ordinal
+	// the decision does not have is refused with the same 404 a decision that
+	// does not exist is, so doing it here — where the caller's standing has not
+	// been established yet — tells a stranger nothing a missing decision would
+	// not have told them, and the standing rule below needs the kind.
+	target, err := challengeAt(d, progress, sub.Ordinal)
+	if err != nil {
+		return Result{}, err
+	}
+
+	allowed, err := s.mayActOn(ctx, sub.Caller, d, progress, target)
+	if err != nil {
+		return Result{}, err
+	}
+	if !allowed {
+		s.auditAccessRefusal(ctx, sub.Caller, d, "submit")
+		return Result{}, ErrNotAuthorized
+	}
+
+	if err := stillCollecting(d, target, now); err != nil {
 		return Result{}, err
 	}
 
@@ -616,48 +657,94 @@ func (s *Service) Submit(ctx context.Context, sub Submission) (Result, error) {
 
 // collecting resolves one challenge that is open for evidence as of now.
 //
-// It is the entry check both [Service.Submit] and [Service.Redeem] make, and it
-// is one function so that the two cannot drift: an authorization code arriving
-// after the decision expired must be refused on exactly the terms an approval
-// arriving then is, and a second copy of "is this still collecting" is a second
-// copy that can answer differently.
+// It is the entry check [Service.Redeem] makes, and [Service.Submit] makes the
+// same one in two halves with the standing rule between them (see there). The
+// three steps below are shared functions rather than a second copy so that the
+// two cannot drift: an authorization code arriving after the decision expired
+// must be refused on exactly the terms an approval arriving then is, and a
+// second copy of "is this still collecting" is a second copy that can answer
+// differently.
+//
+// Redeem has no standing check to make and is not missing one. The party on that
+// path is a browser following an IdP's `Location` header, holding no credential
+// at all; what it holds instead is a `state` this server minted for this
+// challenge, and the handler is what judges that. Its surface answers one
+// uniform 403 for every refusal, so the ordering here leaks nothing there.
 func (s *Service) collecting(
 	ctx context.Context, decisionID string, ordinal int, now time.Time,
 ) (store.Decision, store.ChallengeProgress, error) {
-	d, err := s.store.ActiveDecision(ctx, decisionID)
+	d, progress, err := s.decisionWithProgress(ctx, decisionID)
 	if err != nil {
 		return store.Decision{}, store.ChallengeProgress{}, err
 	}
-	if d.State != store.DecisionPending {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("decision %q is %s: %w", d.ID, d.State, ErrNotPending)
+	target, err := challengeAt(d, progress, ordinal)
+	if err != nil {
+		return store.Decision{}, store.ChallengeProgress{}, err
 	}
+	if err := stillCollecting(d, target, now); err != nil {
+		return store.Decision{}, store.ChallengeProgress{}, err
+	}
+	return d, target, nil
+}
 
+// decisionWithProgress reads a decision and its challenge rows, judging nothing.
+//
+// It is separate from the tests that follow it because the caller's standing has
+// to be settled against a decision that has been read but not yet judged. Every
+// refusal it can produce is store.ErrNotFound, which is the same 404 a caller
+// with no standing gets for a decision that does exist.
+func (s *Service) decisionWithProgress(
+	ctx context.Context, decisionID string,
+) (store.Decision, []store.ChallengeProgress, error) {
+	d, err := store.GetDecision(ctx, s.store.Pool(), decisionID)
+	if err != nil {
+		return store.Decision{}, nil, err
+	}
 	progress, err := store.ChallengeProgressFor(ctx, s.store.Pool(), d.ID)
 	if err != nil {
-		return store.Decision{}, store.ChallengeProgress{}, err
+		return store.Decision{}, nil, err
 	}
-	var target *store.ChallengeProgress
+	return d, progress, nil
+}
+
+// challengeAt picks the challenge an ordinal names.
+func challengeAt(
+	d store.Decision, progress []store.ChallengeProgress, ordinal int,
+) (store.ChallengeProgress, error) {
 	for i := range progress {
 		if progress[i].Ordinal == ordinal {
-			target = &progress[i]
-			break
+			return progress[i], nil
 		}
 	}
-	if target == nil {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("decision %q has no challenge %d: %w", d.ID, ordinal, ErrNoSuchChallenge)
+	return store.ChallengeProgress{},
+		fmt.Errorf("decision %q has no challenge %d: %w", d.ID, ordinal, ErrNoSuchChallenge)
+}
+
+// stillCollecting is the state half: the decision is open, and so is the
+// challenge.
+//
+// The decision's own deadline is tested through [store.EnsureActive] rather than
+// re-read through store.ActiveDecision, so the rule stays in the one place the
+// store states it. The clock is the service's, which is the clock the challenge
+// timer below is already judged against — an entry check that read the decision's
+// deadline off one clock and the challenge's off another could refuse a
+// submission for being late and accept the next one.
+func stillCollecting(d store.Decision, target store.ChallengeProgress, now time.Time) error {
+	if err := store.EnsureActive(d, now); err != nil {
+		return err
+	}
+	if d.State != store.DecisionPending {
+		return fmt.Errorf("decision %q is %s: %w", d.ID, d.State, ErrNotPending)
 	}
 	if challengeState(target.State) != challenge.StatePending {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("challenge %d of decision %q is %s: %w", ordinal, d.ID, target.State, ErrNotPending)
+		return fmt.Errorf("challenge %d of decision %q is %s: %w",
+			target.Ordinal, d.ID, target.State, ErrNotPending)
 	}
 	if target.Deadline != nil && !now.Before(*target.Deadline) {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("challenge %d of decision %q closed at %s: %w",
-				ordinal, d.ID, target.Deadline, store.ErrDecisionExpired)
+		return fmt.Errorf("challenge %d of decision %q closed at %s: %w",
+			target.Ordinal, d.ID, target.Deadline, store.ErrDecisionExpired)
 	}
-	return d, *target, nil
+	return nil
 }
 
 // Callback is one transport-level redirect arriving for a challenge.
@@ -1007,6 +1094,49 @@ func (s *Service) mayAccess(ctx context.Context, caller *identity.Subject, d sto
 		}
 	}
 	return false, nil
+}
+
+// mayActOn answers whether a submitter is allowed to learn anything about this
+// decision beyond "no such decision".
+//
+// It is R40's read rule plus one case the read rule has no room for. A caller
+// who may read the decision — its creator, or a target of any of its challenges
+// — obviously may be told why their submission was refused. The case underneath
+// is a challenge kind whose handler names no targets at all: an external
+// challenge's counterparty is a system STAMP called out to, it holds no identity
+// this service could compare against anything, and what it holds instead is a
+// signature over a nonce this server minted, which only the handler can check.
+// Refusing it here would not close an oracle, it would break the challenge kind
+// — every callback would be turned away before the handler ever saw the
+// credential that authenticates it.
+//
+// That fallback is narrowed to non-people. The counterparty of a handler with no
+// targets arrives as a workload on the callback listener, whose refusals are one
+// uniform 403; an end-user credential is never that counterparty, and admitting
+// one would hand the console's callers back the state oracle for every decision
+// gated on an external challenge.
+//
+// A kind this build has no handler for is nobody's to act on. The 501 that says
+// so is preserved for a caller with standing through some other challenge, and
+// withheld from everyone else — a build that cannot load a handler cannot
+// identify that handler's targets either, so "no such decision" is the only
+// answer it can give without guessing.
+func (s *Service) mayActOn(
+	ctx context.Context, caller *identity.Subject,
+	d store.Decision, progress []store.ChallengeProgress, target store.ChallengeProgress,
+) (bool, error) {
+	allowed, err := s.mayAccess(ctx, caller, d, progress)
+	if err != nil || allowed {
+		return allowed, err
+	}
+	handler, err := s.challenges.Handler(target.Kind)
+	if err != nil {
+		return false, nil //nolint:nilerr // an unknown kind is not a failure to answer, it is the answer
+	}
+	if _, named := handler.(challenge.Targeter); named {
+		return false, nil
+	}
+	return caller.Kind != identity.SubjectUser, nil
 }
 
 // refuse records a decide that produced no decision object and returns the deny

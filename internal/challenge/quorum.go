@@ -490,14 +490,24 @@ type QuorumReview struct {
 
 // Review returns the material a target approver is judging.
 //
-// It refuses anyone the challenge is not waiting on, and refuses an expired or
-// resolved decision, so that a screen is never rendered whose submission would
-// be turned away.
+// It refuses anyone the challenge is not waiting on, and refuses an expired
+// decision, so that a screen is never rendered whose submission would be turned
+// away.
+//
+// The two refusals are in that order, and the order is the point. "Not a target"
+// is a 404 that says nothing about whether the decision exists; "expired" is a
+// 409 that says it does, and when it stopped. Reading the decision through
+// store.ActiveDecisionTx — which applies the deadline test as it reads —
+// answered the second question nineteen lines before this handler got around to
+// asking the first, so a caller with no standing could poll one identifier and
+// watch it change from 404 to 409 at the instant it expired (#38). So the row is
+// read without judging it, the approver set decides whether this caller may know
+// anything at all, and only then is the deadline tested.
 func (q *Quorum) Review(ctx context.Context, req QuorumReviewRequest) (QuorumReview, error) {
 	if q.db == nil {
 		return QuorumReview{}, errors.New("challenge: this quorum handler has no store to read")
 	}
-	d, err := store.ActiveDecisionTx(ctx, q.db, req.DecisionID, req.Now)
+	d, err := store.GetDecision(ctx, q.db, req.DecisionID)
 	if err != nil {
 		return QuorumReview{}, err
 	}
@@ -523,6 +533,13 @@ func (q *Quorum) Review(ctx context.Context, req QuorumReviewRequest) (QuorumRev
 	if !target {
 		return QuorumReview{}, fmt.Errorf("%w: challenge %d of decision %q",
 			ErrNotTarget, req.Ordinal, req.DecisionID)
+	}
+	// The reader is an approver this challenge names, so the state of the
+	// decision is theirs to be told. An expired one is refused rather than
+	// rendered: the screen exists to be submitted from, and a submission against
+	// a decision whose deadline has passed is refused on the same terms.
+	if err := store.EnsureActive(d, req.Now); err != nil {
+		return QuorumReview{}, err
 	}
 
 	instance := Instance{DecisionID: req.DecisionID, Ordinal: req.Ordinal, Kind: policy.ChallengeQuorum}

@@ -365,9 +365,14 @@ func DecisionByIdempotencyKey(ctx context.Context, q Querier, callerID, key stri
 //
 // The expiry test is `expires_at <= now`. next_deadline is not consulted, and
 // that is the whole point of the column split: a decision holding a delay timer
-// in next_deadline is still active, and every entry point that asks this
-// question — status reads, approval submission, transition functions — gets the
-// same answer because they all ask it here.
+// in next_deadline is still active.
+//
+// This is the read-and-test shape, for a caller that has no reason to hold the
+// row when the answer is "expired". A caller that has to see the row first — the
+// submission and review paths settle the caller's standing before they judge
+// anything about the decision's state (#38) — reads it with GetDecision and
+// applies [EnsureActive], which is the same test and the same sentence. Two
+// shapes, one rule, so that every entry point still gets the same answer.
 func (s *Store) ActiveDecision(ctx context.Context, id string) (Decision, error) {
 	return ActiveDecisionTx(ctx, s.pool, id, s.Now())
 }
@@ -379,10 +384,28 @@ func ActiveDecisionTx(ctx context.Context, q Querier, id string, now time.Time) 
 	if err != nil {
 		return Decision{}, err
 	}
-	if d.Expired(now) {
-		return d, fmt.Errorf("store: decision %q expired at %s: %w", id, d.ExpiresAt, ErrDecisionExpired)
+	if err := EnsureActive(d, now); err != nil {
+		return d, err
 	}
 	return d, nil
+}
+
+// EnsureActive is the expiry half of [ActiveDecisionTx], applied to a row the
+// caller already has.
+//
+// It exists because two paths have to read a decision *before* they may judge
+// its state: an approval submission and the approval screen's read both settle
+// whether the caller has any standing first, so that a caller with none cannot
+// tell a decision that expired from one that never existed (#38). Reading the
+// row again through ActiveDecisionTx to get the deadline tested would be a
+// second query for a row already in hand, and — the part that matters — a second
+// place the rule "expired means expires_at is not in the future" is written
+// down. It is written here, once, and ActiveDecisionTx is its first caller.
+func EnsureActive(d Decision, now time.Time) error {
+	if d.Expired(now) {
+		return fmt.Errorf("store: decision %q expired at %s: %w", d.ID, d.ExpiresAt, ErrDecisionExpired)
+	}
+	return nil
 }
 
 // ChallengeProgressFor reads the challenge rows of a decision, ordered by

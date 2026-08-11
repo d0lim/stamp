@@ -954,6 +954,64 @@ func TestTheIdempotencyKeyIsCarriedToTheLifecycle(t *testing.T) {
 	})
 }
 
+// TestAnEntityIdentifierIsBounded is the other caller-chosen string that lands
+// in memory this process keeps.
+//
+// The subject identifier is the key of the per-subject rate limiter's table, and
+// a Go map key retains its bytes for as long as the entry lives. Unbounded, the
+// only ceiling was the 1 MiB body cap, so 8192 entries — the table's own default
+// bound, the thing that is supposed to make the limiter safe — could be made to
+// hold gigabytes by a caller who simply sent long identifiers. The same value is
+// concatenated into the audit event on every refusal.
+//
+// The bound is stated in [api.EvaluationRequest]'s validation, which is upstream
+// of both charges and of the audit record, so what this test asserts is that
+// nothing downstream of it ran: no evaluation, no charge, no event carrying the
+// value that was refused.
+func TestAnEntityIdentifierIsBounded(t *testing.T) {
+	// A budget of one, so that a second request over it would be shed and
+	// audited. If the charge were still happening ahead of the bound, that
+	// refusal — and the oversized identifier inside it — is what the recorder
+	// below would be holding.
+	f := newDecideFixture(t, decideOptions{subjectRate: stream.RateLimit{PerSecond: 1, Burst: 1}})
+	oversized := strings.Repeat("s", api.MaxEntityIDBytes+1)
+
+	for _, body := range []string{
+		decideBodyFor(oversized),
+		`{"subject":  {"type": "account", "id": "acct-src"},
+		  "resource": {"type": "account", "id": "` + oversized + `"},
+		  "action":   {"name": "close"}}`,
+	} {
+		for i := 0; i < 3; i++ {
+			rec := f.create(t, f.workload(t, "svc-payments"), body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("an identifier of %d bytes = %d, want %d: %s",
+					len(oversized), rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			var refusal api.ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &refusal); err != nil {
+				t.Fatalf("decode error body: %v", err)
+			}
+			if refusal.Error != "invalid_request" {
+				t.Errorf("error = %q, want invalid_request: an identifier this deployment will not "+
+					"store is a malformed request, not a verdict", refusal.Error)
+			}
+		}
+	}
+
+	if f.life.decided() != 0 {
+		t.Errorf("%d oversized identifiers reached the lifecycle, want 0", f.life.decided())
+	}
+	for _, e := range f.audit.snapshot() {
+		if strings.Contains(e.Subject, oversized) || strings.Contains(e.Resource, oversized) {
+			t.Fatalf("an audit event carries the %d-byte identifier that was refused: %+v", len(oversized), e)
+		}
+	}
+	if events := f.audit.snapshot(); len(events) != 0 {
+		t.Errorf("%d events were recorded for requests that were never judged: %+v", len(events), events)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the states the surface has to answer for
 // ---------------------------------------------------------------------------
