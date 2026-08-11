@@ -1,6 +1,6 @@
 ---
 contract: decision-api
-version: 1.0.0
+version: 1.1.0
 source: internal/api
 ---
 
@@ -37,6 +37,8 @@ source: internal/api
 | 메서드·경로 | 표면 | 인증 | 역할 |
 |---|---|---|---|
 | `POST /access/v1/evaluation` | PEP | workload | `check` |
+| `POST /decisions` | PEP | workload | `decide` |
+| `GET /decisions/{id}` | PEP | workload | `decide` |
 | `POST /decisions/{id}/challenges/{ordinal}/approvals` | console | user | `decide` |
 | `GET /decisions/{id}/challenges/{ordinal}/approval` | console | user | `decide` |
 | `POST /decisions/{id}/challenges/{ordinal}/cancellation` | console | user | `decide` |
@@ -94,8 +96,37 @@ source: internal/api
 | `X-Stamp-Signature` | 외부 challenge 콜백의 서명 |
 | `X-Stamp-Component` | 콘솔 서빙 응답의 표식 |
 
-## 이 버전에 없는 것
+## decide
 
-**결정을 생성하는 HTTP 엔드포인트는 1.0.0에 없다.** `decide()`는 Go 진입점(`runtime.DecisionPath`)으로 존재하고 승인·취소·조회·콜백은 위 표대로 노출되지만, 결정을 여는 호출은 아직 라우트로 마운트되지 않았다. 엔드포인트 추가는 minor 변경이므로 이 계약은 1.1.0에서 그것을 얻는다.
+`POST /decisions`가 결정을 만든다. 요청 본문은 **check와 같은 모양**(AuthZEN Access Evaluation 요청)에 선택 필드 `ttl`(기간 문자열, 상한 `DefaultMaxDecisionTTL` = 24h)이 더해진 것이다 — PEP가 두 호출을 같은 입력으로 부를 수 있어야 하기 때문이다. **응답은 AuthZEN이 아니다.** `decision.Result`이고 R2가 요구하는 넷을 싣는다: 상태, 요구 challenge와 수집 현황(`have`/`need`), 만료 시각, obligation.
+
+상태 코드가 **요청의 유효성이 아니라 결과**를 따른다:
+
+| 결과 | 상태 | 본문 |
+|---|---|---|
+| 결정이 생성됨(pending 또는 allow) | `201` + `Location: /decisions/{id}` | `id` 있음 |
+| deny | `200` | `id` 없음 — deny는 결정 행을 만들지 않는다 |
+
+그래서 **클라이언트는 상태 코드만으로 `id`의 존재를 판단할 수 없다.** 양쪽 모두 `state`와 `id`를 읽어야 한다.
+
+`GET /decisions/{id}`는 **생성 호출자에게만** 열린다(R40). 대상 승인자를 위한 조회는 콘솔 표면의 `GET /audit/decisions/{id}`다 — 워크로드 자격과 사용자 토큰은 하나의 라우트가 함께 서빙할 수 없다. **권한 없는 조회와 존재하지 않는 결정은 응답 바이트까지 구분되지 않는다**: 결정의 존재 여부가 새면 안 된다.
+
+### deny의 `reason`
+
+`state: denied`는 최종 판정일 수도, 일시적 셰딩일 수도 있다. **구분자는 `reason` 하나뿐이다.**
+
+| `reason` | 뜻 | 재시도 |
+|---|---|---|
+| 정책이 낸 값(`policy_matched` 등) | 정책 판정 | 아니오 |
+| `outstanding_cap` | 주체의 미결 결정 상한 초과 (R43) | 미결이 해소된 뒤 |
+| `rate_limited` | 호출자 또는 주체별 속도 한도 초과 (R43) | 예 — 창이 지나면 |
+
+**속도 한도는 인스턴스별이다.** 레플리카 N개는 실효 한도가 설정값의 N배다. 절대 상한은 미결 상한이 DB 기반으로 클러스터 전역에 건다.
+
+### 이 계약이 아직 말하지 않는 것
+
+`rate_limited`가 전송 수준 신호(`Retry-After` 등)를 갖지 않는다 — 중간의 재시도 미들웨어·게이트웨이·대시보드는 성공한 요청만 본다. [#45](https://github.com/d0lim/stamp/issues/45).
+
+**`error` 코드 어휘가 문서화되지 않았다.** decide는 정책 집합 부재를 `503 policy_set_stale`로 답하는데, 같은 상태를 `GET /policies`는 `503 not_installed`로 답한다. 어느 쪽이 정본인지 정해지지 않았다 — 같은 [#45](https://github.com/d0lim/stamp/issues/45).
 
 콘솔이 부르는 부분집합의 문서 형식(`console/contract/public-endpoints.json`)에는 자체 버전 필드가 있으며, 그것은 **문서의 모양**을 세는 번호이지 이 계약의 버전이 아니다.

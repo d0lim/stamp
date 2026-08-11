@@ -13,14 +13,15 @@ import (
 	"github.com/d0lim/stamp/internal/store"
 )
 
-// Event is one auditable thing the check surface did: a judgment, or an
-// authentication attempt that never became one.
+// Event is one auditable thing a served surface did: a judgment, an
+// authentication attempt that never became one, or a request the decide surface
+// shed under a rate limit.
 //
 // Both kinds go through the same buffer because both are answers R40 and R32
 // require the audit to contain — a surface that recorded its judgments but not
 // its refusals could not show that it refused anything.
 type Event struct {
-	// Kind is EventCheck or EventAuth.
+	// Kind is EventCheck, EventAuth or EventRateLimited.
 	Kind string `json:"kind"`
 	// Time is when the event happened.
 	Time time.Time `json:"time"`
