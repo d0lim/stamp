@@ -79,6 +79,18 @@ describe('API 클라이언트', () => {
     const error = (await api.request('policy-list').catch((e: unknown) => e)) as ApiError
     expect(error.isForbidden).toBe(true)
   })
+
+  it('404는 없음으로 구분되고, 403과 겹치지 않는다', async () => {
+    // The decision surfaces answer this for "not yours" as well (#38), so the
+    // screens that used to read isForbidden read this instead. The two stay
+    // separate here because the audit *list* still has a real 403.
+    const { api } = client({
+      respond: () => new Response('{"error":"not_found"}', { status: 404 }),
+    })
+    const error = (await api.request('policy-list').catch((e: unknown) => e)) as ApiError
+    expect(error.isNotFound).toBe(true)
+    expect(error.isForbidden).toBe(false)
+  })
 })
 
 describe('계약 문서', () => {

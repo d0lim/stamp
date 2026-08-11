@@ -329,3 +329,71 @@ checkpoints for the installation, which is what the remedy says.
   {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+stamp.callbackSurfaceValidated is the same refusal aimed at a listener.
+
+The callback surface is unbound by default and deliberately so (R39): it is the
+one surface a deployment may have to publish past its own perimeter, so it is
+opted into rather than out of. Three things complete on it and on no other
+surface, and every one of them is configured somewhere other than `listeners` —
+which is how a release ends up asking for all three and binding none:
+
+  delegated step-up MFA       the IdP returns the subject to
+                              GET /decisions/{id}/challenges/{ordinal}/mfa
+                              (internal/api/mfa.go, mounted under the decide
+                              role in internal/runtime/wiring.go)
+  external challenge targets  the target acknowledges the notification and
+                              answers later on POST /external/{id}/{ordinal}.
+                              The round trip is two legs on purpose
+                              (internal/challenge/external.go), so the verdict
+                              cannot come back on the outbound call instead
+  HTTP velocity ingest        a producer's batches arrive on
+                              POST /ingest/v1/events under the consumer role
+
+Nothing else catches it. internal/api mounts a route on a surface the process
+does not serve rather than refusing to start (api.New says so at the point it
+does it), because a role a process does not run is not an error — and the
+consequence is that "mounted" and "reachable" come apart with nothing between
+them. The pods are healthy, `helm template` is clean, and the subject's browser
+arrives at a listener this release never bound.
+
+CIBA is not one of the three, and that is a reading of the code rather than an
+omission: it is a backchannel push, its Initiate returns no authorization URL,
+and internal/challenge/mfa/ciba.go ignores the redirect URI the delegated
+handler hands it. It still reaches this guard, through the step-up settings —
+internal/runtime/config.go requires the four step-up variables whenever any MFA
+is configured, CIBA included — and that turns out to be the right answer for a
+second reason: nothing in the binary polls an auth_req_id, so a CIBA verdict is
+handed back on the POST of the same route, on the same surface.
+
+The conditions are per role and not per setting alone, so that a release running
+neither decide nor consumer is not refused for settings that reach no listener
+in it. That is the escape the checkpoint refusal leaves open, for the same
+deployment shape. In the split topology a consumer tier with no surface at all
+has already been refused by stamp.tiers before this runs.
+*/}}
+{{- define "stamp.callbackSurfaceValidated" -}}
+{{- if not .Values.listeners.callback.enabled -}}
+  {{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
+  {{- $decides := false -}}
+  {{- $consumes := false -}}
+  {{- range $tier := $tiers -}}
+    {{- if include "stamp.tierRuns" (dict "tier" $tier "role" "decide") -}}{{- $decides = true -}}{{- end -}}
+    {{- if include "stamp.tierRuns" (dict "tier" $tier "role" "consumer") -}}{{- $consumes = true -}}{{- end -}}
+  {{- end -}}
+  {{- $stranded := list -}}
+  {{- if and $decides .Values.mfa.authorizationEndpoint -}}
+    {{- $stranded = append $stranded "delegated step-up MFA (mfa.authorizationEndpoint) — the IdP returns the subject to GET /decisions/{id}/challenges/{ordinal}/mfa, so the browser lands on a listener nothing binds and the step-up can never be completed, and step-up is the path a decision takes by default (D26)" -}}
+  {{- end -}}
+  {{- if and $decides .Values.documents.externalTargets.secretName -}}
+    {{- $stranded = append $stranded "external challenge targets (documents.externalTargets) — a target acknowledges the notification and answers later on POST /external/{id}/{ordinal}, so no verdict can arrive and every external challenge times out into a deny" -}}
+  {{- end -}}
+  {{- if and $consumes .Values.documents.ingestCredentials.secretName -}}
+    {{- $stranded = append $stranded "HTTP velocity ingest (documents.ingestCredentials) — a producer's batches arrive on POST /ingest/v1/events, so those grants authenticate producers against a route this release does not serve and the velocity facts answer from buckets no event ever reached" -}}
+  {{- end -}}
+  {{- if $stranded -}}
+    {{- fail (printf "stamp chart: listeners.callback.enabled is false, and this release configures what completes on the callback surface and on no other: %s. Nothing downstream catches this — internal/api mounts a route on a surface the process does not serve rather than refusing to start, so the manifests are valid and every pod reports itself healthy. Set listeners.callback.enabled: true and publish that address as callbackBaseUrl, or clear the settings named above and run without what they ask for." (join "; " $stranded)) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}

@@ -1,0 +1,61 @@
+# A release the chart is supposed to refuse, kept as an input so that the
+# refusal is a gate rather than a claim.
+#
+# It is the all-in-one topology asking for all three of the things that complete
+# on the callback surface — delegated step-up MFA, external challenge targets and
+# HTTP velocity ingest — with the callback listener left at its default, which is
+# unbound. Every manifest it produces is valid and every pod starts healthy: the
+# routes are mounted, because --roles=all runs the roles that mount them, and
+# they are mounted on a listener this release never binds. The IdP redirects the
+# subject to nothing, no external target's verdict can arrive, and the producers
+# hold grants for a route that does not answer.
+#
+# All three are listed in one values file on purpose: the refusal names every
+# stranded setting rather than the first one it finds, so this is also what pins
+# that it does.
+#
+# deploy/helm/render.sh renders this and requires a non-zero exit, and keeps the
+# chart's own message in deploy/helm/snapshots/no-callback.err.txt so that
+# internal/release can assert what the refusal says without needing helm.
+topology: all-in-one
+
+image:
+  repository: ghcr.io/d0lim/stamp
+  tag: ""
+
+# The whole of the difference from values-all-in-one.yaml: not written down.
+# listeners.callback.enabled defaults to false, and a release that needs it has
+# to say so.
+
+oidc:
+  issuer: https://idp.example
+  jwksUrl: https://idp.example/.well-known/jwks.json
+  audience: stamp
+
+database:
+  credentials:
+    allInOne:
+      secretName: stamp-db
+      key: dsn
+
+egress:
+  allow:
+    - https://risk.internal.example
+
+callbackBaseUrl: https://stamp-callback.example
+
+mfa:
+  acrValues:
+    - urn:example:acr:mfa
+  authorizationEndpoint: https://idp.example/authorize
+  clientId: stamp-stepup
+  redirectUri: https://stamp-callback.example/mfa/return
+  tokenEndpoint: https://idp.example/token
+
+documents:
+  externalTargets:
+    secretName: stamp-external-targets
+    key: external-targets.json
+  ingestCredentials:
+    secretName: stamp-ingest-credentials
+    key: ingest-credentials.json
