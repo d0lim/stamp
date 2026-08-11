@@ -95,6 +95,27 @@ type RateLimit struct {
 
 func (r RateLimit) unlimited() bool { return r.PerSecond <= 0 }
 
+// WithZeroDefault fills each zero field from fallback, so an operator who
+// raised the burst does not have to restate the rate.
+//
+// It is field by field rather than all or nothing because the two numbers are
+// configured independently, and it fires on exactly zero rather than on
+// anything non-positive because a negative rate is an operator saying "no
+// limit" — a statement, not an omission, and one [RateLimit.unlimited] then
+// honours.
+//
+// Every budget R43 asks for normalises this way, in four packages, so it lives
+// beside the type rather than beside any one of them.
+func (r RateLimit) WithZeroDefault(fallback RateLimit) RateLimit {
+	if r.PerSecond == 0 {
+		r.PerSecond = fallback.PerSecond
+	}
+	if r.Burst == 0 {
+		r.Burst = fallback.Burst
+	}
+	return r
+}
+
 func (r RateLimit) withDefaults() RateLimit {
 	if r.Burst <= 0 {
 		r.Burst = r.PerSecond
@@ -439,6 +460,47 @@ type tokenBucket struct {
 // NewLimiter builds a limiter whose table holds at most max buckets.
 func NewLimiter(max int, now func() time.Time) *Limiter {
 	return &Limiter{max: max, now: now, entries: make(map[string]*tokenBucket)}
+}
+
+// ClockedLimiter is a [Limiter] charged at an instant the caller supplies
+// rather than at wall time.
+//
+// [NewLimiter] takes its clock once, at construction, which fits a surface that
+// can read the clock itself when the request arrives. A challenge handler
+// cannot: it is charged at the instant the decision is being evaluated at,
+// which arrives as an argument and which tests move. Getting that instant to a
+// constructor-time closure means storing it where the closure can see it, and
+// the store and the charge have to be one indivisible step — otherwise two
+// concurrent charges interleave and one of them is measured against the other's
+// clock.
+//
+// So this mutex is not protecting the table; [Limiter] has its own for that. It
+// is what makes "set the clock, then charge against it" atomic. Two handlers
+// needed exactly this and wrote it twice, which is why it lives here now.
+type ClockedLimiter struct {
+	mu      sync.Mutex
+	at      time.Time
+	limiter *Limiter
+}
+
+// NewClockedLimiter builds one whose table holds at most max buckets.
+func NewClockedLimiter(max int) *ClockedLimiter {
+	c := &ClockedLimiter{}
+	c.limiter = NewLimiter(max, c.charged)
+	return c
+}
+
+// charged is the clock the wrapped limiter reads. It runs only from inside
+// [Limiter.Allow], which runs only from [ClockedLimiter.Allow], with mu held.
+func (c *ClockedLimiter) charged() time.Time { return c.at }
+
+// Allow charges key the given cost against limit as of now, and reports whether
+// the budget covered it.
+func (c *ClockedLimiter) Allow(key string, limit RateLimit, cost float64, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = now
+	return c.limiter.Allow(key, limit, cost)
 }
 
 // Allow charges key the given cost against limit and reports whether the budget

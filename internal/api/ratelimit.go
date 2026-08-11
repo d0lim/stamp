@@ -167,20 +167,8 @@ type decideLimiter struct {
 // buy back a megabyte by making the availability property worse under exactly
 // the load this limit exists for.
 func newDecideLimiter(caller, subject stream.RateLimit, maxEntries int, now func() time.Time) *decideLimiter {
-	// A zero field takes the default for that field, so an operator who raised
-	// the burst does not have to restate the rate.
-	if caller.PerSecond == 0 {
-		caller.PerSecond = DefaultDecideRate.PerSecond
-	}
-	if caller.Burst == 0 {
-		caller.Burst = DefaultDecideRate.Burst
-	}
-	if subject.PerSecond == 0 {
-		subject.PerSecond = DefaultDecideSubjectRate.PerSecond
-	}
-	if subject.Burst == 0 {
-		subject.Burst = DefaultDecideSubjectRate.Burst
-	}
+	caller = caller.WithZeroDefault(DefaultDecideRate)
+	subject = subject.WithZeroDefault(DefaultDecideSubjectRate)
 	return &decideLimiter{
 		callers:  stream.NewLimiter(maxEntries, now),
 		subjects: stream.NewLimiter(maxEntries, now),

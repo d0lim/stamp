@@ -185,14 +185,7 @@ func NewApprovals(cfg ApprovalsConfig) (*Approvals, error) {
 	if a.now == nil {
 		a.now = time.Now
 	}
-	// A zero field takes the default for that field, so an operator who raised
-	// the burst does not have to restate the rate.
-	if a.rate.PerSecond == 0 {
-		a.rate.PerSecond = DefaultApprovalRate.PerSecond
-	}
-	if a.rate.Burst == 0 {
-		a.rate.Burst = DefaultApprovalRate.Burst
-	}
+	a.rate = a.rate.WithZeroDefault(DefaultApprovalRate)
 	tracked := cfg.MaxTrackedApprovers
 	if tracked <= 0 {
 		tracked = DefaultMaxTrackedApprovers

@@ -61,7 +61,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/d0lim/stamp/internal/fact"
@@ -214,16 +213,11 @@ type External struct {
 	callbackURL string
 	maxBytes    int64
 
-	// The per-subject dispatch budget. limitAt is the instant the charge in
-	// progress is dated at: [stream.Limiter] takes its clock at construction and
-	// the lifecycle supplies the issuing instant per request, so the two are
-	// joined by writing it here immediately before Allow reads it. Every access
-	// to either field — including the clock closure's, which only ever runs
-	// inside Allow — happens under limitMu.
-	limitMu     sync.Mutex
-	limiter     *stream.Limiter
+	// The per-subject dispatch budget, charged at the instant the lifecycle
+	// supplies rather than at wall time — see [stream.ClockedLimiter] for why
+	// that needs more than a bare limiter.
+	limiter     *stream.ClockedLimiter
 	subjectRate stream.RateLimit
-	limitAt     time.Time
 }
 
 // External deliberately does not implement [Targeter]. Its counterparty is a
@@ -253,19 +247,12 @@ func NewExternal(cfg ExternalConfig) (*External, error) {
 	if x.maxBytes <= 0 {
 		x.maxBytes = DefaultExternalResponseBytes
 	}
-	// A zero field takes the default for that field, so an operator who raised
-	// the burst does not have to restate the rate.
-	if x.subjectRate.PerSecond == 0 {
-		x.subjectRate.PerSecond = DefaultExternalSubjectRate.PerSecond
-	}
-	if x.subjectRate.Burst == 0 {
-		x.subjectRate.Burst = DefaultExternalSubjectRate.Burst
-	}
+	x.subjectRate = x.subjectRate.WithZeroDefault(DefaultExternalSubjectRate)
 	tracked := cfg.MaxTrackedSubjects
 	if tracked <= 0 {
 		tracked = DefaultMaxTrackedSubjects
 	}
-	x.limiter = stream.NewLimiter(tracked, x.chargedAt)
+	x.limiter = stream.NewClockedLimiter(tracked)
 	if cfg.CallbackBaseURL != "" {
 		u, err := url.Parse(cfg.CallbackBaseURL)
 		if err != nil || !u.IsAbs() || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -415,10 +402,6 @@ func (x *External) Issue(ctx context.Context, req IssueRequest) (IssueResult, er
 	return IssueResult{State: StatePending, Detail: detail, Deadline: deadline}, nil
 }
 
-// chargedAt is the clock [stream.Limiter] reads. It is only ever called from
-// inside Allow, which is only ever called by allowNotify with limitMu held.
-func (x *External) chargedAt() time.Time { return x.limitAt }
-
 // allowNotify charges one outbound notification against the subject's budget.
 //
 // The key follows the decide surface's convention — prefixed, so that adding a
@@ -436,10 +419,7 @@ func (x *External) allowNotify(subjectID string, now time.Time) bool {
 	if subjectID == "" {
 		return true
 	}
-	x.limitMu.Lock()
-	defer x.limitMu.Unlock()
-	x.limitAt = now
-	return x.limiter.Allow("subject\x1f"+subjectID, x.subjectRate, 1)
+	return x.limiter.Allow("subject\x1f"+subjectID, x.subjectRate, 1, now)
 }
 
 // notify performs the outbound leg.

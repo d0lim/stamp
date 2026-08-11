@@ -177,16 +177,11 @@ type Delegated struct {
 	recent      map[string]recentIssue
 	initiations int
 
-	// The per-subject issue budget. limitAt is the instant the charge in
-	// progress is dated at: [stream.Limiter] takes its clock at construction and
-	// the lifecycle supplies the issuing instant per request, so the two are
-	// joined by writing it here immediately before Allow reads it. Every access
-	// to either field — including the clock closure's, which only ever runs
-	// inside Allow — happens under limitMu.
-	limitMu   sync.Mutex
-	limiter   *stream.Limiter
+	// The per-subject issue budget, charged at the instant the lifecycle
+	// supplies rather than at wall time — see [stream.ClockedLimiter] for why
+	// that needs more than a bare limiter.
+	limiter   *stream.ClockedLimiter
 	issueRate stream.RateLimit
-	limitAt   time.Time
 }
 
 // recentIssue is one challenge this process opened recently.
@@ -249,25 +244,14 @@ func NewDelegated(cfg Config) (*Delegated, error) {
 	if d.correlator == nil {
 		d.correlator = randomCorrelator
 	}
-	// A zero field takes the default for that field, so an operator who raised
-	// the burst does not have to restate the rate.
-	if d.issueRate.PerSecond == 0 {
-		d.issueRate.PerSecond = DefaultSubjectIssueRate.PerSecond
-	}
-	if d.issueRate.Burst == 0 {
-		d.issueRate.Burst = DefaultSubjectIssueRate.Burst
-	}
+	d.issueRate = d.issueRate.WithZeroDefault(DefaultSubjectIssueRate)
 	tracked := cfg.MaxTrackedSubjects
 	if tracked <= 0 {
 		tracked = DefaultMaxTrackedSubjects
 	}
-	d.limiter = stream.NewLimiter(tracked, d.chargedAt)
+	d.limiter = stream.NewClockedLimiter(tracked)
 	return d, nil
 }
-
-// chargedAt is the clock [stream.Limiter] reads. It is only ever called from
-// inside Allow, which is only ever called by allowIssue with limitMu held.
-func (d *Delegated) chargedAt() time.Time { return d.limitAt }
 
 // Kind implements [challenge.Handler].
 func (d *Delegated) Kind() policy.ChallengeType { return policy.ChallengeMFA }
@@ -422,10 +406,7 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 // decision, because keying on the decision is exactly what [Delegated.reuse]
 // does, and it is why that key cannot see this attack.
 func (d *Delegated) allowIssue(subjectID string, now time.Time) bool {
-	d.limitMu.Lock()
-	defer d.limitMu.Unlock()
-	d.limitAt = now
-	return d.limiter.Allow("subject\x1f"+subjectID, d.issueRate, 1)
+	return d.limiter.Allow("subject\x1f"+subjectID, d.issueRate, 1, now)
 }
 
 // callbackFor asks where a completion for this challenge should land.
