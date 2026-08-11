@@ -356,7 +356,12 @@ assert_eq 1 "$(printf '%s' "$INBOX" | jq -r --arg id "$DECISION_ID" '[.items[]|s
 approve() {
   local id=$1 token=$2 review hash
   review=$(curl -fsS "$CONSOLE/decisions/$id/challenges/0/approval" -H "Authorization: Bearer $token")
-  hash=$(printf '%s' "$review" | jq -r '.binding_hash // ""')
+  # `jq -er` and not `jq -r ... // ""`: the fallback turned a missing hash into
+  # an empty one, and the server treats an empty echo as "no opinion" rather
+  # than as a violation (challenge/quorum.go). So this step used to pass
+  # identically whether R31's echo worked or was absent entirely.
+  hash=$(printf '%s' "$review" | jq -er '.binding_hash') \
+    || die "the approval review carried no binding_hash; R31's echo is not being exercised"
   curl -fsS -X POST "$CONSOLE/decisions/$id/challenges/0/approvals" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
     -d "{\"verdict\":\"approve\",\"binding_hash\":\"$hash\"}"
@@ -591,7 +596,11 @@ if "${COMPOSE[@]}" run --rm --no-deps \
   cat "$EGRESS_LOG" >&2
   die "the process started with a remote fact source and no egress allowlist"
 fi
-grep -qi 'egress' "$EGRESS_LOG" || { cat "$EGRESS_LOG" >&2; die "the refusal did not name the egress gate"; }
+# The sentinel and not the topic word. `grep -qi egress` was satisfied by any
+# startup failure whose output happened to mention an egress-named config key,
+# so the step could pass without the gate having run at all.
+grep -q 'not permitted by the egress allowlist' "$EGRESS_LOG" \
+  || { cat "$EGRESS_LOG" >&2; die "the process refused for some reason other than the egress gate"; }
 ok "refused, naming the egress gate: $(grep -io 'egress[^"]*' "$EGRESS_LOG" | head -1 | cut -c1-90)"
 
 step "no plaintext secret in what the deployment renders or logs"

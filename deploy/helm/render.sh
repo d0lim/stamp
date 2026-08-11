@@ -28,6 +28,15 @@ HELM_IMAGE="${HELM_IMAGE:-alpine/helm:3.19.0}"
 # `type -P` and not `command -v`: the wrapper below is itself named helm, and
 # command -v would find the function and then fail to exec it.
 helm_bin="$(type -P helm || true)"
+# The pin is the default, not the fallback. A local helm is used only when it
+# is the pinned version: otherwise `make chart` on a developer's newer helm
+# regenerates the snapshots under a different renderer, and CI reports "the
+# snapshots are stale" on a PR that never touched the chart -- which is the
+# diagnosis the pin exists to prevent.
+if [ -n "${helm_bin}" ] && ! "${helm_bin}" version --short 2>/dev/null | grep -q "^v${HELM_IMAGE##*:}"; then
+    echo "render.sh: local helm is not ${HELM_IMAGE##*:}; rendering with ${HELM_IMAGE}" >&2
+    helm_bin=""
+fi
 helm() {
     if [ -n "${helm_bin}" ]; then
         "${helm_bin}" "$@"
