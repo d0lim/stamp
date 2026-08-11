@@ -50,8 +50,11 @@ func TestTheContractVersionGateFails(t *testing.T) {
 			want: "states no version",
 		},
 		"a document's version drifted from the code": {
-			dir:  "testdata/contracts-drifted",
-			want: "the code ships 1.0.0",
+			dir: "testdata/contracts-drifted",
+			// Not the version itself: the fixture's drift is from whatever
+			// constant the code currently ships, and pinning the number here
+			// makes a legitimate contract bump look like a broken gate.
+			want: "but the code ships",
 		},
 		"the documents are missing entirely": {
 			dir:  "testdata/contracts-missing",

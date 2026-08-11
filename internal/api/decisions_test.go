@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -388,6 +391,121 @@ func TestDecideReturnsTheWholeDecisionObject(t *testing.T) {
 	// wearing that contract's boolean.
 	if _, wearsAuthZEN := body["decision"]; wearsAuthZEN {
 		t.Errorf("the decide response carries AuthZEN's boolean verdict: %v", body)
+	}
+}
+
+// TestTheDecideResponseSaysWhereToSendTheSubject is R28 at the surface. A
+// delegated MFA challenge is completed in a browser, so a response that names
+// the challenge without naming its destination has told the PEP that something
+// must happen and not what.
+func TestTheDecideResponseSaysWhereToSendTheSubject(t *testing.T) {
+	const authorizationURL = "https://idp.test/authorize?client_id=stamp-stepup&state=csrf-0f0f0f"
+	f := newDecideFixture(t, decideOptions{})
+	f.life.result = decision.Result{
+		ID:          testDecideID,
+		State:       store.DecisionPending,
+		Reason:      engine.ReasonChallengeRequired,
+		PolicyID:    "ledger-export",
+		Obligations: []decision.Obligation{},
+		Challenges: []decision.ChallengeView{{
+			Ordinal: 0, Kind: policy.ChallengeMFA, State: challenge.StatePending,
+			Have: 0, Need: 1, AuthorizationURL: authorizationURL,
+		}},
+		CreatedAt: fixedNow,
+		ExpiresAt: fixedNow.Add(time.Hour),
+	}
+
+	rec := f.create(t, f.workload(t, "svc-payments"), decideBody(""))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST %s = %d: %s", api.DecisionsPath, rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Challenges []map[string]any `json:"challenges"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %q: %v", rec.Body.String(), err)
+	}
+	if len(body.Challenges) != 1 {
+		t.Fatalf("challenges = %v, want the mfa challenge", body.Challenges)
+	}
+	if got := body.Challenges[0]["authorization_url"]; got != authorizationURL {
+		t.Errorf("authorization_url = %v, want %q", got, authorizationURL)
+	}
+}
+
+// TestAChallengeViewCarriesOnlyItsDeclaredFields fixes the wire shape of a
+// challenge view by its whole field set rather than by the presence of the
+// fields a test happens to care about.
+//
+// This is the assertion a future field has to argue with. A challenge's stored
+// detail holds correlators, nonces and PKCE verifiers; the way those reach a
+// caller is somebody widening this struct, and widening it turns this test red
+// before it turns a deployment into a leak.
+//
+// The first half reads the type and not a value, because `omitempty` means a
+// field can be added, be left unset by every fixture in the suite, and ship.
+func TestAChallengeViewCarriesOnlyItsDeclaredFields(t *testing.T) {
+	declared := []string{"ordinal", "kind", "state", "have", "need", "deadline", "authorization_url"}
+	rt := reflect.TypeOf(decision.ChallengeView{})
+	fields := make([]string, 0, rt.NumField())
+	for i := range rt.NumField() {
+		name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+		if name == "" {
+			name = rt.Field(i).Name
+		}
+		fields = append(fields, name)
+	}
+	sort.Strings(fields)
+	want := append([]string(nil), declared...)
+	sort.Strings(want)
+	if !slices.Equal(fields, want) {
+		t.Fatalf("decision.ChallengeView declares %v, want %v — a new field on this type is a "+
+			"new thing a caller is told about a challenge, and challenge details hold secrets", fields, want)
+	}
+
+	deadline := fixedNow.Add(30 * time.Minute)
+	for _, tc := range []struct {
+		name string
+		view decision.ChallengeView
+		want []string
+	}{
+		{
+			name: "a kind that publishes nothing",
+			view: decision.ChallengeView{
+				Ordinal: 0, Kind: policy.ChallengeQuorum, State: challenge.StatePending,
+				Have: 0, Need: 2, Deadline: &deadline,
+			},
+			want: []string{"ordinal", "kind", "state", "have", "need", "deadline"},
+		},
+		{
+			name: "a kind that publishes a destination",
+			view: decision.ChallengeView{
+				Ordinal: 1, Kind: policy.ChallengeMFA, State: challenge.StatePending,
+				Have: 0, Need: 1, AuthorizationURL: "https://idp.test/authorize",
+			},
+			want: []string{"ordinal", "kind", "state", "have", "need", "authorization_url"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.view)
+			if err != nil {
+				t.Fatalf("encode challenge view: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("decode challenge view: %v", err)
+			}
+			keys := make([]string, 0, len(got))
+			for k := range got {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			want := append([]string(nil), tc.want...)
+			sort.Strings(want)
+			if !slices.Equal(keys, want) {
+				t.Errorf("challenge view fields = %v, want %v: %s", keys, want, raw)
+			}
+		})
 	}
 }
 

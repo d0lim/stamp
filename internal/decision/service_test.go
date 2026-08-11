@@ -4,6 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -512,4 +518,376 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatalf("re-encode %T: %v", v, err)
 	}
 	return string(canonical)
+}
+
+// ---------------------------------------------------------------------------
+// what a caller is told about a challenge in progress (R2, R28)
+//
+// A challenge that is completed in a browser is unreachable unless the response
+// says where to send the subject. The stored detail already knows — and it also
+// knows the correlator, the nonce and the PKCE verifier, none of which a caller
+// is owed. So the handler publishes a chosen field and the lifecycle copies that
+// field, rather than the lifecycle projecting a detail it cannot read safely.
+// ---------------------------------------------------------------------------
+
+// TestAChallengeViewCarriesWhereToSendTheSubject is the gap this unit closes:
+// before it, a decision waiting on a delegated MFA challenge told its caller
+// that an `mfa` challenge was pending and nothing about how to satisfy it.
+func TestAChallengeViewCarriesWhereToSendTheSubject(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:      30 * time.Minute,
+		policies: []*policy.Policy{mfaPolicy("ledger-export")},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if len(res.Challenges) != 1 || res.Challenges[0].Kind != policy.ChallengeMFA {
+		t.Fatalf("challenges = %+v, want one mfa challenge", res.Challenges)
+	}
+	if got := res.Challenges[0].AuthorizationURL; got != testAuthorizationURL {
+		t.Fatalf("authorization url = %q, want %q", got, testAuthorizationURL)
+	}
+
+	// A later read is the caller's second chance to find it — a PEP that lost
+	// the create response has no other way back to the URL.
+	again, err := h.svc.Get(ctx, workload("payments"), res.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got := again.Challenges[0].AuthorizationURL; got != testAuthorizationURL {
+		t.Fatalf("authorization url on read = %q, want %q", got, testAuthorizationURL)
+	}
+}
+
+// TestAChallengeViewCarriesNoStoredSecret is the reason this unit is a whitelist
+// rather than a projection of the stored detail.
+//
+// It scans the serialized response for the secret values themselves and not for
+// the names of the fields holding them, because a correlator pasted into a URL's
+// `state` has leaked exactly as much as a correlator in a `correlator` field.
+func TestAChallengeViewCarriesNoStoredSecret(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:      30 * time.Minute,
+		policies: []*policy.Policy{mfaPolicy("ledger-export")},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("encode result: %v", err)
+	}
+	body := string(raw)
+	var decoded struct {
+		Challenges []map[string]any `json:"challenges"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if len(decoded.Challenges) != 1 {
+		t.Fatalf("challenges = %v, want one", decoded.Challenges)
+	}
+	// The response has to be worth scanning: a view that published nothing
+	// would satisfy every assertion below for the wrong reason. The check is on
+	// the decoded value rather than on the bytes because encoding/json escapes
+	// `&`, which a query string is full of and a secret is not.
+	if got := decoded.Challenges[0]["authorization_url"]; got != testAuthorizationURL {
+		t.Fatalf("the response carries no authorization url, so this scan proves nothing: %s", body)
+	}
+	for name, secret := range map[string]string{
+		"correlator":    testCorrelator,
+		"nonce":         testMFANonce,
+		"code_verifier": testCodeVerifier,
+	} {
+		if strings.Contains(body, secret) {
+			t.Errorf("the decision response carries the challenge's %s: %s", name, body)
+		}
+	}
+	// And the field names too: a caller that can read a key called `correlator`
+	// has been handed one whatever the value turned out to be.
+	for _, banned := range []string{"correlator", "nonce", "code_verifier", "detail", "subject_id"} {
+		if _, ok := decoded.Challenges[0][banned]; ok {
+			t.Errorf("the challenge view carries a %q field: %v", banned, decoded.Challenges[0])
+		}
+	}
+}
+
+// TestTheSecretScanCatchesAHandlerThatPublishesOne keeps the test above from
+// being vacuous. It registers a handler that makes the mistake — the correlator
+// smuggled into the published URL rather than into a field of its own — and
+// asserts the same scan finds it.
+//
+// Without this, a whitelist that published nothing at all would leave the suite
+// green while closing nothing.
+func TestTheSecretScanCatchesAHandlerThatPublishesOne(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:        30 * time.Minute,
+		policies:   []*policy.Policy{mfaPolicy("ledger-export")},
+		mfaHandler: &leakyStepUpHandler{},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("encode result: %v", err)
+	}
+	if !strings.Contains(string(raw), testCorrelator) {
+		t.Fatalf("a handler that publishes the correlator produced a response without it, "+
+			"so the scan in TestAChallengeViewCarriesNoStoredSecret proves nothing: %s", raw)
+	}
+}
+
+// TestChallengeKindsWithNothingToPublishSerializeUnchanged is the compatibility
+// half: a quorum and a delay answer no view seam, and their responses have to
+// look to an existing consumer exactly as they did before this field existed.
+func TestChallengeKindsWithNothingToPublishSerializeUnchanged(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:      30 * time.Minute,
+		policies: []*policy.Policy{quorumAndDelayPolicy("wire-transfer", 2, "alice", "bob")},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if len(res.Challenges) != 2 {
+		t.Fatalf("challenges = %+v, want a quorum and a delay", res.Challenges)
+	}
+	for _, c := range res.Challenges {
+		raw, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("encode challenge view: %v", err)
+		}
+		var view map[string]any
+		if err := json.Unmarshal(raw, &view); err != nil {
+			t.Fatalf("decode challenge view: %v", err)
+		}
+		if _, ok := view["authorization_url"]; ok {
+			t.Errorf("a %s challenge grew an authorization_url: %s", c.Kind, raw)
+		}
+		// The fields an existing consumer reads are all still there and are
+		// still the only ones.
+		for _, want := range []string{"ordinal", "kind", "state", "have", "need"} {
+			if _, ok := view[want]; !ok {
+				t.Errorf("a %s challenge lost its %q: %s", c.Kind, want, raw)
+			}
+		}
+	}
+}
+
+// TestAHandlerThatPublishesNothingDoesNotBreakTheView asks the assembly question
+// directly: one decision, two challenges, one of the two answering the optional
+// interface. Neither the missing implementation nor the present one may cost the
+// other its view.
+func TestAHandlerThatPublishesNothingDoesNotBreakTheView(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:      30 * time.Minute,
+		policies: []*policy.Policy{mfaAndQuorumPolicy("dual-control", "alice")},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if len(res.Challenges) != 2 {
+		t.Fatalf("challenges = %+v, want two", res.Challenges)
+	}
+	byKind := map[policy.ChallengeType]decision.ChallengeView{}
+	for _, c := range res.Challenges {
+		byKind[c.Kind] = c
+	}
+	if got := byKind[policy.ChallengeMFA].AuthorizationURL; got != testAuthorizationURL {
+		t.Errorf("the mfa challenge's authorization url = %q, want %q", got, testAuthorizationURL)
+	}
+	if got := byKind[policy.ChallengeQuorum].AuthorizationURL; got != "" {
+		t.Errorf("the quorum challenge published %q, want nothing", got)
+	}
+	if got := byKind[policy.ChallengeQuorum]; got.Need != 1 {
+		t.Errorf("the quorum challenge lost its progress counts: %+v", got)
+	}
+}
+
+// TestTheDecisionLayerKnowsAChallengeKindInOneKnownPlace is KTD1 as an
+// assertion, written against what is true rather than against what the plan
+// assumed.
+//
+// The rule is that this package combines challenge answers without knowing which
+// kinds exist: the moment it imports one it can be asked to special-case it, and
+// the next kind arrives as a second special case. `deploy/demo/README.md` states
+// the rule and the open-issues plan restates it as KTD1.
+//
+// **The rule already has one exception, and it predates this unit.** R31
+// revalidation (`revalidate.go`) imports the delegated MFA package to ask whether
+// a policy revision preserved a completion, because re-issuing a step-up is not
+// a neutral way to bring a challenge up to date — it rotates the correlator and
+// moves the freshness floor. That is a real reason and a real violation; naming
+// it is what keeps it from being joined by others.
+//
+// So the assertion is per file: no file in this package may reach a challenge
+// kind except the one that already does. In particular `service.go`, which
+// assembles the view, may not — a type assertion against an optional interface
+// is the whole point of the seam, and reaching for the concrete type is the
+// mutation this test is pointed at.
+func TestTheDecisionLayerKnowsAChallengeKindInOneKnownPlace(t *testing.T) {
+	// The file allowed to know a kind, and why.
+	known := map[string]string{
+		"revalidate.go": "R31 revalidation asks mfa whether a revision preserved a completion",
+	}
+	byFile := directInternalImports(t, "internal/decision")
+	if len(byFile) == 0 {
+		t.Fatal("the import scan read no files, so it proves nothing")
+	}
+	const kindPrefix = "github.com/d0lim/stamp/internal/challenge/"
+	saw := map[string]bool{}
+	for file, imports := range byFile {
+		for _, imported := range imports {
+			if !strings.HasPrefix(imported, kindPrefix) {
+				continue
+			}
+			if why, ok := known[file]; ok {
+				saw[file] = true
+				t.Logf("known exception: %s imports %s — %s", file, imported, why)
+				continue
+			}
+			t.Errorf("%s imports the challenge kind %s; the lifecycle must ask through "+
+				"an optional interface on challenge.Handler instead", file, imported)
+		}
+	}
+	for file, why := range known {
+		if !saw[file] {
+			t.Logf("%s no longer imports a challenge kind (%s); drop it from the exceptions", file, why)
+		}
+	}
+}
+
+// TestTheChallengeContractDoesNotImportAChallengeKind guards the seam itself.
+//
+// Every kind imports the contract, so the contract importing a kind would be a
+// cycle — but the interesting failure is not the cycle, it is a helper landing in
+// the contract package that only one kind needs. The whole point of an optional
+// interface is that the contract stays the four things every handler answers.
+func TestTheChallengeContractDoesNotImportAChallengeKind(t *testing.T) {
+	const root = "github.com/d0lim/stamp/internal/challenge"
+	deps := transitiveInternalImports(t, root)
+	// The walk has to have walked: a typo in the root would report every
+	// forbidden package as absent.
+	if len(deps) < 2 {
+		t.Fatalf("the import walk found nothing beyond the root, so it proves nothing: %v", deps)
+	}
+	for pkg := range deps {
+		if strings.HasPrefix(pkg, root+"/") {
+			t.Errorf("the challenge contract reaches the kind %s:\n  %s",
+				pkg, strings.Join(importChain(deps, pkg), "\n  -> "))
+		}
+	}
+}
+
+// directInternalImports maps each non-test source file of a package directory to
+// the module-internal packages it imports.
+func directInternalImports(t *testing.T, dir string) map[string][]string {
+	t.Helper()
+	const module = "github.com/d0lim/stamp/"
+	repo, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("locate repository root: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(repo, filepath.FromSlash(dir)))
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	out := map[string][]string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(repo, filepath.FromSlash(dir), name), nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		out[name] = nil
+		for _, spec := range file.Imports {
+			imported, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("import path %s in %s: %v", spec.Path.Value, name, err)
+			}
+			if strings.HasPrefix(imported, module) {
+				out[name] = append(out[name], imported)
+			}
+		}
+	}
+	return out
+}
+
+// transitiveInternalImports walks the module's own import graph from a package,
+// reading source rather than asking the toolchain, and returns every reachable
+// module-internal package mapped to the package that pulled it in.
+//
+// Test files are skipped on purpose: what a package imports and what its tests
+// import are different claims, and only the first one ships.
+func transitiveInternalImports(t *testing.T, root string) map[string]string {
+	t.Helper()
+	const module = "github.com/d0lim/stamp/"
+	repo, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("locate repository root: %v", err)
+	}
+	seen := map[string]string{root: ""}
+	queue := []string{root}
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+		dir := filepath.Join(repo, filepath.FromSlash(strings.TrimPrefix(pkg, module)))
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read package %s: %v", pkg, err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, name), nil, parser.ImportsOnly)
+			if err != nil {
+				t.Fatalf("parse %s: %v", name, err)
+			}
+			for _, spec := range file.Imports {
+				imported, err := strconv.Unquote(spec.Path.Value)
+				if err != nil {
+					t.Fatalf("import path %s in %s: %v", spec.Path.Value, name, err)
+				}
+				if !strings.HasPrefix(imported, module) {
+					continue
+				}
+				if _, ok := seen[imported]; ok {
+					continue
+				}
+				seen[imported] = pkg
+				queue = append(queue, imported)
+			}
+		}
+	}
+	return seen
+}
+
+// importChain reconstructs how a package was reached, so a failure names the
+// edge to delete instead of only the destination.
+func importChain(from map[string]string, target string) []string {
+	var chain []string
+	for at := target; at != ""; at = from[at] {
+		chain = append([]string{at}, chain...)
+	}
+	return chain
 }
