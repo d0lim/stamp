@@ -53,3 +53,8 @@ deploy/demo/.run/
 *.swp
 .idea/
 .vscode/
+
+# Agent worktrees. These are peer checkouts of this same repository, so a
+# stray `git add -A` stages them as embedded repositories — which is how they
+# nearly landed in a docs commit.
+.claude/worktrees/
