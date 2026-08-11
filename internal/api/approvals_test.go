@@ -18,6 +18,7 @@ import (
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // The approval surface owns three things and no more: it puts the endpoint on
@@ -90,14 +91,25 @@ type approvalFixture struct {
 	server    *api.Server
 	idp       *mockIdP
 	collector *recordingCollector
+	audit     *recordingEvents
+	clock     *decideClock
+}
+
+// approvalOptions are the knobs a test turns. Zero is the deployment default
+// for each, which is what most of these tests want to exercise.
+type approvalOptions struct {
+	maxBytes int64
+	rate     stream.RateLimit
 }
 
 func newApprovalFixture(t *testing.T) *approvalFixture {
 	t.Helper()
-	return newApprovalFixtureWith(t, 0)
+	// A budget large enough not to be the limit under test, so that a test about
+	// the approver boundary is not silently also a test about the rate.
+	return newApprovalFixtureWith(t, approvalOptions{rate: generous})
 }
 
-func newApprovalFixtureWith(t *testing.T, maxBytes int64) *approvalFixture {
+func newApprovalFixtureWith(t *testing.T, opts approvalOptions) *approvalFixture {
 	t.Helper()
 	idp := newMockIdP(t)
 	sink := identity.AuditSinkFunc(func(context.Context, identity.AuthRecord) {})
@@ -114,10 +126,15 @@ func newApprovalFixtureWith(t *testing.T, maxBytes int64) *approvalFixture {
 	collector := &recordingCollector{
 		result: decision.Result{ID: testDecisionID, State: store.DecisionPending},
 	}
+	audit := &recordingEvents{}
+	clock := &decideClock{at: fixedNow}
 	approvals, err := api.NewApprovals(api.ApprovalsConfig{
 		Decisions:       collector,
 		Reviews:         collector,
-		MaxRequestBytes: maxBytes,
+		MaxRequestBytes: opts.maxBytes,
+		Rate:            opts.rate,
+		Audit:           audit,
+		Now:             clock.Now,
 	})
 	if err != nil {
 		t.Fatalf("build approvals: %v", err)
@@ -125,7 +142,7 @@ func newApprovalFixtureWith(t *testing.T, maxBytes int64) *approvalFixture {
 	if err := server.Mount(approvals); err != nil {
 		t.Fatalf("mount approvals: %v", err)
 	}
-	return &approvalFixture{server: server, idp: idp, collector: collector}
+	return &approvalFixture{server: server, idp: idp, collector: collector, audit: audit, clock: clock}
 }
 
 // userToken mints an end-user token: a client the operator did not declare as a
@@ -397,10 +414,117 @@ func TestReviewRefusedToANonTarget(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// the submission budget (R43)
+// ---------------------------------------------------------------------------
+
+// TestSubmissionsAreRefusedOverTheApproverBudget is R43's submission half.
+//
+// Its refusal is a 4xx, which the other two budgets this unit added are not, and
+// that difference is deliberate. A challenge issue has no HTTP response of its
+// own to carry a status code — the caller there is a PEP asking for a decision —
+// so a refusal can only be challenge state. This one is answering a console over
+// a request the approver made themselves, so it is answered where they asked.
+//
+// The refusal must also happen before the lifecycle is touched, because what a
+// submission costs behind this door is a row lock on the decision; a limit
+// applied after that has limited nothing.
+func TestSubmissionsAreRefusedOverTheApproverBudget(t *testing.T) {
+	t.Parallel()
+	const burst = 3
+	f := newApprovalFixtureWith(t, approvalOptions{
+		rate: stream.RateLimit{PerSecond: 1, Burst: burst},
+	})
+
+	for i := range burst {
+		if rec := f.approve(t, "bob", ""); rec.Code != http.StatusOK {
+			t.Fatalf("submission %d within the burst = %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	rec := f.approve(t, "bob", "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("the submission past the burst = %d, want 429: %s", rec.Code, rec.Body.String())
+	}
+	if f.collector.submitted() != burst {
+		t.Errorf("%d submissions reached the lifecycle, want %d: the refusal happened behind the row lock",
+			f.collector.submitted(), burst)
+	}
+
+	// The code is the console's, and it is its own code: a caller has to be able
+	// to tell "slow down" from "you are not an approver" and from "the decision
+	// changed", both of which are also refusals with a body.
+	var body struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %q: %v", rec.Body.String(), err)
+	}
+	if body.Error != api.ApprovalRateLimitedCode {
+		t.Errorf("error code = %q, want %q", body.Error, api.ApprovalRateLimitedCode)
+	}
+
+	// And it is audited, with its own ground: an operator reading the chain has
+	// to be able to tell an approver who was shed from a PEP that was.
+	var refusals []api.Event
+	for _, e := range f.audit.snapshot() {
+		if e.Kind == api.EventRateLimited {
+			refusals = append(refusals, e)
+		}
+	}
+	if len(refusals) != 1 {
+		t.Fatalf("%d rate-limit events were recorded, want 1", len(refusals))
+	}
+	got := refusals[0]
+	switch {
+	case got.Reason != api.ApprovalRateLimitedReason:
+		t.Errorf("audited reason = %q, want %q", got.Reason, api.ApprovalRateLimitedReason)
+	case got.Reason == string(decision.ReasonRateLimited):
+		t.Error("the approval refusal is indistinguishable from the decide path's")
+	}
+	if got.CallerID == "" || !strings.Contains(got.CallerID, "bob") {
+		t.Errorf("audited caller = %q, want the approver's identifier", got.CallerID)
+	}
+	if got.Path != approvalPath || got.Method != http.MethodPost {
+		t.Errorf("audited request = %s %s, want POST %s", got.Method, got.Path, approvalPath)
+	}
+	if got.Limit == "" || got.Scope == "" {
+		t.Errorf("audited scope/limit = %q/%q, want both: a reader cannot tell which budget bound", got.Scope, got.Limit)
+	}
+}
+
+// TestTheApprovalBudgetIsPerApproverAndRefills guards the key and the recovery.
+// A budget shared across approvers would let one flooding console user stop
+// everybody else approving, which is the limit becoming the incident.
+func TestTheApprovalBudgetIsPerApproverAndRefills(t *testing.T) {
+	t.Parallel()
+	const burst = 2
+	f := newApprovalFixtureWith(t, approvalOptions{
+		rate: stream.RateLimit{PerSecond: 1, Burst: burst},
+	})
+
+	for range burst {
+		if rec := f.approve(t, "bob", ""); rec.Code != http.StatusOK {
+			t.Fatalf("submission within the burst = %d", rec.Code)
+		}
+	}
+	if rec := f.approve(t, "bob", ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("the submission past the burst = %d, want 429", rec.Code)
+	}
+	if rec := f.approve(t, "carol", ""); rec.Code != http.StatusOK {
+		t.Fatalf("a second approver's first submission = %d: one approver spent another's budget", rec.Code)
+	}
+
+	f.clock.Advance(time.Second)
+	if rec := f.approve(t, "bob", ""); rec.Code != http.StatusOK {
+		t.Fatalf("a full refill window later the submission = %d, want 200", rec.Code)
+	}
+}
+
 // A body big enough to be an attack is refused before it is parsed.
 func TestOversizedSubmissionIsRefused(t *testing.T) {
 	t.Parallel()
-	f := newApprovalFixtureWith(t, 64)
+	f := newApprovalFixtureWith(t, approvalOptions{maxBytes: 64, rate: generous})
 	rec := f.approve(t, "bob", `{"binding_hash":"`+strings.Repeat("a", 200)+`"}`)
 	if rec.Code != http.StatusRequestEntityTooLarge && rec.Code != http.StatusBadRequest {
 		t.Fatalf("oversized body answered %d, want a refusal", rec.Code)
