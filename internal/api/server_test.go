@@ -2,9 +2,12 @@ package api_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,6 +99,110 @@ func TestPEPListenerCannotReachConsoleOrCallbackPaths(t *testing.T) {
 		if got := resp.Header.Get("X-Stamp-Surface"); got != string(surface) {
 			t.Fatalf("%s health reports surface %q", surface, got)
 		}
+	}
+}
+
+// Readiness and liveness are two endpoints because they have two remedies, and
+// that split is the whole reason a lagging schema is a wait rather than an
+// outage or a restart loop. Both halves are asserted: /readyz refuses while the
+// gate refuses, and /healthz keeps answering 200 through it — because the chart
+// still points the livenessProbe at /healthz, and a /healthz that followed the
+// gate would restart every pod in the fleet instead of holding them back.
+func TestReadyzRefusesWhileHealthzKeepsAnsweringAndBothNameTheirSurface(t *testing.T) {
+	t.Parallel()
+
+	var refuse atomic.Bool
+	refuse.Store(true)
+	server, err := api.New(api.Config{
+		Addresses: map[api.Surface]string{api.SurfacePEP: "127.0.0.1:0"},
+		Ready: func(context.Context) error {
+			if refuse.Load() {
+				return errors.New("database schema is at version 7 and this build needs 9")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	handler := server.Handler(api.SurfacePEP)
+
+	probe := func(path string) (int, string, string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String(), rec.Header().Get("X-Stamp-Surface")
+	}
+
+	code, body, surface := probe("/readyz")
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("GET /readyz while the gate refuses = %d, want 503", code)
+	}
+	// The reason travels in the body because that is where `kubectl describe`
+	// and a curl both show it. A 503 with no reason is a rollout nobody can
+	// diagnose without reading the pod's logs.
+	if !strings.Contains(body, "version 7") || !strings.Contains(body, "needs 9") {
+		t.Errorf("GET /readyz body does not carry the gate's reason: %q", body)
+	}
+	if surface != string(api.SurfacePEP) {
+		t.Errorf("GET /readyz reports surface %q", surface)
+	}
+
+	// Same moment, same process: liveness says the process is fine, because it
+	// is. Nothing about a schema that has not landed is fixed by a restart.
+	if code, _, surface := probe("/healthz"); code != http.StatusOK || surface != string(api.SurfacePEP) {
+		t.Errorf("GET /healthz while readiness refuses = %d on surface %q, want 200 on %q",
+			code, surface, api.SurfacePEP)
+	}
+
+	refuse.Store(false)
+	if code, body, _ := probe("/readyz"); code != http.StatusOK || !strings.Contains(body, "ready") {
+		t.Errorf("GET /readyz once the gate opens = %d %q, want 200 ready", code, body)
+	}
+}
+
+// A server given no readiness question answers 200. An embedding that only
+// wants a router must not have to prove something to serve.
+func TestReadyzWithoutAGateIsAlwaysReady(t *testing.T) {
+	t.Parallel()
+	server, err := api.New(api.Config{Addresses: map[api.Surface]string{api.SurfacePEP: "127.0.0.1:0"}})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	server.Handler(api.SurfacePEP).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /readyz with a nil Ready = %d, want 200", rec.Code)
+	}
+}
+
+// /readyz is mounted by the server on every surface, like /healthz, so a route
+// that claims either pattern is a collision rather than an override. Without
+// this, a later provider could take the pattern the chart's probe depends on and
+// nothing would say so until a rollout hung.
+func TestReadyzCannotBeShadowedByAMountedRoute(t *testing.T) {
+	t.Parallel()
+	server, err := api.New(api.Config{Addresses: map[api.Surface]string{api.SurfaceCallback: "127.0.0.1:0"}})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	// AuthPublic on the callback surface, so the only thing that can refuse this
+	// mount is the pattern collision this test is about — a route needing a
+	// credential would be refused for want of identity middleware instead, and
+	// the test would pass without ever reaching the question.
+	err = server.Mount(staticProvider{{
+		Name:    "impostor",
+		Surface: api.SurfaceCallback,
+		Pattern: "GET /readyz",
+		Auth:    api.AuthPublic,
+		Handler: okHandler("no"),
+	}})
+	if err == nil {
+		t.Fatal("mounting GET /readyz was accepted: the probe the chart depends on can be replaced")
+	}
+	if !strings.Contains(err.Error(), "readyz") {
+		t.Errorf("the refusal does not name readyz: %v", err)
 	}
 }
 

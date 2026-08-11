@@ -118,43 +118,61 @@ function proposal(overrides: Record<string, unknown> = {}) {
   }
 }
 
+interface Answer {
+  readonly status: number
+  readonly body: unknown
+  /** Response headers beyond the JSON content type, when a case needs one. */
+  readonly headers?: Readonly<Record<string, string>>
+}
+
 interface StubOptions {
-  readonly inbox?: { readonly status: number; readonly body: unknown }
-  readonly review?: { readonly status: number; readonly body: unknown }
-  readonly proposal?: { readonly status: number; readonly body: unknown }
-  readonly submit?: { readonly status: number; readonly body: unknown }
+  readonly inbox?: Answer
+  /**
+   * The review answer. An array is answered in order, with the last entry
+   * repeating — which is how a screen that re-reads on an interval is given a
+   * read that succeeds and then stops succeeding.
+   */
+  readonly review?: Answer | readonly Answer[]
+  readonly proposal?: Answer
+  readonly submit?: Answer
 }
 
 function stub(options: StubOptions = {}) {
   const calls: { method: string; path: string; body: unknown }[] = []
+  let reviewCalls = 0
   const impl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://console.test')
     const method = init?.method ?? 'GET'
     const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined
     calls.push({ method, path: url.pathname, body })
-    const answer = (status: number, payload: unknown) =>
-      new Response(JSON.stringify(payload), { status, headers: { 'Content-Type': 'application/json' } })
+    const answer = (result: Answer) =>
+      new Response(JSON.stringify(result.body), {
+        status: result.status,
+        headers: { 'Content-Type': 'application/json', ...(result.headers ?? {}) },
+      })
 
     if (url.pathname === '/decisions/inbox') {
-      const result = options.inbox ?? { status: 200, body: { items: [], server_time: SERVER_NOW } }
-      return answer(result.status, result.body)
+      return answer(options.inbox ?? { status: 200, body: { items: [], server_time: SERVER_NOW } })
     }
     if (url.pathname.endsWith('/approval')) {
-      const result = options.review ?? { status: 200, body: review() }
-      return answer(result.status, result.body)
+      const configured = options.review ?? { status: 200, body: review() }
+      const index = reviewCalls++
+      if (!Array.isArray(configured)) return answer(configured as Answer)
+      const sequence = configured as readonly Answer[]
+      return answer(sequence[Math.min(index, sequence.length - 1)] as Answer)
     }
     if (url.pathname.endsWith('/approvals')) {
-      const result = options.submit ?? {
-        status: 200,
-        body: { id: DECISION_ID, state: 'pending', reason: '', challenges: [] },
-      }
-      return answer(result.status, result.body)
+      return answer(
+        options.submit ?? {
+          status: 200,
+          body: { id: DECISION_ID, state: 'pending', reason: '', challenges: [] },
+        },
+      )
     }
     if (url.pathname.startsWith('/policies/revisions/')) {
-      const result = options.proposal ?? { status: 200, body: proposal() }
-      return answer(result.status, result.body)
+      return answer(options.proposal ?? { status: 200, body: proposal() })
     }
-    return answer(404, { error: 'not_found', message: `no stub for ${method} ${url.pathname}` })
+    return answer({ status: 404, body: { error: 'not_found', message: `no stub for ${method} ${url.pathname}` } })
   })
   return { impl: impl as unknown as typeof fetch, calls }
 }
@@ -476,6 +494,85 @@ describe('제출 실패', () => {
     for (const forbidden of ['기다리고 있지 않습니다', '권한이 없습니다']) {
       expect(failure).not.toHaveTextContent(forbidden)
     }
+  })
+
+  it('429 rate_limited는 기다리라고 말하지, 운영자에게 가라고 하지 않는다', async () => {
+    // The budget refills on a timer (R43). Sending the approver to an operator
+    // — which is what the generic branch does — is the one piece of advice that
+    // makes the situation worse: the operator has nothing to do, and the
+    // approver stops doing the thing that works. The server states the wait in
+    // `Retry-After` for exactly this rendering.
+    const user = userEvent.setup()
+    renderApproval({
+      submit: {
+        status: 429,
+        body: { error: 'rate_limited', message: 'too many submissions; try again shortly' },
+        headers: { 'Retry-After': '30' },
+      },
+    })
+    await entryList(17)
+    await user.click(screen.getByTestId('expand-all'))
+    await user.click(screen.getByTestId('approve'))
+
+    const failure = await screen.findByTestId('submit-failure')
+    expect(failure).toHaveTextContent('30초')
+    expect(failure).toHaveTextContent('다시 누르십시오')
+    // And it says the approval did not land, because an approver who thinks it
+    // might have walks away from a quorum still one short.
+    expect(failure).toHaveTextContent('기록되지 않았습니다')
+    expect(failure).not.toHaveTextContent('운영자에게 이 화면의 결정 식별자를 전달')
+  })
+
+  it('Retry-After가 없으면 숫자를 지어내지 않고 그래도 기다리라고 말한다', async () => {
+    // The header can be absent for reasons that are not about this deployment's
+    // budget — a cross-origin response that does not expose it, a proxy that
+    // dropped it. The advice is unchanged; only the number goes.
+    const user = userEvent.setup()
+    renderApproval({
+      submit: { status: 429, body: { error: 'rate_limited', message: 'too many submissions' } },
+    })
+    await entryList(17)
+    await user.click(screen.getByTestId('expand-all'))
+    await user.click(screen.getByTestId('approve'))
+
+    const failure = await screen.findByTestId('submit-failure')
+    expect(failure).toHaveTextContent('잠시 기다린 뒤')
+    expect(failure).not.toHaveTextContent('NaN')
+    expect(failure).not.toHaveTextContent('undefined')
+    expect(failure).not.toHaveTextContent('운영자에게 이 화면의 결정 식별자를 전달')
+  })
+
+  it('읽기가 실패하면 직전에 성공한 검토 화면은 남지 않는다', async () => {
+    // This screen re-reads while it is open, so a read that stops working has a
+    // previous one to leave behind. Left behind, the "cannot be opened" notice
+    // renders on top of a full review body with a live approve button under it:
+    // material the server has just refused to stand behind, next to the control
+    // that would submit against it. AuditDecisionScreen clears its body on the
+    // same failure; this asserts they agree.
+    //
+    // The second read is driven by the reload a successful submission triggers
+    // rather than by the poll timer, because it is the same function — useReview
+    // hands `load` out as `reload` — and a test that waits five seconds for a
+    // timer is a test that eventually gets deleted for being slow.
+    const user = userEvent.setup()
+    renderApproval({
+      review: [
+        { status: 200, body: review() },
+        { status: 404, body: { error: 'not_found', message: 'no such decision or challenge' } },
+      ],
+    })
+    await entryList(17)
+    await user.click(screen.getByTestId('expand-all'))
+    await user.click(screen.getByTestId('approve'))
+
+    const notice = await screen.findByTestId('review-unavailable')
+    expect(notice).toHaveTextContent('존재하지 않거나, 당신에게 열려 있지 않습니다')
+    await waitFor(() => expect(screen.queryByTestId('entry-list')).toBeNull())
+    expect(screen.queryByTestId('approve')).toBeNull()
+    expect(screen.queryByTestId('binding-hash')).toBeNull()
+    // And not the loading line either: the read finished, it just did not give
+    // us anything.
+    expect(screen.queryByText('승인 자료를 읽는 중입니다…')).toBeNull()
   })
 
   it('열 수 없는 승인 화면은 오류가 아니라 거부로 말한다', async () => {

@@ -42,4 +42,37 @@ what a first release would contain.
   the image and the chart with an SBOM and signatures, and specification
   documents for the three public contracts.
 
+### Upgrade notes
+
+- **A serving pod must not run ahead of the schema, and now it will not.** Only
+  the tier holding the `api` role migrates, while `helm upgrade` rolls every
+  Deployment at once. Every listener therefore answers `GET /readyz`, and the
+  chart's readinessProbe asks it instead of `/healthz`: a pod whose binary needs
+  a schema the database has not reached stays out of its Service until the
+  migration lands, rather than joining it and answering `42703 column ... does
+  not exist`. `/healthz` is unchanged and remains the liveness signal. Two
+  consequences for an operator: an upgrade can now pause with pods Running and
+  not Ready — that is the migration not having landed, and `kubectl describe`
+  prints the version being waited for — and a chart upgraded ahead of the image
+  will stall, because an older image has no `/readyz` to answer. Upgrade the
+  chart and the image together.
+
+- **Rolling migrations 000009 and 000008 back discards the in-flight idempotency
+  keys, and a PEP mid-retry pays for it.** 000009 drops the unique index and
+  000008 drops `decisions.idempotency_key` itself; the decision rows survive, but
+  the names their callers gave them do not. A PEP that retries a `POST /decisions`
+  across that rollback is a caller whose key now matches nothing, so it gets a
+  *second* decision: a second slot against the subject's outstanding cap, a
+  second set of challenges, and a second push at whichever person was already
+  asked to authorise the first one. Rolling forward again does not reunite them —
+  the first decision keeps running under a name nobody holds. Treat the rollback
+  as an operation with a human cost and drain the decide path first if the
+  deployment can.
+
+- 000009 builds its index with `CREATE INDEX CONCURRENTLY`, which is not atomic.
+  An interrupted build leaves an INVALID index behind and marks the schema dirty,
+  which the readiness gate above reports as unready on every tier. Recovery is to
+  roll 000009 back — its down is a single `DROP INDEX CONCURRENTLY IF EXISTS`,
+  which clears the corpse — and migrate up again.
+
 [Unreleased]: https://github.com/d0lim/stamp/compare/main...HEAD

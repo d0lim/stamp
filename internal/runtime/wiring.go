@@ -729,7 +729,19 @@ func (a *App) build(ctx context.Context) error {
 	}
 	a.registry = registry
 
-	server, err := api.New(api.Config{Identity: middleware, Addresses: cfg.Addresses})
+	// Readiness is answered by the schema gate on every tier, including the one
+	// that migrates: the migrating tier has already applied everything by the
+	// time it gets here, so the gate opens on its first probe, and a tier
+	// configured not to migrate is exactly the one that has to wait. Which
+	// tiers those are is deployment configuration, so the gate is not
+	// conditional on it.
+	readiness, gerr := newSchemaVersionGate(a.store, a.logger)
+	if gerr != nil {
+		return gerr
+	}
+	server, err := api.New(api.Config{
+		Identity: middleware, Addresses: cfg.Addresses, Ready: readiness.ready,
+	})
 	if err != nil {
 		return err
 	}

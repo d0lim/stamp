@@ -1283,10 +1283,19 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 				}
 			}
 			// Every process answers its own liveness probe, on every surface it
-			// serves, whatever it runs.
+			// serves, whatever it runs. And its readiness probe: the harness
+			// migrated this database, so every role's answer is 200 — which is
+			// also the assertion that the schema gate does not depend on the
+			// roles a process runs. It is the tiers that do *not* migrate that
+			// need it, and they are the ones that would notice a gate wired
+			// only into the migrating path.
 			for _, surface := range []api.Surface{api.SurfacePEP, api.SurfaceConsole} {
 				if code, _ := h.do(http.MethodGet, surface, "/healthz", "", "", nil); code != http.StatusOK {
 					t.Errorf("GET /healthz on %s under --roles=%s = %d, want 200", surface, tc.roles, code)
+				}
+				if code, body := h.do(http.MethodGet, surface, "/readyz", "", "", nil); code != http.StatusOK {
+					t.Errorf("GET /readyz on %s under --roles=%s = %d %q, want 200 on a migrated database",
+						surface, tc.roles, code, body)
 				}
 			}
 		})

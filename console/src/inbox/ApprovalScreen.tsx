@@ -76,6 +76,47 @@ const NOT_FOUND = {
   next: '승인함 목록을 다시 읽으십시오. 승인자 집합이 개정으로 바뀌었더라도, 당신을 기다리는 결정은 그 목록에 남아 있습니다.',
 } as const
 
+/**
+ * The error code the approval budget refuses under (R43), as `internal/api/
+ * approvals.go` spells it.
+ *
+ * It is not in FAILURES because its next step carries a number the table cannot
+ * hold — see [rateLimited].
+ */
+const RATE_LIMITED = 'rate_limited'
+
+/**
+ * An approval refused by the per-approver budget, worded as the wait it is.
+ *
+ * This is the one failure on this screen that clears by itself. Everything else
+ * here is final for this submission — the decision expired, the quorum closed,
+ * the material moved — and the generic branch's advice to hand the decision
+ * identifier to an operator is right for those. For a limit it is the opposite
+ * of right: there is nothing for an operator to do, the budget refills on a
+ * timer measured in seconds, and an approver who escalates instead of waiting
+ * has stopped doing the one thing that would work. The server states the wait in
+ * `Retry-After` precisely so a console can say it.
+ *
+ * The approval was not recorded, and that is said outright. An approver who
+ * believes a refused submission might have landed either walks away from a
+ * quorum still one short, or waits for a state change that is not coming.
+ *
+ * Without a readable `Retry-After` the copy still stands, minus the number. The
+ * header can be missing for reasons that have nothing to do with this
+ * deployment's budget — a cross-origin response that does not expose it, an
+ * intermediary that dropped it — and "잠시" is honest where a fabricated
+ * countdown would not be.
+ */
+function rateLimited(seconds: number | undefined): { text: string; next: string } {
+  return {
+    text: '승인 제출이 너무 잦아 이번 제출이 거부되었습니다. 이 승인은 기록되지 않았습니다.',
+    next:
+      seconds === undefined
+        ? '잠시 기다린 뒤 승인 버튼을 다시 누르십시오. 운영자에게 알릴 일은 아닙니다 — 이 한도는 시간이 지나면 저절로 풀립니다.'
+        : `약 ${seconds}초 뒤에 승인 버튼을 다시 누르십시오. 운영자에게 알릴 일은 아닙니다 — 이 한도는 시간이 지나면 저절로 풀립니다.`,
+  }
+}
+
 /** R21's submission failures, each with its own words and its own next step. */
 const FAILURES: Readonly<Record<string, { readonly text: string; readonly next: string }>> = {
   expired: {
@@ -161,6 +202,19 @@ function useReview(api: ApiClient, decisionID: string, ordinal: string) {
       setUnavailable(false)
     } catch (cause) {
       if (cause instanceof ApiError && cause.isUnauthenticated) return
+      // The body goes with the failure. This screen polls, so a read that stops
+      // working leaves the last successful one behind — and the last successful
+      // one is a fully drawn review with a live submit panel underneath a notice
+      // saying the decision cannot be opened. An approver reading that has been
+      // shown material the server has just refused to stand behind, next to a
+      // button that would submit against it. The audit detail screen clears its
+      // body for the same reason; this is the same rule.
+      //
+      // A 401 is the one failure that does not clear, and the early return above
+      // is why: the session is being refreshed, the material is still the
+      // material, and blanking the screen on every token expiry would be a
+      // flicker rather than a refusal.
+      setReview(null)
       setUnavailable(cause instanceof ApiError && cause.isNotFound)
       setError(describe(cause))
     }
@@ -530,6 +584,14 @@ function SubmitPanel({
 export function failureOf(cause: unknown): { text: string; next: string } {
   if (cause instanceof ApiError) {
     const body = cause.body as { error?: string; message?: string } | undefined
+    // Before the table, because the words depend on a value the table cannot
+    // hold: how long to wait. Matched on the status as well as on the code for
+    // the reason the 404 below is — a 429 from anything between the console and
+    // the engine is still a limit, and telling an approver to escalate one is
+    // the worst answer available.
+    if (cause.isRateLimited || body?.error === RATE_LIMITED) {
+      return rateLimited(cause.retryAfterSeconds)
+    }
     const known = body?.error === undefined ? undefined : FAILURES[body.error]
     if (known) return known
     if (cause.isNotFound) return NOT_FOUND
