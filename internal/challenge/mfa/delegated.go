@@ -19,6 +19,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -130,12 +131,14 @@ type recentIssue struct {
 	detail Detail
 }
 
-// Compile-time proof that the handler serves the whole contract, including both
-// optional interfaces: the read rule and the publishable view.
+// Compile-time proof that the handler serves the whole contract, including all
+// three optional interfaces: the read rule, the publishable view, and the
+// redemption of the redirect the view published.
 var (
 	_ challenge.Handler  = (*Delegated)(nil)
 	_ challenge.Targeter = (*Delegated)(nil)
 	_ challenge.Viewer   = (*Delegated)(nil)
+	_ challenge.Redeemer = (*Delegated)(nil)
 )
 
 // NewDelegated builds the handler, refusing a configuration that would leave
@@ -290,6 +293,8 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 		ContextHash:       contextHash,
 		AuthorizationURL:  out.AuthorizationURL,
 		AuthReqID:         out.AuthReqID,
+		State:             out.State,
+		CodeVerifier:      out.CodeVerifier,
 	}
 	d.remember(subjectID, contextHash, detail, req.Now)
 	return challenge.IssueResult{State: challenge.StatePending, Detail: detail}, nil
@@ -433,6 +438,58 @@ func (d *Delegated) View(_ context.Context, req challenge.ViewRequest) (challeng
 		return challenge.View{}, err
 	}
 	return challenge.View{AuthorizationURL: detail.AuthorizationURL}, nil
+}
+
+// Redeem implements [challenge.Redeemer]: it turns the IdP's redirect into the
+// ID token that redirect was worth, and into the body that completes the
+// challenge.
+//
+// It judges none of the authentication. The token goes back to the surface to
+// be verified by [identity.Verifier], and then arrives at [Delegated.Submit] as
+// a caller — the same path a CIBA poll and the mock-OP tests take, so there is
+// one conjunction of checks and the transport does not get a second one. In
+// particular the `acr` check, which U0 proved is the only thing standing between
+// a silent downgrade and a satisfied step-up, runs there and only there.
+//
+// The correlator is put into the payload here rather than being asked of the
+// caller. On the redirect path there is no caller to ask: a browser following an
+// IdP's `Location` header carries what the IdP put in the query and nothing
+// else. The correlator's job on this path is what it always was — to be the
+// value the completion is recorded against — and the binding that a redirect
+// belongs to this challenge is done by the path, the `state` and the `nonce`.
+func (d *Delegated) Redeem(ctx context.Context, req challenge.RedeemRequest) (challenge.Redemption, error) {
+	detail, err := DecodeDetail(req.Detail)
+	if err != nil {
+		return challenge.Redemption{}, err
+	}
+	// Refused before the token call rather than after it. A spent challenge has
+	// nothing a code could add, and redeeming one would spend a real
+	// authorization code to reach a refusal that was already certain.
+	if detail.Consumed() {
+		return challenge.Redemption{}, fmt.Errorf("%w: %s was completed at %s",
+			ErrCorrelatorConsumed, req.Instance, detail.ConsumedAt.UTC().Format(time.RFC3339Nano))
+	}
+	redeemer, ok := d.initiator.(Redeemer)
+	if !ok {
+		return challenge.Redemption{}, fmt.Errorf("%w: %s was opened by a transport with no redirect",
+			challenge.ErrNotRedeemable, req.Instance)
+	}
+
+	token, err := redeemer.Redeem(ctx, RedeemRequest{
+		Instance:      req.Instance,
+		Params:        req.Params,
+		ExpectedState: detail.State,
+		CodeVerifier:  detail.CodeVerifier,
+		RedirectURI:   d.callbackFor(req.Instance),
+	})
+	if err != nil {
+		return challenge.Redemption{}, err
+	}
+	payload, err := json.Marshal(Submission{Correlator: detail.Correlator})
+	if err != nil {
+		return challenge.Redemption{}, fmt.Errorf("mfa: encoding the completion for %s: %w", req.Instance, err)
+	}
+	return challenge.Redemption{Credential: token, Payload: payload}, nil
 }
 
 // IsTarget implements [challenge.Targeter] for R40's read rule.

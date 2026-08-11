@@ -54,10 +54,16 @@ fails the run.
   nor the checkpoint private key, appears in any container log or in the
   console's configuration document.
 
-The script also opens a delegated MFA challenge and shows the callback surface
-refusing a forged completion. It does not complete that challenge; see
-[`deploy/demo/README.md`](../deploy/demo/README.md) for exactly what is missing
-and why it is reported rather than worked around.
+- **A delegated MFA challenge, completed in a browser.** `dana` is sent to the
+  demo IdP by the address the decision response carries, signs in at the real
+  login form, and the IdP redirects back to that challenge's own callback path.
+  STAMP redeems the authorization code with the PKCE verifier it kept, checks the
+  `acr` on the ID token that comes back — which is the only thing standing
+  between a silently downgraded login and a satisfied step-up — and the decision
+  resolves. On the way, a redirect echoing a `state` this deployment never issued
+  is refused before any token call is made. See
+  [`deploy/demo/README.md`](../deploy/demo/README.md) for how the three seams fit
+  together.
 
 ## The bootstrap token and the lock are steps, not footnotes
 

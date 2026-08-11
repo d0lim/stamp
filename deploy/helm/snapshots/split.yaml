@@ -59,6 +59,7 @@ data:
   STAMP_MFA_AUTHORIZATION_ENDPOINT: "https://idp.example/authorize"
   STAMP_MFA_CLIENT_ID: "stamp-stepup"
   STAMP_MFA_REDIRECT_URI: "https://stamp-callback.example/mfa/return"
+  STAMP_MFA_TOKEN_ENDPOINT: "https://idp.example/token"
   STAMP_MFA_CIBA_BACKCHANNEL_ENDPOINT: "https://idp.example/ciba"
   STAMP_MFA_CIBA_TOKEN_ENDPOINT: "https://idp.example/token"
   STAMP_MFA_CIBA_CLIENT_ID: "stamp-ciba"
@@ -252,7 +253,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: check
       annotations:
-        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
+        checksum/config: 6572659fbe8dda5e6514f399183a6482eb48c31b73dc1d60157d72e813cc1c24
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -415,7 +416,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: decide
       annotations:
-        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
+        checksum/config: 6572659fbe8dda5e6514f399183a6482eb48c31b73dc1d60157d72e813cc1c24
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -601,7 +602,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: consumer
       annotations:
-        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
+        checksum/config: 6572659fbe8dda5e6514f399183a6482eb48c31b73dc1d60157d72e813cc1c24
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -772,7 +773,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: api
       annotations:
-        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
+        checksum/config: 6572659fbe8dda5e6514f399183a6482eb48c31b73dc1d60157d72e813cc1c24
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -1006,7 +1007,7 @@ spec:
         stamp.dev/topology: split
         app.kubernetes.io/component: console
       annotations:
-        checksum/config: 6f9b9a8caca80bc949fcb5173ab30f93c53b5a3ae99d9144f06cafe6ba257d22
+        checksum/config: 6572659fbe8dda5e6514f399183a6482eb48c31b73dc1d60157d72e813cc1c24
     spec:
       serviceAccountName: stamp
       securityContext:

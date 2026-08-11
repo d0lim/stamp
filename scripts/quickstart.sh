@@ -435,9 +435,77 @@ STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$CALLBACK/decisions/$M
   -d '{"correlator":"not-the-one","id_token":"not.a.token"}')
 assert_eq 401 "$STATUS" "a completion with an unverifiable credential"
 
-note "KNOWN GAP: the browser round trip that would satisfy this challenge cannot be"
-note "driven from here. The step-up authorization URL is built at issuance and stored"
-note "in the challenge detail, and no HTTP response carries it — see deploy/demo/README.md."
+# The decision response carries the address to send the subject to (U1, #41).
+# Nothing else does: the correlator and the PKCE verifier stay on the challenge
+# row, and `state` is a throwaway CSRF token rather than the correlator (KTD2).
+AUTHZ_URL=$(printf '%s' "$MFA_DECISION" | jq -er '.challenges[0].authorization_url') \
+  || die "the decision response carries no authorization_url for the step-up"
+case "$AUTHZ_URL" in
+  *code_challenge_method=S256*) ;;
+  *) die "the authorization url carries no PKCE challenge method; this realm refuses such a request" ;;
+esac
+note "the subject is sent to: ${AUTHZ_URL%%\?*}?…"
+
+# A redirect this deployment did not ask for is refused before any token call.
+STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+  "$CALLBACK/decisions/$MFA_ID/challenges/0/mfa?code=forged&state=not-the-state")
+assert_eq 403 "$STATUS" "a callback echoing a state this challenge never issued"
+
+# `auth_time` has one-second resolution and has to postdate the instant the
+# challenge opened, which is what `max_age=0` on the way out is for. A second of
+# slack here is the difference between a demo and a coin flip.
+sleep 1.2
+
+# The browser's half: the login form, the password, and the 302 the IdP answers
+# with. Nothing below is a shortcut past any of it.
+STEPUP_JAR="$RUN_DIR/cookies-stepup-dana.txt"; : >"$STEPUP_JAR"
+PAGE=$(curl -fsS -c "$STEPUP_JAR" "$AUTHZ_URL") \
+  || die "the IdP refused the step-up authorization request"
+ACTION=$(printf '%s' "$PAGE" | tr '>' '>\n' | sed -n 's/.*action="\([^"]*\)".*/\1/p' | head -1)
+[ -n "$ACTION" ] || die "no login form in the IdP's response to the step-up request"
+ACTION=${ACTION//&amp;/&}
+LOCATION=$(curl -sS -b "$STEPUP_JAR" -c "$STEPUP_JAR" -o /dev/null -D - \
+  --data-urlencode "username=dana" \
+  --data-urlencode "password=$DEMO_USER_PASSWORD" \
+  --data-urlencode "credentialId=" \
+  "$ACTION" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -1)
+case "$LOCATION" in
+  *code=*) ;;
+  *) die "the step-up login did not produce an authorization code (redirect: ${LOCATION:-none})" ;;
+esac
+case "$LOCATION" in
+  "$CALLBACK/decisions/$MFA_ID/challenges/0/mfa"*) ;;
+  *) die "the IdP redirected somewhere other than this challenge's callback: $LOCATION" ;;
+esac
+
+# And the browser follows it. This is the whole round trip: STAMP redeems the
+# code with the verifier it kept, verifies the ID token against the pinned
+# issuer, and judges the `acr` — which S1 established is the only defence against
+# a silent downgrade.
+LANDING=$(curl -sS -D "$RUN_DIR/mfa-landing-headers.txt" "$LOCATION") \
+  || die "the callback surface did not answer the IdP's redirect"
+STATUS=$(sed -n '1s/[^ ]* \([0-9]*\).*/\1/p' "$RUN_DIR/mfa-landing-headers.txt")
+assert_eq 200 "$STATUS" "the step-up landing"
+case "$LANDING" in
+  *"Verification complete"*) ;;
+  *) die "the landing page does not tell the subject they are done: $LANDING" ;;
+esac
+# It answers a person, so it is a page — and one that carries no referrer, so the
+# authorization code in that URL does not travel any further.
+grep -qi '^content-type: *text/html' "$RUN_DIR/mfa-landing-headers.txt" \
+  || die "the step-up landing is not served as html"
+grep -qi '^referrer-policy: *no-referrer' "$RUN_DIR/mfa-landing-headers.txt" \
+  || die "the step-up landing does not suppress the referrer"
+
+MFA_RESOLVED=$(curl -fsS "$PEP/decisions/$MFA_ID" -H "Authorization: Bearer $PEP_TOKEN")
+assert_eq allowed "$(printf '%s' "$MFA_RESOLVED" | jq -r .state)" "MFA decision after the step-up"
+assert_eq satisfied "$(printf '%s' "$MFA_RESOLVED" | jq -r '.challenges[0].state')" "step-up challenge state"
+
+# R38: one consumption. The IdP will not mint a second token for a spent code and
+# the challenge is no longer collecting either way.
+STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$LOCATION")
+[ "$STATUS" != "200" ] || die "a replayed step-up redirect was accepted"
+mark "delegated MFA completed end to end ($PROFILE profile)"
 
 # ---------------------------------------------------------------------------
 # 10. locking governance

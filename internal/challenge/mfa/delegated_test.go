@@ -971,22 +971,23 @@ func TestViewRefusesAnUnreadableDetail(t *testing.T) {
 	}
 }
 
-// TestTheCorrelatorReachesACallerOnlyAsTheOAuthState bounds an exposure this
-// unit opens and does not close.
+// TestTheCorrelatorReachesACallerOnlyAsTheOAuthState is U1's test, and its name
+// is now a statement about the past.
 //
-// [StepUp.Initiate] sends the correlator as the authorization request's `state`
-// (stepup.go), and this unit makes that URL reach a caller for the first time.
-// So a 32-byte binding value now travels in a response and, once the subject
-// opens the URL, in an address bar, a referrer and a history entry — which is
-// what KTD2 of the open-issues plan rejects. **KTD2 belongs to U2**: `state`
-// becomes a CSRF token, the per-challenge callback path identifies the
-// challenge, and the correlator stops travelling. This test passes either way,
-// and in the meantime it holds the exposure to exactly one query parameter: a
-// correlator anywhere else in the published view is a leak with no owner.
+// U1 made the authorization URL travel in a decision response for the first
+// time, and at that moment [StepUp.Initiate] still sent the correlator as
+// `state` — so a 32-byte binding value began travelling in a response and, once
+// the subject opened the link, in an address bar, a referrer and a history
+// entry. U1 recorded that as a KNOWN GAP owned by U2 and held the exposure to
+// one query parameter. U2 closed it: `state` is a fresh CSRF token, the
+// per-challenge callback path is what identifies the challenge (KTD2), and the
+// assertion below no longer needs its exemption.
 //
-// It is a bounded hazard rather than a fresh one — the correlator binds, it does
-// not authorize, and a completion is still refused without a verified subject,
-// the right issuer, a matching nonce and a sufficient acr.
+// The test is kept rather than renamed away because what it bounds is still
+// worth bounding: nothing derived from the correlator may reach a caller except
+// the `nonce`, which is a one-way digest and belongs in the request by protocol.
+// The PKCE verifier joins it — minted at issue, stored on the row, and never
+// published.
 func TestTheCorrelatorReachesACallerOnlyAsTheOAuthState(t *testing.T) {
 	t.Parallel()
 	// The real step-up initiator, not the recording one: the question is what
@@ -1009,19 +1010,31 @@ func TestTheCorrelatorReachesACallerOnlyAsTheOAuthState(t *testing.T) {
 		t.Fatalf("parse the published authorization url %q: %v", view.AuthorizationURL, err)
 	}
 	q := u.Query()
-	if q.Get("state") == detail.Correlator {
-		t.Logf("KNOWN GAP (KTD2, owned by U2): the published authorization url carries "+
-			"the correlator as `state`: %s", view.AuthorizationURL)
-		q.Del("state")
+	// No exemption. `state` is a value of its own now, and it is the frozen one.
+	if got := q.Get("state"); got == detail.Correlator {
+		t.Errorf("the published authorization url carries the correlator as `state` (KTD2): %s",
+			view.AuthorizationURL)
+	} else if got != detail.State {
+		t.Errorf("state = %q, want the value frozen on the challenge row (%q)", got, detail.State)
 	}
-	u.RawQuery = q.Encode()
-	if strings.Contains(u.String(), detail.Correlator) {
-		t.Errorf("the correlator reaches a caller somewhere other than `state`: %s", view.AuthorizationURL)
+	if strings.Contains(view.AuthorizationURL, detail.Correlator) {
+		t.Errorf("the correlator reaches a caller in the published url: %s", view.AuthorizationURL)
+	}
+	if detail.CodeVerifier == "" {
+		t.Fatal("no pkce verifier was frozen on the challenge row")
+	}
+	if strings.Contains(view.AuthorizationURL, detail.CodeVerifier) {
+		t.Errorf("the pkce verifier reaches a caller in the published url: %s", view.AuthorizationURL)
 	}
 	// The nonce is a one-way derivation of the correlator and belongs in an
 	// authorization request by protocol, so its presence is not a leak of the
 	// correlator — but it must be the derived value and never the raw one.
 	if got := q.Get("nonce"); got != NonceFor(detail.Correlator) {
 		t.Errorf("nonce = %q, want the derived %q", got, NonceFor(detail.Correlator))
+	}
+	// The view publishes one field, and it must stay one field: a `state` or a
+	// verifier appearing here later would be a leak with no owner.
+	if view != (challenge.View{AuthorizationURL: view.AuthorizationURL}) {
+		t.Errorf("view = %+v, want only an authorization url", view)
 	}
 }

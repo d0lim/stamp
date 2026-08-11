@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -977,7 +978,137 @@ func TestADelegatedStepUpCompletesThroughTheCallbackSurface(t *testing.T) {
 		}
 	})
 
+	// ---------------------------------------------------------------------
+	// the redirect the IdP actually sends (#41, U2)
+	// ---------------------------------------------------------------------
+
+	t.Run("the idp redirect completes the step-up", func(t *testing.T) {
+		open, err := h.app.Decisions().Decide(context.Background(), closure("alice"))
+		if err != nil {
+			t.Fatalf("open a step-up decision: %v", err)
+		}
+		detail := h.mfaDetail(open.ID)
+		// KTD2, at the composition root: the value the IdP will echo is not the
+		// binding secret, and the row holds both separately.
+		if detail.State == "" || detail.State == detail.Correlator {
+			t.Fatalf("the challenge's state is %q and its correlator is %q; KTD2 wants them different",
+				detail.State, detail.Correlator)
+		}
+		if detail.CodeVerifier == "" {
+			t.Fatal("the challenge froze no pkce verifier (KTD3)")
+		}
+
+		code, state := h.idp.authorize(t, detail.AuthorizationURL, "alice", testStepUpACR,
+			detail.IssuedAt.Add(2*time.Second))
+		status, body := h.landStepUp(open.ID, code, state)
+		if status != http.StatusOK {
+			t.Fatalf("the redirect = %d: %s", status, body)
+		}
+		if got := h.decisionState(open.ID); got != store.DecisionAllowed {
+			t.Fatalf("decision state = %q, want it resolved by the completed step-up", got)
+		}
+		// A person read this, so it is a page and not a JSON document.
+		if !strings.Contains(string(body), "Verification complete") {
+			t.Errorf("the landing page does not say the verification succeeded: %s", body)
+		}
+		// R38: one consumption. The IdP refuses to mint a second token for a
+		// spent code, and the decision is no longer collecting either way.
+		if status, _ := h.landStepUp(open.ID, code, state); status == http.StatusOK {
+			t.Error("a replayed redirect was accepted")
+		}
+	})
+
+	t.Run("a forged state is refused without a token call", func(t *testing.T) {
+		open, err := h.app.Decisions().Decide(context.Background(), closure("carol"))
+		if err != nil {
+			t.Fatalf("open a step-up decision: %v", err)
+		}
+		detail := h.mfaDetail(open.ID)
+		code, _ := h.idp.authorize(t, detail.AuthorizationURL, "carol", testStepUpACR,
+			detail.IssuedAt.Add(2*time.Second))
+
+		before := h.idp.tokenCalls()
+		status, _ := h.landStepUp(open.ID, code, "not-the-state")
+		if status != http.StatusForbidden {
+			t.Fatalf("a forged state = %d, want 403", status)
+		}
+		if h.idp.tokenCalls() != before {
+			t.Error("a forged state caused a token call: the csrf check must come first")
+		}
+		if got := h.decisionState(open.ID); got != store.DecisionPending {
+			t.Errorf("decision state = %q, want it still pending", got)
+		}
+	})
+
+	t.Run("another decision's code is refused at this challenge's path", func(t *testing.T) {
+		mine, err := h.app.Decisions().Decide(context.Background(), closure("dave"))
+		if err != nil {
+			t.Fatalf("open a step-up decision: %v", err)
+		}
+		theirs, err := h.app.Decisions().Decide(context.Background(), closure("erin"))
+		if err != nil {
+			t.Fatalf("open a second step-up decision: %v", err)
+		}
+		mineDetail, theirsDetail := h.mfaDetail(mine.ID), h.mfaDetail(theirs.ID)
+		otherCode, _ := h.idp.authorize(t, theirsDetail.AuthorizationURL, "erin", testStepUpACR,
+			theirsDetail.IssuedAt.Add(2*time.Second))
+
+		// The state is this challenge's, so the CSRF check passes and the
+		// refusal has to come from somewhere else: the OP checks the verifier
+		// and the redirect target, and both are this challenge's.
+		status, _ := h.landStepUp(mine.ID, otherCode, mineDetail.State)
+		if status != http.StatusForbidden {
+			t.Fatalf("another decision's code = %d, want 403", status)
+		}
+		if got := h.decisionState(mine.ID); got != store.DecisionPending {
+			t.Errorf("decision state = %q, want it still pending", got)
+		}
+	})
+
+	t.Run("a silently downgraded class does not satisfy the redirect either", func(t *testing.T) {
+		// S1's finding on the path that D26 made the default. The IdP answers
+		// with a weaker class rather than an error, the code exchanges, the token
+		// verifies — and the challenge is still unsatisfied, because the `acr`
+		// check on the way back in is the only thing that looks.
+		open, err := h.app.Decisions().Decide(context.Background(), closure("frank"))
+		if err != nil {
+			t.Fatalf("open a step-up decision: %v", err)
+		}
+		detail := h.mfaDetail(open.ID)
+		code, state := h.idp.authorize(t, detail.AuthorizationURL, "frank",
+			"urn:mace:incommon:iap:bronze", detail.IssuedAt.Add(2*time.Second))
+
+		before := h.idp.tokenCalls()
+		status, body := h.landStepUp(open.ID, code, state)
+		if status == http.StatusOK {
+			t.Fatalf("a downgraded authentication satisfied the step-up through the redirect: %s", body)
+		}
+		if h.idp.tokenCalls() == before {
+			t.Fatal("the code was never exchanged, so this did not test the acr check")
+		}
+		if got := h.decisionState(open.ID); got != store.DecisionPending {
+			t.Errorf("decision state = %q, want it still pending", got)
+		}
+		// The subject is told something they can act on, and never what the
+		// deployment's allowlist holds.
+		if !strings.Contains(string(body), "not strong enough") {
+			t.Errorf("the landing page does not tell the subject their sign-in was too weak: %s", body)
+		}
+		if strings.Contains(string(body), testStepUpACR) {
+			t.Errorf("the landing page names the operator allowlist: %s", body)
+		}
+	})
+
 	t.Run("the audit chain still verifies", func(t *testing.T) { h.verifyChain() })
+}
+
+// landStepUp follows the IdP's redirect into the callback listener, the way a
+// browser does: a GET with `code` and `state` in the query and no credential.
+func (h *harness) landStepUp(decisionID, code, state string) (int, []byte) {
+	h.t.Helper()
+	path := api.MFACallbackPath(decisionID, 0) +
+		"?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+	return h.do(http.MethodGet, api.SurfaceCallback, path, "", "", nil)
 }
 
 // completeStepUp posts a completion to the callback listener, the way a browser
@@ -1015,6 +1146,10 @@ const statusServed = -1
 func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 	dsn := freshDB(t)
 	approvalPath := "/decisions/d-1/challenges/0/approvals"
+	// A well-formed identifier that names nothing. The decision column is a
+	// uuid, so `d-1` would come back as a database error rather than as the
+	// refusal this table is about.
+	mfaCallbackPath := api.MFACallbackPath("00000000-0000-4000-8000-000000000000", 0)
 
 	cases := []struct {
 		roles  string
@@ -1037,6 +1172,13 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 					"GET /policies":        http.StatusNotFound,
 					"GET /console/":        http.StatusNotFound,
 				},
+				api.SurfaceCallback: {
+					// R39's separation, on the route U2 added: a check tier
+					// runs no decision lifecycle, so the step-up landing is not
+					// a refusal there, it is not there.
+					"GET " + mfaCallbackPath:  http.StatusNotFound,
+					"POST " + mfaCallbackPath: http.StatusNotFound,
+				},
 			},
 		},
 		{
@@ -1053,6 +1195,13 @@ func TestRolesDecideWhichRoutesTheProcessHas(t *testing.T) {
 				api.SurfaceConsole: {
 					"POST " + approvalPath: http.StatusUnauthorized,
 					"GET /policies":        http.StatusNotFound,
+				},
+				api.SurfaceCallback: {
+					// Mounted, and refusing uniformly: the party arriving here
+					// holds no credential and has not yet proved a `state`, so
+					// 403 rather than 404 is what says "this process serves the
+					// route and did not accept your link".
+					"GET " + mfaCallbackPath: http.StatusForbidden,
 				},
 			},
 		},
