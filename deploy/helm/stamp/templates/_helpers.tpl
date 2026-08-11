@@ -54,9 +54,10 @@ database Secret it reads its DSN from, and whether it is the tier that migrates.
 Which surfaces a role serves is not an operator choice — it is where the routes
 are mounted in internal/api — so it is decided here rather than in values.yaml:
 
-  check     PEP
-  decide    console (approvals, inbox, audit views) and callback (MFA return,
-            external challenge completion)
+  check     PEP (AuthZEN evaluation)
+  decide    PEP (decision create and the creator's read), console (approvals,
+            inbox, audit views) and callback (MFA return, external challenge
+            completion)
   consumer  callback (HTTP velocity ingest)
   api       console (policy, revision, governance)
   console   console (the bundle and its configuration document)
@@ -84,7 +85,7 @@ are mounted in internal/api — so it is decided here rather than in values.yaml
       {{- if eq $role "check" -}}
         {{- $surfaces = list "pep" -}}
       {{- else if eq $role "decide" -}}
-        {{- $surfaces = list "console" -}}
+        {{- $surfaces = list "pep" "console" -}}
         {{- if $callback -}}{{- $surfaces = append $surfaces "callback" -}}{{- end -}}
       {{- else if eq $role "consumer" -}}
         {{- if not $callback -}}

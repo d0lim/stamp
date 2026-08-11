@@ -552,8 +552,13 @@ for _ in $(seq 1 40); do
       --dsn "postgres://stamp:$DEMO_POSTGRES_PASSWORD@postgres:5432/stamp?sslmode=disable" \
       --sink /var/lib/stamp/checkpoints.jsonl >"$RUN_DIR/audit-verify.txt" 2>&1; then
     AUDIT_RC=0; break
+  else
+    # The capture has to be inside the else. After `fi` the status is the
+    # status of the `if` statement, and an `if` whose condition was false with
+    # no else exits 0 -- so a chain mismatch (6) read as a pass, and the
+    # retry-on-7 loop below compared 0 to 7 and broke on the first pass.
+    AUDIT_RC=$?
   fi
-  AUDIT_RC=$?
   [ "$AUDIT_RC" -eq 7 ] || break
   sleep 3
 done
@@ -591,6 +596,10 @@ ok "refused, naming the egress gate: $(grep -io 'egress[^"]*' "$EGRESS_LOG" | he
 
 step "no plaintext secret in what the deployment renders or logs"
 LOGS=$("${COMPOSE[@]}" logs --no-color 2>/dev/null || true)
+# An empty LOGS would make every match below miss and report a green scan it
+# never performed -- the same shape as the audit guard above. The logs of a
+# running stack are never empty, so emptiness means the read failed.
+[ -n "$LOGS" ] || die "could not read the stack's logs; the secret scan would have passed without looking"
 CONFIG_DOC=$(curl -fsS "$CONSOLE/console/config.json")
 for name in DEMO_POSTGRES_PASSWORD DEMO_KEYCLOAK_ADMIN_PASSWORD DEMO_USER_PASSWORD \
             DEMO_PEP_CLIENT_SECRET DEMO_INGEST_CLIENT_SECRET; do
