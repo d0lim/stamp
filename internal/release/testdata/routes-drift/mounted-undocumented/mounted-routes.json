@@ -1,0 +1,32 @@
+{
+  "note": "Fixture: the three routes the aligned document lists, in the shape internal/runtime renders.",
+  "routes": [
+    {
+      "name": "inbox-list",
+      "roles": [
+        "decide"
+      ],
+      "surface": "console",
+      "pattern": "GET /decisions/inbox",
+      "auth": "user"
+    },
+    {
+      "name": "decision-create",
+      "roles": [
+        "decide"
+      ],
+      "surface": "pep",
+      "pattern": "POST /decisions",
+      "auth": "workload"
+    },
+    {
+      "name": "mfa-callback",
+      "roles": [
+        "decide"
+      ],
+      "surface": "callback",
+      "pattern": "POST /decisions/{id}/challenges/{ordinal}/mfa",
+      "auth": "public"
+    }
+  ]
+}

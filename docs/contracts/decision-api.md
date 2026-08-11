@@ -1,6 +1,6 @@
 ---
 contract: decision-api
-version: 1.3.0
+version: 1.3.1
 source: internal/api
 ---
 
@@ -61,7 +61,12 @@ source: internal/api
 | `GET /governance` | console | user | `api` |
 | `POST /governance/lock` | console | user | `api` |
 | `GET /console/config.json` | console | static | `console` |
-| `GET /console/` (하위 트리) | console | static | `console` |
+| `/console/` (하위 트리) | console | static | `console` |
+| `/console` (하위 트리로의 리다이렉트) | console | static | `console` |
+
+**이 표는 `internal/release`가 실제 마운트 표와 대조한다.** 마운트됐는데 행이 없거나, 행이 있는데 아무 컴포넌트도 마운트하지 않거나, 표면·인증·역할이 다르면 CI가 빨개진다([#44](https://github.com/d0lim/stamp/issues/44)). 버전 문자열 비교로는 구조적으로 잡을 수 없던 것이다. **1.3.1은 그 대조가 처음 잡은 것을 반영한다** — 하위 트리 리다이렉트 `/console`이 표에 없었고, 하위 트리 라우트가 `GET`을 싣는 것처럼 적혀 있었다. 엔드포인트는 하나도 바뀌지 않았고 문서만 고쳐졌다(의미를 바꾸지 않는 수정 = patch). 인증 없는 `GET /healthz`는 이 표에 없다 — 역할과 무관하게 리스너가 직접 답하므로 네 번째 열이 가리킬 역할이 없다.
+
+**콘솔의 두 정적 라우트는 메서드를 싣지 않는다.** net/http는 경로가 맞고 메서드가 다른 패턴에 405를 답하므로, `GET /console/` 하위 트리를 선언하면 콘솔만 서빙하는 티어가 `POST /console/v1/policies/dry-run`에 405를 답한다 — 그 엔드포인트를 서빙하지 않는 유일한 티어가 "여기 있다"고 말하는 것이다. 메서드 판정은 핸들러 안으로 옮겨져 404로 돌아온다.
 
 두 콜백 엔드포인트가 `public`인 것은 인증이 없다는 뜻이지 통제가 없다는 뜻이 아니다. 외부 콜백은 서명(`X-Stamp-Signature`)과 서버가 발급한 nonce로, MFA 콜백은 서버가 개시한 상관자로 결속된다 — 표시용 값이 아니라 그쪽이 결속의 정본이다(D16).
 
