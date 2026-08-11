@@ -336,3 +336,43 @@ jobs:
           docker rm -f stamp-ci stamp-ci-db >/dev/null 2>&1 || true
           docker network rm stamp-ci-net >/dev/null 2>&1 || true
           [ "$ok" = "1" ]
+
+  # The demo smoke. This is the job that keeps docs/quickstart.md and the
+  # product in the same universe: the documentation explains the script and does
+  # not restate it, so the script is the procedure, and a procedure that is not
+  # executed is a procedure that rots.
+  #
+  # Both profiles, because D11's ingestion port is only worth its abstraction if
+  # both adapters actually run — and because the claim the demo makes is that
+  # the broker-free profile and the Kafka overlay produce the *same* velocity
+  # deny. One profile passing proves neither half of that.
+  #
+  # It gates on `docker` so that a broken image build reports as a broken image
+  # build rather than as an inscrutable compose failure.
+  demo:
+    name: demo smoke (${{ matrix.profile }} profile)
+    needs: docker
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [default, kafka]
+    steps:
+      - uses: actions/checkout@v5
+      # A runner is the clean environment the quickstart claims to work in: no
+      # images, no volumes, no networks, no deploy/demo/.env. Nothing here
+      # pre-pulls or pre-builds anything, so the recorded time is the time an
+      # operator sees on a first run.
+      - name: quickstart
+        run: bash scripts/quickstart.sh --profile ${{ matrix.profile }}
+      - name: how long it took
+        if: always()
+        run: cat deploy/demo/.run/quickstart-timings-${{ matrix.profile }}.txt || true
+      - name: upload the timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickstart-timings-${{ matrix.profile }}
+          path: deploy/demo/.run/quickstart-timings-${{ matrix.profile }}.txt
+          if-no-files-found: warn
+          retention-days: 14

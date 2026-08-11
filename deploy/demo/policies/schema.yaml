@@ -1,0 +1,36 @@
+# The demo schema.
+#
+# This is the file authoring format exactly as `stamp policy apply` reads it and
+# exactly as `stamp policy export` writes it (D10). The quickstart loads this
+# directory with `stamp policy apply`, so the file path in the documentation is
+# the path that actually ran.
+#
+# A source's signature is authorable; its transport is not. `transferred_today`
+# names a metric, a window and an ingestion adapter nowhere in this file — those
+# are STAMP_STREAM_SOURCES on the deployment, because an author who could write
+# them could widen a limit until it stopped biting.
+apiVersion: stamp/v1
+kind: Schema
+entities:
+  - name: user
+    attributes:
+      id: string
+  - name: transfer
+    attributes:
+      id: string
+      amount: double
+      destination: string
+  - name: ledger
+    attributes:
+      id: string
+actions:
+  - name: execute
+    description: Move money out of an account.
+  - name: export
+    description: Take a copy of a ledger off the platform.
+sources:
+  - name: transferred_today
+    kind: event
+    params:
+      - account: string
+    returns: double

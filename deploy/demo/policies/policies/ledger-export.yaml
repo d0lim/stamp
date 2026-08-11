@@ -1,0 +1,25 @@
+# The delegated MFA path (D26: step-up redirect, not CIBA).
+#
+# `mode` is omitted because `delegated` is the default and the only implemented
+# one. `acr_values` names the authentication context class the completion has to
+# carry; the deployment's STAMP_MFA_ACR_VALUES allowlist bounds it, and U0
+# established why that allowlist is the whole control — an IdP that cannot
+# satisfy an `acr` request downgrades it silently rather than failing, so the
+# response is the only place the request can be shown to have taken effect.
+#
+# Read deploy/demo/README.md before running the quickstart's MFA step: the
+# challenge is issued and visible, and the browser round trip that would satisfy
+# it is not reachable from any HTTP response today. The README says exactly what
+# is missing.
+apiVersion: stamp/v1
+kind: Policy
+id: ledger-export
+description: Taking a ledger off the platform needs a fresh step-up authentication by the subject.
+subject: user
+resource: ledger
+actions:
+  - export
+challenges:
+  - type: mfa
+    acr_values:
+      - "1"

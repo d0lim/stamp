@@ -1,0 +1,36 @@
+# The allow path, and the velocity limit that closes it.
+#
+# STAMP has no `deny` rule: a policy states when the action is permitted and
+# everything else is the default, which is deny. So a velocity limit is written
+# as the allow-complement — "under the daily total" rather than "over it" — and
+# the deny an operator sees when the account has spent its day is
+# `condition_not_met`, produced by the same evaluation that produced the allow.
+#
+# The three example policies are deliberately disjoint on `destination`, so that
+# the quickstart's console-authored revision — which adds a fourth policy for
+# offshore destinations — changes an answer that is observably a deny before it
+# and observably a pending decision after it.
+apiVersion: stamp/v1
+kind: Policy
+id: routine-transfer
+description: A domestic transfer under 10,000 goes through while the account is under its daily total.
+subject: user
+resource: transfer
+actions:
+  - execute
+condition:
+  all:
+    - left:
+        field: resource.destination
+      op: ne
+      right: offshore
+    - left:
+        field: resource.amount
+      op: lt
+      right: 10000.0
+    - left:
+        source: transferred_today
+        args:
+          - field: subject.id
+      op: le
+      right: 50000.0
