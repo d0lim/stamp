@@ -293,7 +293,7 @@ func TestSplitIsNotAllInOneUnderFiveNames(t *testing.T) {
 		// on the highest-QPS, least-trusted tier.
 		want := map[string]map[string]string{
 			"stamp-check":    {"pep": ":8080", "console": "", "callback": ""},
-			"stamp-decide":   {"pep": "", "console": ":8081", "callback": ":8082"},
+			"stamp-decide":   {"pep": ":8080", "console": ":8081", "callback": ":8082"},
 			"stamp-consumer": {"pep": "", "console": "", "callback": ":8082"},
 			"stamp-api":      {"pep": "", "console": ":8081", "callback": ""},
 			"stamp-console":  {"pep": "", "console": ":8081", "callback": ""},

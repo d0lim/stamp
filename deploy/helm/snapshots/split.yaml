@@ -120,6 +120,10 @@ spec:
   # console port to reach even by mistake, which is the point of splitting the
   # listeners rather than the paths.
   ports:
+    - name: pep
+      port: 8080
+      targetPort: pep
+      protocol: TCP
     - name: console
       port: 8081
       targetPort: console
@@ -452,6 +456,9 @@ spec:
           args:
             - --roles=decide
           ports:
+            - name: pep
+              containerPort: 8080
+              protocol: TCP
             - name: console
               containerPort: 8081
               protocol: TCP
@@ -471,7 +478,7 @@ spec:
             # An empty address unbinds a surface; an absent variable would bind
             # it to its default. A tier says what it does not serve.
             - name: STAMP_PEP_ADDR
-              value: ""
+              value: ":8080"
             - name: STAMP_CONSOLE_ADDR
               value: ":8081"
             - name: STAMP_CALLBACK_ADDR
@@ -495,13 +502,13 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz
-              port: console
+              port: pep
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /healthz
-              port: console
+              port: pep
             initialDelaySeconds: 2
             periodSeconds: 5
           volumeMounts:
