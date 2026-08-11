@@ -1,6 +1,6 @@
 ---
 contract: decision-api
-version: 1.1.0
+version: 1.2.0
 source: internal/api
 ---
 
@@ -110,6 +110,25 @@ source: internal/api
 그래서 **클라이언트는 상태 코드만으로 `id`의 존재를 판단할 수 없다.** 양쪽 모두 `state`와 `id`를 읽어야 한다.
 
 `GET /decisions/{id}`는 **생성 호출자에게만** 열린다(R40). 대상 승인자를 위한 조회는 콘솔 표면의 `GET /audit/decisions/{id}`다 — 워크로드 자격과 사용자 토큰은 하나의 라우트가 함께 서빙할 수 없다. **권한 없는 조회와 존재하지 않는 결정은 응답 바이트까지 구분되지 않는다**: 결정의 존재 여부가 새면 안 된다.
+
+### challenge 뷰
+
+`challenges[]`의 각 항목은 challenge 하나의 진행 상황이다.
+
+| 필드 | 뜻 | 언제 나타나는가 |
+|---|---|---|
+| `ordinal` | 결정 안에서의 challenge 번호 | 항상 |
+| `kind` | `quorum` · `mfa` · `delay` · `external` | 항상 |
+| `state` | `pending` · `satisfied` · `failed` · `cancelled` | 항상 |
+| `have` · `need` | 수집 현황 | 항상 |
+| `deadline` | 그 challenge의 타이머 | 타이머가 있을 때 |
+| `authorization_url` | **주체의 브라우저를 보낼 곳** | 브라우저로 완결되는 kind에서만 |
+
+**`authorization_url`은 1.2.0에서 더해졌다**(응답 필드 추가 = minor). 위임 MFA가 step-up 리다이렉트로 완결되는데(D26) 그 주소가 challenge 행에만 있고 어떤 응답에도 실리지 않아, 호출자가 주체를 어디로 보낼지 알 수 없었다([#41](https://github.com/d0lim/stamp/issues/41)). quorum·delay·external은 이 필드를 갖지 않으며 이전과 **바이트까지 동일하게** 직렬화된다.
+
+**뷰에 실리는 것은 challenge 핸들러가 이름으로 고른 것뿐이다.** challenge 행의 `detail`은 저장용이고 correlator·nonce·PKCE verifier를 담는다 — 그것들은 뷰로 가지 않으며, 갈 수 있는 통로 자체가 없다. 결정 레이어는 특정 challenge kind를 알지 못하므로(선택적 `challenge.Viewer` 인터페이스로만 묻는다) 저장된 값을 스스로 꺼내 실을 수 없다.
+
+**알려진 노출**: 지금 step-up 인가 요청은 correlator를 `state` 파라미터로 싣는다. 그래서 이 URL을 받는 호출자와 주체의 브라우저에 correlator가 도달한다. correlator는 결합값이지 인가값이 아니며(완결은 여전히 검증된 주체·발급자·nonce·acr를 요구한다) 이것은 KTD2로 해소된다 — `state`는 CSRF 전용이 되고 challenge는 콜백 **경로**가 식별한다.
 
 ### deny의 `reason`
 

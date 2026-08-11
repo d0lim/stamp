@@ -59,7 +59,7 @@ import (
 
 // ContractVersion is the semantic version of the interfaces in this file. It is
 // bumped when the contract changes, not when a handler does.
-const ContractVersion = "1.0.0"
+const ContractVersion = "1.1.0"
 
 // Errors handlers and the registry return as sentinels. A handler may wrap them
 // with detail; callers branch with errors.Is.
@@ -296,6 +296,48 @@ type TargetRequest struct {
 // targets, so it grants no read access — which is the fail-closed answer.
 type Targeter interface {
 	IsTarget(ctx context.Context, req TargetRequest) (bool, error)
+}
+
+// ViewRequest asks a challenge what a caller may be told about it.
+type ViewRequest struct {
+	Instance Instance
+	Decision DecisionContext
+	Detail   json.RawMessage
+	Now      time.Time
+}
+
+// View is the part of a challenge in progress that may leave the deployment.
+//
+// It is a whitelist and not a projection of [StatusRequest.Detail]. That detail
+// is storage: a delegated MFA challenge keeps a correlator and a nonce there, an
+// external one keeps a shared secret's fingerprint, and a caller is owed none of
+// it. A field appears here because somebody decided it may travel, and a stored
+// value reaches a caller only by a handler copying it into a field by name.
+//
+// Empty is the answer for a challenge with nothing to publish, which is most of
+// them: a quorum is completed by other people, a delay by waiting.
+type View struct {
+	// AuthorizationURL is where the subject's browser must be sent for the
+	// challenge to be completed. Empty when the challenge is not completed by
+	// sending anybody anywhere — a CIBA push, a quorum, a delay.
+	AuthorizationURL string `json:"authorization_url,omitempty"`
+}
+
+// Viewer reports the publishable part of a challenge in progress.
+//
+// It is optional, and separate from Handler for the reason [Targeter] is:
+// adding it must not make the contract four verbs, and a kind that has nothing
+// to say should not have to say so. The lifecycle asks it one question — R2's
+// rule that a decision object exposes enough for a caller to act on it, which
+// for a challenge answered in a browser means the destination.
+//
+// A handler that does not implement it publishes nothing, which is both the
+// fail-closed answer and the right one for every kind that has no destination.
+// The lifecycle must not read a stored detail itself: it cannot tell a
+// correlator from a URL without knowing the kind, and knowing the kind is what
+// this seam exists to avoid.
+type Viewer interface {
+	View(ctx context.Context, req ViewRequest) (View, error)
 }
 
 // Registry maps challenge kinds to their handlers.

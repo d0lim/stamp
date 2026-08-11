@@ -1,6 +1,6 @@
 ---
 contract: challenge-interface
-version: 1.0.0
+version: 1.1.0
 source: internal/challenge
 ---
 
@@ -32,7 +32,7 @@ type Handler interface {
 
 네 번째 동사는 없다. 특히 **"마감이 지났다, 이제 어떻게 하나"라는 동사가 없다** — 스위퍼가 현재 시각으로 `Status`를 물으면 지연은 satisfied를, 정족수는 pending을 답한다. 마감 경과의 의미가 종류마다 정반대라 별도 콜백은 반드시 한쪽을 틀린다.
 
-선택 인터페이스는 하나다.
+선택 인터페이스는 둘이다. 둘 다 네 번째 동사를 만들지 않으려고 분리됐고, 둘 다 구현하지 않은 핸들러가 있어도 조립이 실패하지 않는다.
 
 ```go
 type Targeter interface {
@@ -41,6 +41,16 @@ type Targeter interface {
 ```
 
 구현하지 않은 핸들러는 대상이 없는 것으로 취급한다 — 조회 권한은 fail-closed다(R40).
+
+```go
+type Viewer interface {
+    View(ctx context.Context, req ViewRequest) (View, error)
+}
+```
+
+**1.1.0에서 더해졌다**(선택 인터페이스 추가 = minor). 진행 중 challenge에서 **호출자에게 말해도 되는 부분**을 답한다. 지금 `View`가 가진 필드는 `AuthorizationURL` 하나 — 브라우저로 완결되는 challenge가 주체를 보낼 곳이다. 구현하지 않은 핸들러는 아무것도 공개하지 않으며, 그것이 quorum·delay·external 셋이 원하는 답이다.
+
+**이것은 `Detail`의 투영이 아니라 화이트리스트다.** `Detail`은 저장용이고 correlator·nonce 같은 비밀을 담는다. 결정 수명주기는 특정 kind를 알지 못하므로 `Detail`에서 URL과 비밀을 구별할 수 없다 — 그래서 핸들러가 **이름으로 고른 필드만** 넘어간다. 새 필드는 "이 값이 배포 밖으로 나가도 되는가"에 누군가 답했다는 뜻이다.
 
 ## 상태
 
@@ -66,6 +76,8 @@ type Targeter interface {
 | `SubmitResult` | `State`, `Have`, `Need`, `Detail` |
 | `StatusRequest` | `Instance`, `Decision`, `Detail`, `Stored`, `Deadline`, `Now` |
 | `Status` | `State`, `Have`, `Need`, `Deadline`, `Detail` |
+| `ViewRequest` | `Instance`, `Decision`, `Detail`, `Now` |
+| `View` | `AuthorizationURL` |
 
 ## 오류
 
