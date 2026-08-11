@@ -132,6 +132,7 @@ mfa:
   authorizationEndpoint: https://idp.example/authorize
   clientId: stamp-stepup
   redirectUri: https://stamp-callback.example/mfa/return
+  tokenEndpoint: https://idp.example/token
   ciba:
     backchannelEndpoint: https://idp.example/ciba
     tokenEndpoint: https://idp.example/token

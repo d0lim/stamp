@@ -49,10 +49,46 @@ func (s *stubVerifier) Verify(_ context.Context, raw string) (*identity.Subject,
 	return s.subject, nil
 }
 
+// stubRedeemer stands in for the decision service's redemption path: this
+// surface's job is to route a redirect to one, not to be one.
+type stubRedeemer struct {
+	mu         sync.Mutex
+	calls      []decision.Callback
+	redemption challenge.Redemption
+	err        error
+}
+
+func (s *stubRedeemer) Redeem(_ context.Context, cb decision.Callback) (challenge.Redemption, error) {
+	s.mu.Lock()
+	s.calls = append(s.calls, cb)
+	s.mu.Unlock()
+	if s.err != nil {
+		return challenge.Redemption{}, s.err
+	}
+	return s.redemption, nil
+}
+
+func (s *stubRedeemer) redeemed() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.calls)
+}
+
+func (s *stubRedeemer) lastCallback(t *testing.T) decision.Callback {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.calls) == 0 {
+		t.Fatal("no redemption was attempted")
+	}
+	return s.calls[len(s.calls)-1]
+}
+
 type mfaFixture struct {
 	server    *api.Server
 	collector *recordingCollector
 	verifier  *stubVerifier
+	redeemer  *stubRedeemer
 }
 
 func newMFAFixture(t *testing.T) *mfaFixture {
@@ -81,14 +117,28 @@ func newMFAFixture(t *testing.T) *mfaFixture {
 		ACR:      "gold",
 	}, []byte(`{"sub":"alice","acr":"gold"}`))}
 
-	surface, err := api.NewMFA(api.MFAConfig{Decisions: collector, Tokens: verifier})
+	redeemer := &stubRedeemer{redemption: challenge.Redemption{
+		Credential: "the.redeemed.token",
+		Payload:    []byte(`{"correlator":"correlator-value"}`),
+	}}
+
+	surface, err := api.NewMFA(api.MFAConfig{Decisions: collector, Tokens: verifier, Redeemer: redeemer})
 	if err != nil {
 		t.Fatalf("build mfa surface: %v", err)
 	}
 	if err := server.Mount(surface); err != nil {
 		t.Fatalf("mount mfa surface: %v", err)
 	}
-	return &mfaFixture{server: server, collector: collector, verifier: verifier}
+	return &mfaFixture{server: server, collector: collector, verifier: verifier, redeemer: redeemer}
+}
+
+// land drives the IdP redirect: a GET with a query and no body.
+func (f *mfaFixture) land(t *testing.T, surface api.Surface, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, mfaPath+"?"+query, http.NoBody)
+	rec := httptest.NewRecorder()
+	f.server.Handler(surface).ServeHTTP(rec, req)
+	return rec
 }
 
 func (f *mfaFixture) post(t *testing.T, surface api.Surface, body string) *httptest.ResponseRecorder {
@@ -123,12 +173,21 @@ func TestMFACallbackIsOnTheCallbackListenerOnly(t *testing.T) {
 		t.Fatalf("console surface returned %d for the mfa callback, want 404", rec.Code)
 	}
 
-	mounted := f.server.Mounted(api.SurfaceCallback)
-	if len(mounted) != 1 {
-		t.Fatalf("mounted %d routes on the callback surface, want 1", len(mounted))
+	if rec := f.land(t, api.SurfaceCallback, "code=c&state=s"); rec.Code != http.StatusOK {
+		t.Fatalf("callback surface returned %d for the redirect, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if mounted[0].Auth != api.AuthPublic {
-		t.Fatalf("route auth = %q, want public: the credential arrives in the body", mounted[0].Auth)
+	if rec := f.land(t, api.SurfaceConsole, "code=c&state=s"); rec.Code != http.StatusNotFound {
+		t.Fatalf("console surface returned %d for the mfa redirect, want 404", rec.Code)
+	}
+
+	mounted := f.server.Mounted(api.SurfaceCallback)
+	if len(mounted) != 2 {
+		t.Fatalf("mounted %d routes on the callback surface, want 2", len(mounted))
+	}
+	for _, route := range mounted {
+		if route.Auth != api.AuthPublic {
+			t.Fatalf("route %s auth = %q, want public", route.Name, route.Auth)
+		}
 	}
 }
 
@@ -305,7 +364,259 @@ func TestNewMFARequiresItsCollaborators(t *testing.T) {
 	if _, err := api.NewMFA(api.MFAConfig{Tokens: &stubVerifier{}}); err == nil {
 		t.Fatal("an mfa surface was built with no decision service")
 	}
-	if _, err := api.NewMFA(api.MFAConfig{Decisions: &recordingCollector{}}); err == nil {
+	if _, err := api.NewMFA(api.MFAConfig{
+		Decisions: &recordingCollector{}, Redeemer: &stubRedeemer{},
+	}); err == nil {
 		t.Fatal("an mfa surface was built with no token verifier")
+	}
+	// Without a redeemer the step-up D26 made the default path has no way back,
+	// which is the whole of #41. It is refused at wiring time rather than at the
+	// moment somebody has finished authenticating and is waiting for a page.
+	if _, err := api.NewMFA(api.MFAConfig{
+		Decisions: &recordingCollector{}, Tokens: &stubVerifier{},
+	}); err == nil {
+		t.Fatal("an mfa surface was built with no redeemer")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the IdP redirect
+// ---------------------------------------------------------------------------
+
+// TestMFARedirectCompletesTheStepUp is #41's second seam closed: the IdP sends a
+// browser, the challenge redeems the code, and the token that comes back walks
+// the same three lines the POST body's token does.
+func TestMFARedirectCompletesTheStepUp(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	rec := f.land(t, api.SurfaceCallback, "code=the-code&state=the-state&session_state=x")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	cb := f.redeemer.lastCallback(t)
+	if cb.DecisionID != testDecisionID || cb.Ordinal != 0 {
+		t.Fatalf("redemption named %s#%d", cb.DecisionID, cb.Ordinal)
+	}
+	// The whole query is passed through: the transport's vocabulary is the
+	// transport's, and a surface that named fields would have to keep the list
+	// in step with whichever transports exist.
+	for k, want := range map[string]string{"code": "the-code", "state": "the-state", "session_state": "x"} {
+		if cb.Params[k] != want {
+			t.Errorf("callback param %s = %q, want %q", k, cb.Params[k], want)
+		}
+	}
+	// The credential the redemption produced is what gets verified. The surface
+	// does not invent one, and the browser did not carry one.
+	if len(f.verifier.tokens) != 1 || f.verifier.tokens[0] != "the.redeemed.token" {
+		t.Fatalf("verifier saw %v, want the redeemed token", f.verifier.tokens)
+	}
+	sub := f.collector.lastSubmission(t)
+	if sub.Caller == nil || sub.Caller.ID != "alice" {
+		t.Fatalf("caller = %+v, want the verified subject", sub.Caller)
+	}
+	var payload mfa.Submission
+	if err := json.Unmarshal(sub.Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.Correlator != "correlator-value" {
+		t.Fatalf("correlator = %q, want the one the redemption supplied", payload.Correlator)
+	}
+}
+
+// TestMFARedirectAnswersAPersonInHTML is Open Question 1 answered.
+//
+// The other callback on this listener answers a machine in JSON; this one
+// answers somebody who has just typed a password because they were asked to.
+// The headers are the load-bearing part: `Referrer-Policy: no-referrer` keeps
+// the authorization code in this URL's query from travelling anywhere, and the
+// CSP can be `default-src 'none'` because the page needs nothing.
+func TestMFARedirectAnswersAPersonInHTML(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	rec := f.land(t, api.SurfaceCallback, "code=the-code&state=the-state")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	h := rec.Header()
+	for name, want := range map[string]string{
+		"Content-Type":            "text/html; charset=utf-8",
+		"Referrer-Policy":         "no-referrer",
+		"X-Content-Type-Options":  "nosniff",
+		"Cache-Control":           "no-store",
+		"Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+	} {
+		if got := h.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Verification complete") {
+		t.Errorf("the page does not say the verification succeeded: %s", body)
+	}
+	// A page with no scripts, no styles and no external references is what makes
+	// the CSP above a statement rather than a wish.
+	for _, forbidden := range []string{"<script", "<style", "<img", "http://", "https://"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("the landing page contains %q, which its own CSP forbids: %s", forbidden, body)
+		}
+	}
+}
+
+// TestMFARedirectRefusesUniformlyBeforeTheStateIsProved is the oracle closed.
+//
+// Until a `state` checks out, the party holding the link has proved nothing — so
+// an unknown decision, a forged state, a code the IdP would not exchange and a
+// challenge that is no longer collecting are one status and one page. The
+// external webhook listener makes the same choice for the same reason; the
+// difference here is only that the one page is readable.
+func TestMFARedirectRefusesUniformlyBeforeTheStateIsProved(t *testing.T) {
+	t.Parallel()
+	var bodies []string
+	for name, err := range map[string]error{
+		"no such decision":  store.ErrNotFound,
+		"no such challenge": decision.ErrNoSuchChallenge,
+		"forged state":      fmt.Errorf("decision: redeem: %w", challenge.ErrRedemptionRefused),
+		"already resolved":  decision.ErrNotPending,
+		"expired":           store.ErrDecisionExpired,
+		"already spent":     mfa.ErrCorrelatorConsumed,
+		"not a redirect":    challenge.ErrNotRedeemable,
+	} {
+		f := newMFAFixture(t)
+		f.redeemer.err = err
+		rec := f.land(t, api.SurfaceCallback, "code=c&state=s")
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s: status = %d, want a uniform 403", name, rec.Code)
+		}
+		if f.collector.submitted() != 0 {
+			t.Errorf("%s: an unredeemed callback reached the decision service", name)
+		}
+		bodies = append(bodies, rec.Body.String())
+	}
+	for i := range bodies {
+		if bodies[i] != bodies[0] {
+			t.Fatalf("the refusals differ in their bodies:\n%s\n---\n%s", bodies[0], bodies[i])
+		}
+	}
+	if strings.Contains(bodies[0], testDecisionID) {
+		t.Fatalf("the refusal names the decision: %s", bodies[0])
+	}
+}
+
+// TestMFARedirectReportsAnOutageAsAnOutage: a database that is down is not a
+// refusal, and telling somebody their link was bad when it was fine would have
+// them start over against a system that cannot answer.
+func TestMFARedirectReportsAnOutageAsAnOutage(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	f.redeemer.err = errors.New("connection refused")
+	rec := f.land(t, api.SurfaceCallback, "code=c&state=s")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "connection refused") {
+		t.Fatalf("the page narrated the failure: %s", rec.Body.String())
+	}
+}
+
+// TestMFARedirectTellsTheSubjectWhatTheyCanActOnAfterRedeeming is the other half
+// of the answer to Open Question 1. Once the state has checked out, the party
+// reading the page is the subject — and folding every refusal into one message
+// would tell somebody to try again when trying again cannot work.
+func TestMFARedirectTellsTheSubjectWhatTheyCanActOnAfterRedeeming(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		err    error
+		status int
+		says   string
+	}{
+		"downgraded acr": {mfa.ErrACRNotAllowed, http.StatusForbidden, "not strong enough"},
+		"weak acr":       {mfa.ErrACRUnsatisfied, http.StatusForbidden, "not strong enough"},
+		"stale session":  {mfa.ErrStaleAuthentication, http.StatusForbidden, "no longer open"},
+		"replayed":       {mfa.ErrCorrelatorConsumed, http.StatusConflict, "no longer open"},
+		"context moved":  {mfa.ErrContextChanged, http.StatusConflict, "no longer open"},
+		"wrong nonce":    {mfa.ErrNonceMismatch, http.StatusForbidden, "cannot be used"},
+		"not the target": {challenge.ErrNotTarget, http.StatusForbidden, "cannot be used"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := newMFAFixture(t)
+			f.collector.submitErr = fmt.Errorf("decision: submit: %w", tc.err)
+			rec := f.land(t, api.SurfaceCallback, "code=c&state=s")
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.status)
+			}
+			if !strings.Contains(rec.Body.String(), tc.says) {
+				t.Fatalf("the page does not say %q: %s", tc.says, rec.Body.String())
+			}
+			// Whatever else it says, it never names the deployment's state.
+			if strings.Contains(rec.Body.String(), testDecisionID) {
+				t.Fatalf("the page names the decision: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestMFARedirectRefusesAnUnverifiableRedemption: a token the pinned issuer set
+// does not accept ends the round, and the reason is not narrated.
+func TestMFARedirectRefusesAnUnverifiableRedemption(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	f.verifier.err = identity.ErrSignatureInvalid
+	rec := f.land(t, api.SurfaceCallback, "code=c&state=s")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if f.collector.submitted() != 0 {
+		t.Fatal("an unverifiable redemption reached the decision service")
+	}
+	if strings.Contains(rec.Body.String(), "signature") {
+		t.Fatalf("the page narrated the verification failure: %s", rec.Body.String())
+	}
+}
+
+// TestMFARedirectTakesAParameterOnceEvenWhenItIsSentTwice: a duplicated `state`
+// is a request with two answers, and the comparison downstream has to be against
+// one of them rather than against a joined string.
+func TestMFARedirectTakesAParameterOnceEvenWhenItIsSentTwice(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	if rec := f.land(t, api.SurfaceCallback, "code=c&state=first&state=second"); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := f.redeemer.lastCallback(t).Params["state"]; got != "first" {
+		t.Fatalf("state = %q, want the first value", got)
+	}
+}
+
+// TestMFARedirectRefusesAMalformedPath: the ordinal is part of what identifies
+// the challenge, so a path that does not name one is refused the way an unknown
+// decision is rather than reported as a different kind of wrong.
+func TestMFARedirectRefusesAMalformedPath(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	req := httptest.NewRequest(http.MethodGet,
+		"/decisions/"+testDecisionID+"/challenges/not-a-number/mfa?code=c&state=s", http.NoBody)
+	rec := httptest.NewRecorder()
+	f.server.Handler(api.SurfaceCallback).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want a uniform 403", rec.Code)
+	}
+	if f.redeemer.redeemed() != 0 {
+		t.Fatal("a malformed path reached the redemption path")
+	}
+}
+
+// TestMFAPostDoesNotGoThroughTheRedemptionSeam keeps the CIBA path intact: D26
+// left the CIBA client as a contract verified against a mock OP, and that mock
+// hands its token back through the POST route with nothing to redeem.
+func TestMFAPostDoesNotGoThroughTheRedemptionSeam(t *testing.T) {
+	t.Parallel()
+	f := newMFAFixture(t)
+	if rec := f.post(t, api.SurfaceCallback, completionBody("c", "a.b.c")); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if f.redeemer.redeemed() != 0 {
+		t.Fatal("the post path went through the redemption seam")
 	}
 }

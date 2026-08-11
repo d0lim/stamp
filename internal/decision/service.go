@@ -501,35 +501,9 @@ func (s *Service) Submit(ctx context.Context, sub Submission) (Result, error) {
 	}
 	now := s.Now()
 
-	d, err := s.store.ActiveDecision(ctx, sub.DecisionID)
+	d, target, err := s.collecting(ctx, sub.DecisionID, sub.Ordinal, now)
 	if err != nil {
 		return Result{}, err
-	}
-	if d.State != store.DecisionPending {
-		return Result{}, fmt.Errorf("decision %q is %s: %w", d.ID, d.State, ErrNotPending)
-	}
-
-	progress, err := store.ChallengeProgressFor(ctx, s.store.Pool(), d.ID)
-	if err != nil {
-		return Result{}, err
-	}
-	var target *store.ChallengeProgress
-	for i := range progress {
-		if progress[i].Ordinal == sub.Ordinal {
-			target = &progress[i]
-			break
-		}
-	}
-	if target == nil {
-		return Result{}, fmt.Errorf("decision %q has no challenge %d: %w", d.ID, sub.Ordinal, ErrNoSuchChallenge)
-	}
-	if challengeState(target.State) != challenge.StatePending {
-		return Result{}, fmt.Errorf("challenge %d of decision %q is %s: %w",
-			sub.Ordinal, d.ID, target.State, ErrNotPending)
-	}
-	if target.Deadline != nil && !now.Before(*target.Deadline) {
-		return Result{}, fmt.Errorf("challenge %d of decision %q closed at %s: %w",
-			sub.Ordinal, d.ID, target.Deadline, store.ErrDecisionExpired)
 	}
 
 	handler, err := s.challenges.Handler(target.Kind)
@@ -565,6 +539,104 @@ func (s *Service) Submit(ctx context.Context, sub Submission) (Result, error) {
 	}
 
 	return s.advance(ctx, d.ID, now)
+}
+
+// collecting resolves one challenge that is open for evidence as of now.
+//
+// It is the entry check both [Service.Submit] and [Service.Redeem] make, and it
+// is one function so that the two cannot drift: an authorization code arriving
+// after the decision expired must be refused on exactly the terms an approval
+// arriving then is, and a second copy of "is this still collecting" is a second
+// copy that can answer differently.
+func (s *Service) collecting(
+	ctx context.Context, decisionID string, ordinal int, now time.Time,
+) (store.Decision, store.ChallengeProgress, error) {
+	d, err := s.store.ActiveDecision(ctx, decisionID)
+	if err != nil {
+		return store.Decision{}, store.ChallengeProgress{}, err
+	}
+	if d.State != store.DecisionPending {
+		return store.Decision{}, store.ChallengeProgress{},
+			fmt.Errorf("decision %q is %s: %w", d.ID, d.State, ErrNotPending)
+	}
+
+	progress, err := store.ChallengeProgressFor(ctx, s.store.Pool(), d.ID)
+	if err != nil {
+		return store.Decision{}, store.ChallengeProgress{}, err
+	}
+	var target *store.ChallengeProgress
+	for i := range progress {
+		if progress[i].Ordinal == ordinal {
+			target = &progress[i]
+			break
+		}
+	}
+	if target == nil {
+		return store.Decision{}, store.ChallengeProgress{},
+			fmt.Errorf("decision %q has no challenge %d: %w", d.ID, ordinal, ErrNoSuchChallenge)
+	}
+	if challengeState(target.State) != challenge.StatePending {
+		return store.Decision{}, store.ChallengeProgress{},
+			fmt.Errorf("challenge %d of decision %q is %s: %w", ordinal, d.ID, target.State, ErrNotPending)
+	}
+	if target.Deadline != nil && !now.Before(*target.Deadline) {
+		return store.Decision{}, store.ChallengeProgress{},
+			fmt.Errorf("challenge %d of decision %q closed at %s: %w",
+				ordinal, d.ID, target.Deadline, store.ErrDecisionExpired)
+	}
+	return d, *target, nil
+}
+
+// Callback is one transport-level redirect arriving for a challenge.
+type Callback struct {
+	// DecisionID and Ordinal come from the callback path, which STAMP built
+	// itself and therefore knows.
+	DecisionID string
+	Ordinal    int
+	// Params is the callback's query as received.
+	Params map[string]string
+}
+
+// Redeem turns a challenge's own redirect into the credential and body a
+// [Service.Submit] needs.
+//
+// It authenticates nobody, and that is the shape of the problem rather than a
+// gap: the party arriving is a browser following an IdP's `Location` header,
+// and the only credential in the exchange is the one the redirect is worth —
+// which does not exist until the code has been redeemed. So the round is three
+// steps and not one: redeem here, verify the credential on the surface that
+// received it, then submit as the caller that credential proved.
+//
+// The lifecycle does not read the redemption. It routes it: which challenge, is
+// it still collecting, does its handler have a redirect to redeem at all. What
+// `state` means and whether this one is right belongs to the handler that minted
+// it, for the same reason the correlator does.
+func (s *Service) Redeem(ctx context.Context, cb Callback) (challenge.Redemption, error) {
+	now := s.Now()
+	d, target, err := s.collecting(ctx, cb.DecisionID, cb.Ordinal, now)
+	if err != nil {
+		return challenge.Redemption{}, err
+	}
+	handler, err := s.challenges.Handler(target.Kind)
+	if err != nil {
+		return challenge.Redemption{}, err
+	}
+	instance := challenge.Instance{DecisionID: d.ID, Ordinal: target.Ordinal, Kind: target.Kind}
+	redeemer, ok := handler.(challenge.Redeemer)
+	if !ok {
+		return challenge.Redemption{}, fmt.Errorf("%w: %s", challenge.ErrNotRedeemable, instance)
+	}
+	out, err := redeemer.Redeem(ctx, challenge.RedeemRequest{
+		Instance: instance,
+		Decision: contextOf(d),
+		Detail:   target.Detail,
+		Params:   cb.Params,
+		Now:      now,
+	})
+	if err != nil {
+		return challenge.Redemption{}, fmt.Errorf("decision: redeem %s: %w", instance, err)
+	}
+	return out, nil
 }
 
 // advance re-reads a decision, brings every challenge up to date as of now, and

@@ -98,38 +98,46 @@ window, the bucket width and the ingestion adapter are `STAMP_STREAM_SOURCES` on
 the deployment. An author who could write those could point a limit at another
 tenant's metric or widen its window until the limit stopped biting.
 
-## The delegated MFA challenge does not complete — a known gap
+## The delegated MFA challenge completes, end to end
 
-`ledger-export` carries an `mfa` challenge and the quickstart shows it being
-issued, the decision going pending, and the callback surface refusing a forged
-completion. It does not show the challenge being satisfied, because **no client
-can satisfy one today.** Two seams are missing, both in the delegated MFA
-handler rather than in this bundle:
+`ledger-export` carries an `mfa` challenge, and the quickstart drives the whole
+round trip: the decision goes pending and its response carries the address to
+send the subject to, the browser signs in at the demo IdP, the IdP redirects back
+to this challenge's own callback path, STAMP redeems the authorization code and
+judges the ID token, and the decision resolves. Nothing is stubbed and no step is
+skipped past the login form.
 
-1. ~~**The authorization URL is not reachable.**~~ **Closed.**
-   `decision.ChallengeView` now carries `authorization_url`, published by the
-   handler through the optional `challenge.Viewer` interface so that the decision
-   layer still does not import a challenge kind. The stored detail does not
-   travel: the handler names the one field that may leave, and the correlator and
-   the nonce are not among them. See `docs/contracts/decision-api.md` (1.2.0) and
-   `docs/contracts/challenge-interface.md` (1.1.0).
-2. **Nothing turns the IdP's redirect into a completion.** The step-up is built
-   with `response_type=code` and the configured redirect target is the
-   per-challenge callback path, which is a `POST` route expecting a JSON body
-   with an `id_token`. The IdP redirects a browser there with `GET ?code=…`, and
-   there is no handler that receives that, exchanges the code and posts the
-   completion. **Still open**, and it is what keeps the flow from completing.
+Three things make it work, and each of them was a seam that was missing:
 
-The demo makes the remaining gap concrete and reproducible instead of hiding it.
+1. **The authorization URL is published.** `decision.ChallengeView` carries
+   `authorization_url`, answered by the handler through the optional
+   `challenge.Viewer` interface so that the decision layer still does not import
+   a challenge kind. The stored detail does not travel: the handler names the one
+   field that may leave, and the correlator, the nonce and the PKCE verifier are
+   not among them.
+2. **The redirect has somewhere to land.** `GET /decisions/{id}/challenges/{n}/mfa`
+   receives the IdP's redirect, hands `code` and `state` to the challenge through
+   the optional `challenge.Redeemer` interface, verifies the ID token that comes
+   back against the pinned issuer set, and submits it. The existing `POST` route
+   stays: the CIBA client hands its token back that way.
+3. **The request carries PKCE.** `stamp-stepup` is registered as a public client
+   with `pkce.code.challenge.method: S256`, and Keycloak reads that as a
+   requirement — an authorization request without `code_challenge_method` comes
+   back as `error=invalid_request` before any login form is shown. The verifier
+   is minted at issue and lives on the challenge row, which is where the
+   correlator and the nonce already live.
 
-One consequence of closing the first seam is worth naming: the step-up
-authorization request currently carries the correlator as its `state`, so
-publishing the URL publishes the correlator to the decision's caller and, once
-the subject opens it, to a browser address bar. The correlator binds a completion
-rather than authorizing one — a completion is still refused without a verified
-subject, the right issuer, a matching nonce and a sufficient `acr` — and the unit
-that closes the second seam also makes `state` a CSRF token, since the callback
-path already identifies the challenge.
+**`state` is not the correlator.** The callback path already names the decision
+and the ordinal, so `state` has one job — proving the redirect answers a request
+this deployment made — and a fresh random value does it. The correlator stays on
+the challenge row and never reaches an address bar, a referrer or a browser
+history entry. The landing page the subject reads carries
+`Referrer-Policy: no-referrer` for the same reason: the URL it is served at has an
+authorization code in its query.
+
+**What is deliberately not demonstrated is CIBA.** D26 settled that: Keycloak's
+CIBA grant needs a decoupled authentication server it does not ship, so the CIBA
+client stays a contract verified against a mock OP and the demo redirects.
 
 ## What this bundle is not
 

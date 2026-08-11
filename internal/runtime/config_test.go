@@ -43,7 +43,7 @@ func clearEnv(t *testing.T) {
 		EnvExternalTargets, EnvCallbackBaseURL,
 		EnvMFAACRValues, EnvMFARequiredAMR, EnvMFAAuthzEndpoint, EnvMFAClientID,
 		EnvMFARedirectURI, EnvMFAScopes, EnvMFAIssuer, EnvMFATokenClientID,
-		EnvMFAAudience, EnvMFAAllowInsecure,
+		EnvMFAAudience, EnvMFAAllowInsecure, EnvMFATokenEndpoint, EnvMFAClientSecret,
 		EnvCIBABackchannel, EnvCIBATokenURL, EnvCIBAClientID, EnvCIBAClientSecret, EnvCIBAScope,
 		EnvStreamSources, EnvIngestCredentials, EnvIngestAdapterName,
 		EnvIngestRate, EnvIngestBurst, EnvIngestSubjectRate, EnvIngestSubjectBurst,
@@ -402,6 +402,7 @@ func TestDelegatedMFANeedsAnACRAllowlist(t *testing.T) {
 	cfg := baseConfig()
 	cfg.MFA = MFAConfig{
 		AuthorizationEndpoint: "https://idp.example/authorize",
+		TokenEndpoint:         "https://idp.example/token",
 		ClientID:              "stamp-console",
 		RedirectURI:           "https://stamp.example/callback",
 	}
@@ -424,6 +425,7 @@ func TestStepUpClassesMustBeAdmittedByTheProcessWideAllowlist(t *testing.T) {
 	cfg.MFA = MFAConfig{
 		AllowedACRValues:      []string{"aal2"},
 		AuthorizationEndpoint: "https://idp.example/authorize",
+		TokenEndpoint:         "https://idp.example/token",
 		ClientID:              "stamp-console",
 		RedirectURI:           "https://stamp.example/callback",
 	}
@@ -444,6 +446,36 @@ func TestStepUpClassesMustBeAdmittedByTheProcessWideAllowlist(t *testing.T) {
 	cfg.OIDC.AllowedACRValues = nil
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("an unbounded process-wide allowlist was refused: %v", err)
+	}
+}
+
+// U2's trap, and the one #41 was made of: a step-up with nowhere to redeem its
+// code is a challenge that can be opened and never completed. It fails the boot
+// rather than the moment somebody has finished authenticating and is waiting for
+// a page.
+func TestDelegatedMFANeedsSomewhereToRedeemTheCode(t *testing.T) {
+	cfg := baseConfig()
+	cfg.MFA = MFAConfig{
+		AllowedACRValues:      []string{"aal2"},
+		AuthorizationEndpoint: "https://idp.example/authorize",
+		ClientID:              "stamp-console",
+		RedirectURI:           "https://stamp.example/callback",
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("a step-up with no token endpoint was accepted")
+	}
+	if !strings.Contains(err.Error(), EnvMFATokenEndpoint) {
+		t.Errorf("the error does not name %s:\n%v", EnvMFATokenEndpoint, err)
+	}
+	cfg.MFA.TokenEndpoint = "https://idp.example/token"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("a complete step-up configuration was refused: %v", err)
+	}
+	// R42: the secret is a path, never a value. A public client — which is what
+	// a step-up client normally is — names none at all.
+	if cfg.MFA.ClientSecretFile != "" {
+		t.Error("a client secret file is required where PKCE is the proof")
 	}
 }
 

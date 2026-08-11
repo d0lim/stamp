@@ -306,6 +306,9 @@ mfa:
   authorizationEndpoint: ""
   clientId: ""
   redirectUri: ""
+  # Where the authorization code is redeemed. Required alongside the three above:
+  # a step-up that cannot redeem its code opens a challenge nobody can complete.
+  tokenEndpoint: ""
   scopes: []
   tokenIssuer: ""
   tokenClientId: ""

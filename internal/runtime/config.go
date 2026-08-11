@@ -522,12 +522,21 @@ type MFAConfig struct {
 	// required to be present.
 	RequiredAMR []string
 
-	// AuthorizationEndpoint, ClientID and RedirectURI are the step-up half
-	// (D26's default demo path). All three are required for the handler to be
-	// built.
+	// AuthorizationEndpoint, ClientID, RedirectURI and TokenEndpoint are the
+	// step-up half (D26's default demo path). All four are required for the
+	// handler to be built: without the token endpoint the redirect comes back
+	// with a code nothing can redeem, which is the half of #41 that made the
+	// default path unwalkable.
 	AuthorizationEndpoint string
 	ClientID              string
 	RedirectURI           string
+	TokenEndpoint         string
+	// ClientSecretFile is where the step-up client's secret is read from, for a
+	// deployment that registers a confidential client. Empty is the normal case:
+	// a step-up client is public and PKCE is what proves the redeemer is the
+	// requester. It is a path rather than a value because R42 admits a secret
+	// only from a file or a secret reference.
+	ClientSecretFile string
 	// Scopes overrides what a step-up asks for. Empty asks for `openid` only.
 	Scopes []string
 
@@ -713,6 +722,8 @@ const (
 	EnvMFAAuthzEndpoint = "STAMP_MFA_AUTHORIZATION_ENDPOINT"
 	EnvMFAClientID      = "STAMP_MFA_CLIENT_ID"
 	EnvMFARedirectURI   = "STAMP_MFA_REDIRECT_URI"
+	EnvMFATokenEndpoint = "STAMP_MFA_TOKEN_ENDPOINT"     //nolint:gosec // a variable name, not a credential
+	EnvMFAClientSecret  = "STAMP_MFA_CLIENT_SECRET_FILE" //nolint:gosec // a path to a credential, not one
 	EnvMFAScopes        = "STAMP_MFA_SCOPES"
 	EnvMFAIssuer        = "STAMP_MFA_TOKEN_ISSUER"
 	EnvMFATokenClientID = "STAMP_MFA_TOKEN_CLIENT_ID" //nolint:gosec // a variable name, not a credential
@@ -957,6 +968,8 @@ func ConfigFromEnv() (Config, error) {
 		AuthorizationEndpoint:  strings.TrimSpace(os.Getenv(EnvMFAAuthzEndpoint)),
 		ClientID:               strings.TrimSpace(os.Getenv(EnvMFAClientID)),
 		RedirectURI:            strings.TrimSpace(os.Getenv(EnvMFARedirectURI)),
+		TokenEndpoint:          strings.TrimSpace(os.Getenv(EnvMFATokenEndpoint)),
+		ClientSecretFile:       strings.TrimSpace(os.Getenv(EnvMFAClientSecret)),
 		Scopes:                 splitList(os.Getenv(EnvMFAScopes)),
 		Issuer:                 strings.TrimSpace(os.Getenv(EnvMFAIssuer)),
 		TokenClientID:          strings.TrimSpace(os.Getenv(EnvMFATokenClientID)),
@@ -1126,6 +1139,10 @@ func (m MFAConfig) validate(oidc OIDCConfig) []error {
 		{EnvMFAAuthzEndpoint, m.AuthorizationEndpoint},
 		{EnvMFAClientID, m.ClientID},
 		{EnvMFARedirectURI, m.RedirectURI},
+		// A step-up that cannot redeem its code is a challenge nobody can
+		// complete. It is refused at boot rather than at the moment somebody has
+		// finished authenticating and is waiting for a page.
+		{EnvMFATokenEndpoint, m.TokenEndpoint},
 	} {
 		if strings.TrimSpace(field.value) == "" {
 			errs = append(errs, fmt.Errorf("delegated mfa is configured but %s is not set", field.env))

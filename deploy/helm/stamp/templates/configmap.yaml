@@ -118,6 +118,9 @@ data:
   {{- with .Values.mfa.redirectUri }}
   STAMP_MFA_REDIRECT_URI: {{ . | quote }}
   {{- end }}
+  {{- with .Values.mfa.tokenEndpoint }}
+  STAMP_MFA_TOKEN_ENDPOINT: {{ . | quote }}
+  {{- end }}
   {{- with .Values.mfa.scopes }}
   STAMP_MFA_SCOPES: {{ join "," . | quote }}
   {{- end }}
