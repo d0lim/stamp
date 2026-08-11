@@ -85,6 +85,12 @@ type Decision struct {
 	NextDeadline     *time.Time
 	NextDeadlineKind DeadlineKind
 	ResolvedAt       *time.Time
+	// IdempotencyKey is the caller's name for the decide attempt that created
+	// this decision, empty for a decision created by an attempt that named
+	// none. It is read back so that the row can say who it already answers for:
+	// the uniqueness that makes a retry safe is on (caller_id, this), and a
+	// column the code cannot see is a column the code cannot check.
+	IdempotencyKey string
 }
 
 // Expired reports whether the decision's own deadline has passed. It reads
@@ -126,6 +132,9 @@ type NewDecision struct {
 	Obligations   any
 	ExpiresAt     time.Time
 	Challenges    []NewChallenge
+	// IdempotencyKey is the caller's name for the attempt that produced this
+	// decision, or empty for a decision nobody named.
+	IdempotencyKey string
 }
 
 // NewDecisionID returns a random UUIDv4 in string form.
@@ -195,20 +204,34 @@ func (w *AuditWriter) CreateDecision(ctx context.Context, in NewDecision) (Decis
 		ExpiresAt:        expiresAt,
 		NextDeadline:     deadline,
 		NextDeadlineKind: kind,
+		IdempotencyKey:   in.IdempotencyKey,
 	}
 
 	err = w.InTx(ctx, func(ctx context.Context, tx pgx.Tx, ap *Appender) error {
 		insertErr := tx.QueryRow(ctx, `
 			INSERT INTO decisions
 				(id, caller_id, policy_id, policy_version, subject_id, resource_id, action,
-				 request, fact_snapshot, obligations, state, expires_at, next_deadline, next_deadline_kind)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+				 request, fact_snapshot, obligations, state, expires_at, next_deadline, next_deadline_kind,
+				 idempotency_key)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 			RETURNING created_at, updated_at`,
 			out.ID, out.CallerID, out.PolicyID, out.PolicyVersion, out.SubjectID, out.ResourceID,
 			out.Action, []byte(out.Request), []byte(out.FactSnapshot), []byte(out.Obligations),
 			string(out.State), out.ExpiresAt, out.NextDeadline, nullableKind(out.NextDeadlineKind),
+			nullableText(out.IdempotencyKey),
 		).Scan(&out.CreatedAt, &out.UpdatedAt)
 		if insertErr != nil {
+			// Both conflicts are ErrConflict and they are told apart in the
+			// message rather than in the sentinel, because the caller acts the
+			// same way on either: re-read and see what is already there. The
+			// constraint name is what separates them, and it is read rather than
+			// guessed from the fields — an identifier collision and a repeated
+			// key are one SQLSTATE, and naming the wrong one in a log is how an
+			// operator spends an afternoon on the wrong hypothesis.
+			if isUniqueViolationOn(insertErr, "decisions_unique_idempotency_key") {
+				return fmt.Errorf("store: caller %q already holds a decision under key %q: %w",
+					out.CallerID, out.IdempotencyKey, ErrConflict)
+			}
 			if isUniqueViolation(insertErr) {
 				return fmt.Errorf("store: decision %q already exists: %w", out.ID, ErrConflict)
 			}
@@ -295,14 +318,46 @@ func nullableKind(k DeadlineKind) *string {
 	return &s
 }
 
+// nullableText writes an absent string as SQL NULL rather than as the empty
+// string. The distinction is load-bearing for idempotency_key: the unique index
+// is partial on `IS NOT NULL`, so a decision nobody named has to arrive as NULL
+// or every keyless decide by one caller would collide with every other.
+func nullableText(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 const decisionColumns = `id, caller_id, policy_id, policy_version, subject_id, resource_id, action,
 	request::text, fact_snapshot::text, obligations::text, state, created_at, updated_at,
-	expires_at, next_deadline, next_deadline_kind, resolved_at`
+	expires_at, next_deadline, next_deadline_kind, resolved_at, idempotency_key`
 
 // GetDecision reads a decision by identifier. It reports the row as stored and
 // makes no judgement about deadlines.
 func GetDecision(ctx context.Context, q Querier, id string) (Decision, error) {
 	return scanDecision(q.QueryRow(ctx, `SELECT `+decisionColumns+` FROM decisions WHERE id = $1`, id))
+}
+
+// DecisionByIdempotencyKey reads the decision a caller already created under a
+// key, or ErrNotFound when it created none.
+//
+// It is scoped to the caller for the reason the index is: the key is a name the
+// caller chose for its own attempt, not a coordinate in a namespace it shares
+// with every other workload. An unscoped lookup would let one workload's
+// "retry-1" answer another's, which is a decision identifier crossing a trust
+// boundary — and R40 makes that identifier readable.
+//
+// The row is returned whatever state it is in, including expired. A retry asking
+// after an attempt whose decision has since expired is entitled to that answer:
+// it names the thing it created, and creating a second decision because the
+// first one is over is exactly the orphan this is here to prevent.
+func DecisionByIdempotencyKey(ctx context.Context, q Querier, callerID, key string) (Decision, error) {
+	if key == "" {
+		return Decision{}, ErrNotFound
+	}
+	return scanDecision(q.QueryRow(ctx, `SELECT `+decisionColumns+`
+		FROM decisions WHERE caller_id = $1 AND idempotency_key = $2`, callerID, key))
 }
 
 // ActiveDecision reads a decision and refuses it if its own deadline has
@@ -543,10 +598,11 @@ func scanDecision(row pgx.Row) (Decision, error) {
 		obligations string
 		state       string
 		kind        *string
+		key         *string
 	)
 	err := row.Scan(&d.ID, &d.CallerID, &d.PolicyID, &d.PolicyVersion, &d.SubjectID, &d.ResourceID,
 		&d.Action, &request, &facts, &obligations, &state, &d.CreatedAt, &d.UpdatedAt,
-		&d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt)
+		&d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt, &key)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Decision{}, ErrNotFound
 	}
@@ -559,6 +615,9 @@ func scanDecision(row pgx.Row) (Decision, error) {
 	d.State = DecisionState(state)
 	if kind != nil {
 		d.NextDeadlineKind = DeadlineKind(*kind)
+	}
+	if key != nil {
+		d.IdempotencyKey = *key
 	}
 	d.CreatedAt = d.CreatedAt.UTC()
 	d.UpdatedAt = d.UpdatedAt.UTC()

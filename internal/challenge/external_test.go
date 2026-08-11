@@ -774,6 +774,15 @@ func TestExternalStopsDispatchingOverTheSubjectBudget(t *testing.T) {
 		if st.State != issued.State {
 			t.Fatalf("status of %s = %q but issue returned %q", id, st.State, issued.State)
 		}
+		// And it has to agree about *why*. Shed is set for the one failure that
+		// means the target was never called, and for no other — it is what the
+		// decision layer reads to deny on load shedding rather than on a refusal
+		// somebody made, and a bit that were set for every failure would collapse
+		// the two back together.
+		if want := detail.Failure == challenge.ExternalFailureRateLimited; st.Shed != want {
+			t.Fatalf("status of %s reported Shed=%v with failure %q, want %v",
+				id, st.Shed, detail.Failure, want)
+		}
 		return detail
 	}
 

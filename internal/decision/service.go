@@ -77,6 +77,26 @@ const (
 	// timed-out challenge.
 	ReasonChallengeFailed engine.Reason = "challenge_failed"
 
+	// ReasonChallengeRateLimited is the ground for a decision denied because a
+	// challenge it needed was never opened: the issuance was shed by the
+	// per-subject challenge rate limit (R43).
+	//
+	// It has parity with ReasonOutstandingCap above, and for the same reason
+	// that one is not folded into the policy's vocabulary: what happened is a
+	// limit this deployment applied, not a judgement anybody made about the
+	// request. Without it the decision reads `challenge_failed`, which is also
+	// what a rejected step-up reads — so an operator watching denies could not
+	// tell "the subject refused the prompt" from "we never sent the prompt", and
+	// those call for opposite responses. One is final; the other clears when the
+	// window does.
+	//
+	// It is deliberately not `rate_limited`. That value is the decide surface's
+	// own budget, refused before any decision existed. This one is a decision
+	// that exists, was created, opened a challenge and denied — a client that
+	// read the two as one word would retry a decision that is already on its
+	// record as denied.
+	ReasonChallengeRateLimited engine.Reason = "challenge_rate_limited"
+
 	// ReasonExpired is the ground for a decision the sweeper expired.
 	ReasonExpired engine.Reason = "expired"
 )
@@ -297,6 +317,12 @@ type Request struct {
 
 	// TTL overrides the service default for this decision. Zero uses it.
 	TTL time.Duration
+
+	// IdempotencyKey names this decide attempt, so that a retry of it returns
+	// the decision the first attempt created instead of creating a second one.
+	// Empty means the caller is not retrying anything and every call is a new
+	// decision, which is what every caller did before this field existed.
+	IdempotencyKey string
 }
 
 // Decide evaluates a request and creates the decision object it calls for
@@ -314,6 +340,34 @@ func (s *Service) Decide(ctx context.Context, req Request) (Result, error) {
 		return Result{}, ErrUnauthenticated
 	}
 	now := s.Now()
+
+	// The lookup stands here — ahead of the cap, ahead of the evaluation, ahead
+	// of the challenge issuance — and that placement is the whole unit (KTD5).
+	//
+	// This function mints the identifier, issues every challenge and only then
+	// writes the row, so the IdP call and the outbound webhook both happen before
+	// the database has heard of the decision. A key enforced only as a uniqueness
+	// constraint at insert time would therefore push a second step-up at the
+	// subject on every retry and refuse afterwards: the caller would be protected
+	// from a duplicate row and the person would not be protected from anything.
+	//
+	// It is ahead of the outstanding cap for a second reason. A decision counts
+	// against its own subject's cap while it is open, so a retry arriving at a
+	// full cap would be refused by the very decision it is asking after.
+	if req.IdempotencyKey != "" {
+		existing, err := store.DecisionByIdempotencyKey(ctx, s.store.Pool(),
+			req.Caller.CallerID(), req.IdempotencyKey)
+		switch {
+		case err == nil:
+			// Answered through advance rather than through a bare read, so that
+			// a retry sees the decision as it stands now — a delay that has since
+			// elapsed, a quorum that has since been met — which is what the first
+			// call would have reported had it arrived at this instant.
+			return s.advance(ctx, existing.ID, now)
+		case !errors.Is(err, store.ErrNotFound):
+			return Result{}, err
+		}
+	}
 
 	if s.maxOutstanding > 0 {
 		outstanding, err := s.countOutstanding(ctx, req.Input.Subject.ID, now)
@@ -424,19 +478,38 @@ func (s *Service) Decide(ctx context.Context, req Request) (Result, error) {
 	}
 
 	created, err := s.audit.CreateDecision(ctx, store.NewDecision{
-		ID:            id,
-		CallerID:      req.Caller.CallerID(),
-		PolicyID:      policyID,
-		PolicyVersion: version,
-		SubjectID:     req.Input.Subject.ID,
-		ResourceID:    req.Input.Resource.ID,
-		Action:        req.Input.Action,
-		Request:       requestPayload(req.Input),
-		FactSnapshot:  factSnapshot,
-		Obligations:   obligations,
-		ExpiresAt:     expiresAt,
-		Challenges:    opened,
+		ID:             id,
+		CallerID:       req.Caller.CallerID(),
+		PolicyID:       policyID,
+		PolicyVersion:  version,
+		SubjectID:      req.Input.Subject.ID,
+		ResourceID:     req.Input.Resource.ID,
+		Action:         req.Input.Action,
+		Request:        requestPayload(req.Input),
+		FactSnapshot:   factSnapshot,
+		Obligations:    obligations,
+		ExpiresAt:      expiresAt,
+		Challenges:     opened,
+		IdempotencyKey: req.IdempotencyKey,
 	})
+	// A conflict on a keyed create means another attempt under the same key
+	// landed while this one was issuing its challenges. The two callers are the
+	// same caller retrying, so the loser answers with the winner's decision
+	// rather than reporting a conflict to somebody who did nothing wrong.
+	//
+	// The challenges this attempt opened are already open, and that is the
+	// residue the unique index cannot remove — it is a backstop, and it can only
+	// act after the pushes it would have wanted to prevent. Bounding the damage
+	// to a genuine race is what it is for; the lookup at the top is what keeps a
+	// retry from being one.
+	if req.IdempotencyKey != "" && errors.Is(err, store.ErrConflict) {
+		winner, lookupErr := store.DecisionByIdempotencyKey(ctx, s.store.Pool(),
+			req.Caller.CallerID(), req.IdempotencyKey)
+		if lookupErr != nil {
+			return Result{}, err
+		}
+		return s.advance(ctx, winner.ID, now)
+	}
 	if err != nil {
 		return Result{}, err
 	}
@@ -666,6 +739,14 @@ func (s *Service) advance(ctx context.Context, id string, now time.Time) (Result
 
 	changed := false
 	satisfied, failed := 0, 0
+	// Whether any challenge failed because it was never opened. It is collected
+	// from the same Status answers that decide the states, so it cannot disagree
+	// with them. A challenge already stored terminal is skipped here and its bit
+	// is not read — which cannot lose anything, because a shed challenge is
+	// recorded failed by the very pass that observes it, and that pass is the one
+	// that resolves the decision. The read path recomputes the ground from every
+	// challenge regardless, so a decision read back afterwards still says it.
+	shed := false
 	for i := range progress {
 		p := progress[i]
 		if stored := challengeState(p.State); stored.Terminal() {
@@ -704,13 +785,14 @@ func (s *Service) advance(ctx context.Context, id string, now time.Time) (Result
 			satisfied++
 		case challenge.StateFailed, challenge.StateCancelled:
 			failed++
+			shed = shed || st.Shed
 		case challenge.StatePending:
 		}
 	}
 
 	switch {
 	case failed > 0:
-		if _, err := s.resolve(ctx, d, Fail, ReasonChallengeFailed); err != nil {
+		if _, err := s.resolve(ctx, d, Fail, failureReason(shed)); err != nil {
 			return Result{}, err
 		}
 	case satisfied == len(progress):
@@ -739,6 +821,19 @@ func reasonFor(challenges int) engine.Reason {
 		return engine.ReasonPolicyMatched
 	}
 	return ReasonChallengeSatisfied
+}
+
+// failureReason names the ground of a decision its challenges denied.
+//
+// The distinction is between a challenge that was put to somebody and not met,
+// and a challenge that was never put to anybody because a limit refused to open
+// it. Both leave the decision denied and only the ground says which, so the
+// ground is the whole difference between "this was refused" and "ask again".
+func failureReason(shed bool) engine.Reason {
+	if shed {
+		return ReasonChallengeRateLimited
+	}
+	return ReasonChallengeFailed
 }
 
 // resolve applies a transition and writes it.
@@ -845,6 +940,7 @@ func (s *Service) view(ctx context.Context, d store.Decision, progress []store.C
 		out.Outcome = engine.Deny
 		out.Reason = ReasonChallengeFailed
 	}
+	shed := false
 	for _, p := range progress {
 		view := ChallengeView{
 			Ordinal:  p.Ordinal,
@@ -856,6 +952,9 @@ func (s *Service) view(ctx context.Context, d store.Decision, progress []store.C
 		if err != nil {
 			return Result{}, err
 		}
+		if st.Shed {
+			shed = true
+		}
 		view.Have, view.Need = st.Have, st.Need
 		published, err := s.publish(ctx, d, p, now)
 		if err != nil {
@@ -866,6 +965,14 @@ func (s *Service) view(ctx context.Context, d store.Decision, progress []store.C
 		// reading is used for progress counts, but promoting a challenge to
 		// satisfied is a write, and a read path must not perform one.
 		out.Challenges = append(out.Challenges, view)
+	}
+	// The ground of a denied decision is recomputed here rather than remembered,
+	// because nothing on the row remembers it: the state is written, the reason
+	// is derived. Deriving it from the same Status answers the resolution used
+	// is what keeps a decision reading the same afterwards as it did in the
+	// response that created it.
+	if out.Reason == ReasonChallengeFailed {
+		out.Reason = failureReason(shed)
 	}
 	return out, nil
 }

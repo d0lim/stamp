@@ -86,6 +86,27 @@ const CodeNotInstalled = "not_installed"
 // is worse than a decision that was not created.
 const DefaultMaxDecisionTTL = 24 * time.Hour
 
+// IdempotencyKeyHeader is where a PEP names the decide attempt it is making, so
+// that a retry of that attempt answers with the decision the attempt created
+// rather than creating a second one (#47(a)).
+//
+// It is a header rather than a body field, and the choice is not arbitrary: the
+// decide body is the AuthZEN evaluation request plus `ttl`, and it is that shape
+// so a PEP can send one value to both `POST /decisions` and
+// `POST /access/v1/evaluation` (KTD1). A retry name is a property of the HTTP
+// attempt and not of the access request being judged — check has no decisions to
+// deduplicate — so putting it in the body would put a field into the shared shape
+// that only one of the two endpoints reads. The name is the one the industry
+// already uses for this, so a client library that has an idempotency setting can
+// be pointed at this endpoint without a translation layer.
+const IdempotencyKeyHeader = "Idempotency-Key"
+
+// MaxIdempotencyKeyBytes bounds a key. It is a caller-chosen string that lands
+// in a column and an index, so it is bounded here and again by a CHECK in
+// migration 000008 — a bound that lives only at the surface is a bound that the
+// next write path does not have.
+const MaxIdempotencyKeyBytes = 255
+
 // DecisionCreator creates decisions.
 //
 // It is an interface rather than *decision.Service so that this surface can be
@@ -288,6 +309,17 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A key that this deployment cannot store is refused rather than dropped. A
+	// caller that sent one believes its retries are safe, and silently ignoring
+	// the header would leave it believing that while every retry opened another
+	// decision — the failure it asked to be protected from, arriving without a
+	// word.
+	key, err := idempotencyKey(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
 	schema := d.schemas.Schema()
 	if schema == nil {
 		// An instance with no policy set cannot judge, and unlike the check
@@ -311,7 +343,9 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := d.decisions.Decide(r.Context(), decision.Request{Caller: caller, Input: in, TTL: ttl})
+	result, err := d.decisions.Decide(r.Context(), decision.Request{
+		Caller: caller, Input: in, TTL: ttl, IdempotencyKey: key,
+	})
 	if err != nil {
 		status, code, message := decisionError(err)
 		writeError(w, status, code, message)
@@ -369,6 +403,33 @@ func (req DecisionRequest) ttl(maxTTL time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("ttl %s is longer than this deployment allows (%s)", d, maxTTL)
 	}
 	return d, nil
+}
+
+// idempotencyKey reads and validates the retry name a request carries. An absent
+// header is the empty string and no error: a caller that names nothing is
+// retrying nothing, and every caller did that before this header existed.
+//
+// The accepted shape is deliberately narrow — printable, no spaces, bounded —
+// because the value is chosen by the caller and ends up in an index, in error
+// messages and in an audit trail an operator reads. A key is an opaque token the
+// caller generates, so nothing legitimate needs a control character in it, and
+// refusing them here is cheaper than discovering later which log line was
+// forged. Whitespace is refused rather than trimmed: `"k"` and `"k "` would
+// otherwise be one key on the way in and two keys in anything that echoed them.
+func idempotencyKey(r *http.Request) (string, error) {
+	key := r.Header.Get(IdempotencyKeyHeader)
+	if key == "" {
+		return "", nil
+	}
+	if len(key) > MaxIdempotencyKeyBytes {
+		return "", fmt.Errorf("%s is longer than %d bytes", IdempotencyKeyHeader, MaxIdempotencyKeyBytes)
+	}
+	for i := 0; i < len(key); i++ {
+		if c := key[i]; c <= ' ' || c > '~' {
+			return "", fmt.Errorf("%s must be printable ascii without spaces", IdempotencyKeyHeader)
+		}
+	}
+	return key, nil
 }
 
 // decodeDecisionRequest reads the decide body, bounded, and holds it to the same

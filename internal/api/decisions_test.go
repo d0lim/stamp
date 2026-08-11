@@ -301,6 +301,20 @@ func (f *decideFixture) create(t *testing.T, token, body string) *httptest.Respo
 	return f.do(api.SurfacePEP, http.MethodPost, api.DecisionsPath, token, body)
 }
 
+// createWithKey is create with a retry name on it. It builds the request the
+// long way rather than going through do, because the header is the subject of
+// the test and a helper that could not carry it would be testing the default.
+func (f *decideFixture) createWithKey(t *testing.T, token, body, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, api.DecisionsPath, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(api.IdempotencyKeyHeader, key)
+	rec := httptest.NewRecorder()
+	f.server.Handler(api.SurfacePEP).ServeHTTP(rec, req)
+	return rec
+}
+
 func (f *decideFixture) read(t *testing.T, token, id string) *httptest.ResponseRecorder {
 	t.Helper()
 	return f.do(api.SurfacePEP, http.MethodGet, api.DecisionsPath+"/"+id, token, "")
@@ -876,6 +890,66 @@ func TestTheRequestedLifetimeIsBounded(t *testing.T) {
 		}
 		if f.life.decided() != 0 {
 			t.Errorf("%d unusable lifetimes reached the lifecycle, want 0", f.life.decided())
+		}
+	})
+}
+
+// TestTheIdempotencyKeyIsCarriedToTheLifecycle is the surface's whole share of
+// #47(a). Whether a repeated key returns the same decision is a question about
+// rows and challenge issuance, and it is answered in internal/decision against a
+// real database; what this endpoint owes is that the header reaches the
+// lifecycle intact, that a key it cannot store is refused rather than dropped,
+// and that a request without one behaves exactly as it did before.
+func TestTheIdempotencyKeyIsCarriedToTheLifecycle(t *testing.T) {
+	t.Run("a key is carried to the lifecycle", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{})
+		rec := f.createWithKey(t, f.workload(t, "svc-a"), decideBody(""), "attempt-7f3c")
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := f.life.lastRequest(t).IdempotencyKey; got != "attempt-7f3c" {
+			t.Errorf("idempotency key = %q, want %q", got, "attempt-7f3c")
+		}
+	})
+
+	t.Run("no key leaves the request unnamed", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{})
+		if rec := f.create(t, f.workload(t, "svc-a"), decideBody("")); rec.Code != http.StatusCreated {
+			t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := f.life.lastRequest(t).IdempotencyKey; got != "" {
+			t.Errorf("idempotency key = %q, want empty: a caller that sent no header named nothing", got)
+		}
+	})
+
+	t.Run("a key this deployment cannot store is refused, not dropped", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{})
+		for name, key := range map[string]string{
+			"too long":        strings.Repeat("k", api.MaxIdempotencyKeyBytes+1),
+			"a space":         "attempt 7f3c",
+			"a newline":       "attempt\n7f3c",
+			"a control byte":  "attempt\x00",
+			"a non-ascii run": "attempt-\xc3\xa9",
+		} {
+			rec := f.createWithKey(t, f.workload(t, "svc-a"), decideBody(""), key)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("%s key = %d, want %d: %s", name, rec.Code, http.StatusBadRequest, rec.Body.String())
+				continue
+			}
+			var body api.ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Errorf("%s key: decode error body: %v", name, err)
+				continue
+			}
+			if body.Error != "invalid_request" {
+				t.Errorf("%s key error = %q, want invalid_request", name, body.Error)
+			}
+		}
+		// A refused key must not have been judged. Silently evaluating and then
+		// refusing would mean the caller was charged an evaluation for a request
+		// whose retry safety it was told it does not have.
+		if f.life.decided() != 0 {
+			t.Errorf("%d unusable keys reached the lifecycle, want 0", f.life.decided())
 		}
 	})
 }
