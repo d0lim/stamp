@@ -1016,8 +1016,8 @@ func TestASecondDecisionUnderOneKeyIsAConflict(t *testing.T) {
 		SubjectID:      stored.SubjectID,
 		ResourceID:     stored.ResourceID,
 		Action:         stored.Action,
-		Request:        json.RawMessage(stored.Request),
-		FactSnapshot:   json.RawMessage(stored.FactSnapshot),
+		Request:        stored.Request,
+		FactSnapshot:   stored.FactSnapshot,
 		ExpiresAt:      stored.ExpiresAt,
 		IdempotencyKey: "dup-1",
 	})
