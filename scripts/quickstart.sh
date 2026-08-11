@@ -267,8 +267,12 @@ for _ in $(seq 1 60); do
   # It is printed to stdout exactly once, on the first start with the api role,
   # and stored only as a digest. Reading it out of the container's log is the
   # demo's stand-in for an operator reading it off their terminal.
+  # `|| true` on the pipeline, not `2>/dev/null` alone: under `set -euo
+  # pipefail` a failing `compose logs` -- which is what a container that has not
+  # come up yet gives -- fails the assignment and kills the shell, so the sixty
+  # retries below never run. The redirect hid the message, never the status.
   BOOTSTRAP=$("${COMPOSE[@]}" logs --no-color --no-log-prefix stamp 2>/dev/null \
-    | awk '/governance bootstrap token/ {grab=1; next} grab && NF {print $1; exit}')
+    | awk '/governance bootstrap token/ {grab=1; next} grab && NF {print $1; exit}' || true)
   [ -n "$BOOTSTRAP" ] && break
   sleep 1
 done
