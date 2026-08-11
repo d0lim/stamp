@@ -62,6 +62,9 @@ stamp --roles=all
 | `STAMP_EGRESS_ALLOW` | Origins a fact call may reach, comma-separated. Nothing else is dialled. |
 | `STAMP_FACT_ALLOW_FAIL_OPEN` | Permit source declarations that fail open. Off by default. |
 | `STAMP_AUDIT_FAIL_CLOSED` | Deny while the check-path audit buffer is saturated. On by default. |
+| `STAMP_AUDIT_CHECKPOINT_KEY_FILE`, `STAMP_AUDIT_CHECKPOINT_KEY_ID` | The Ed25519 key checkpoints are signed with, as a mounted PEM file, and the identifier stamped on every checkpoint it signs. There is deliberately no variable that carries the key itself. |
+| `STAMP_AUDIT_CHECKPOINT_SINK_FILE`, `STAMP_AUDIT_CHECKPOINT_SINK_WEBHOOK` | Where signed checkpoints are published. The file is the default and the only sink verification can read back; the webhook is an addition, delivered through the egress gate. |
+| `STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS`, `STAMP_AUDIT_CHECKPOINT_INTERVAL` | Retired public keys as `key-id=/path/to/key.pub`, comma-separated, and how often a checkpoint is taken. Defaults to five minutes. |
 | `STAMP_GOVERNANCE_MIN_APPROVERS` | The operator floor under any revision quorum. |
 | `STAMP_AUTHORING_MODE` | Which authoring paths may write policy: `both` (default), `file` (closes the console's policy authoring), `console` (closes the file path's apply). An unrecognized value fails the boot rather than falling back to `both`. No mode closes the approval inbox, the audit views, the dry run or the lock. |
 | `STAMP_CAPABILITY_CLAIM` | The verified token claim the policy set export reads `policy.author` and `audit.read` from. Defaults to `stamp_capabilities`. The gate is fail-closed per caller: a token without the claim, or with a claim naming neither capability, is refused and the refusal is audited. |
@@ -124,6 +127,37 @@ A quorum can name a group instead of a list of people. The group source is a fac
 The directory's URL and credential are operator configuration and appear in no policy document. A group-resolved set carries its own issuer, so it is also how a deployment names approvers in an IdP other than the one `STAMP_APPROVER_ISSUER` designates.
 
 On its first start with the `api` role the process installs the reserved governance policy and prints a one-time bootstrap token. It is shown once and stored only as a digest; lock governance with it as soon as the approver set is known.
+
+### Verifying the audit chain
+
+The audit log is a hash chain per writer, which catches an edit or a deletion but not a wholesale rewrite: whoever can write the database can recompute every hash, and the result re-chains perfectly. What it cannot do is produce the signature. A checkpoint names every writer's head at a moment, is signed with a key the database does not hold, and is published outside it — so the rewrite disagrees with something the rewriter could not reach.
+
+The `api` role records them on a timer. It is the one role that does: a checkpoint binds every segment's head, so the series wants one producer, and putting it on the tiers that scale would buy a serialized global writer per replica. Nothing is configured by default, and a deployment that configures nothing is told at startup that it is running without the control — not that a setting is at its default.
+
+```sh
+openssl genpkey -algorithm ed25519 -out checkpoint.key
+openssl pkey -in checkpoint.key -pubout -out checkpoint.pub
+
+STAMP_AUDIT_CHECKPOINT_KEY_FILE=/run/secrets/checkpoint.key \
+STAMP_AUDIT_CHECKPOINT_KEY_ID=audit-2026-08 \
+STAMP_AUDIT_CHECKPOINT_SINK_FILE=/var/lib/stamp/checkpoints.jsonl \
+stamp --roles=api
+
+STAMP_AUDIT_CHECKPOINT_SINK_FILE=/var/lib/stamp/checkpoints.jsonl \
+STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS=audit-2026-08=/etc/stamp/checkpoint.pub \
+stamp audit verify --dsn "$STAMP_DSN"
+```
+
+Verification needs the public key and a readable sink, and nothing else from the deployment — an auditor runs it against a read-only replica with a copy of the checkpoint file. Rotating the signing key is a new file and a new identifier; keep the retired key's public half in `STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS` and everything it signed stays verifiable without being re-signed.
+
+| Exit | Meaning |
+|---|---|
+| `0` | At least one checkpoint was verified and everything agrees. |
+| `1` | The command was used or configured wrong and never looked at the audit trail. |
+| `6` | The log and what was signed do not agree: rows were modified, removed, rewritten, or a checkpoint was forged or lost. |
+| `7` | No verdict: no key, no readable sink, an unreachable database — or nothing to verify, because the sink is empty or a checkpoint names a key nobody kept. |
+
+`7` is the one to wire an alert to alongside `6`. Zero checkpoints produce zero faults, so a command that reported "nothing to verify" as a pass would report a control that quietly stopped working as a healthy one.
 
 ### The console
 

@@ -59,6 +59,17 @@ const (
 	DefaultIngestAdapterName = "http-ingest"
 	DefaultKafkaAdapterName  = "kafka"
 
+	// DefaultCheckpointInterval is how often the audit chain's heads are signed
+	// into a checkpoint.
+	//
+	// It is a tuning knob with a safe direction rather than a trust decision:
+	// the interval is the widest window in which a rewrite of the log could
+	// still be covered by no external signature, so a shorter one is stricter
+	// and a longer one is cheaper. Five minutes is short enough that the
+	// unanchored window is smaller than most incident timelines and long enough
+	// that the head scan is nowhere near the write path's cost.
+	DefaultCheckpointInterval = 5 * time.Minute
+
 	// DefaultRetentionSweepInterval is how often the dedup index and the bucket
 	// table are swept of rows past the retention horizon.
 	//
@@ -184,6 +195,12 @@ type Config struct {
 	AuditCapacity      int
 	AuditBatchSize     int
 	AuditFlushInterval time.Duration
+
+	// Checkpoint is the audit chain's tamper-evidence half: the signing key,
+	// where signed checkpoints are published and how often one is taken. R32
+	// asks for the sink and the key to be on the deployment surface; R42
+	// decides how the key is allowed to get here.
+	Checkpoint CheckpointConfig
 
 	// PolicyRefreshInterval and PolicyStalenessDeadline are R24's two knobs.
 	// Zero selects the engine's defaults.
@@ -313,6 +330,106 @@ type ConsoleConfig struct {
 	// AllowInsecureTransport permits plaintext console endpoints, for loopback
 	// development and tests.
 	AllowInsecureTransport bool
+}
+
+// CheckpointConfig is the audit checkpoint subsystem's deployment
+// configuration.
+//
+// R42 decides the shape of the first two fields, and it is the reason this
+// struct has no field a key's bytes could be written into. A private key handed
+// over in an environment variable is a key in the process listing, in `docker
+// inspect`, in the chart values that produced the manifest and in whatever
+// shipped that manifest around; there is no way to inject one that way and
+// still say the deployment holds it as a secret. A file is what a Kubernetes
+// Secret, a Docker secret and a laptop all mount, so a path is the only
+// injection path there is — and a path is not the key, so a configuration dump
+// or a startup log carries the name of the key and never the key.
+//
+// The identifier is mandatory for the same requirement's second half. Every
+// checkpoint records the key it was signed under, so a rotation is: point
+// KeyFile at the new key, give it a new KeyID, and leave the retired key's
+// *public* half in VerifyKeys. Checkpoints signed before the rotation stay
+// verifiable and nothing has to be re-signed, which is what makes the rotation
+// a restart rather than an outage. Reusing one identifier for two different
+// keys is the one move that breaks that, and it is what an operator does when
+// the identifier is optional and gets defaulted.
+type CheckpointConfig struct {
+	// KeyFile is the path the Ed25519 signing key is mounted at, in PEM
+	// PKCS#8 form — what `openssl genpkey -algorithm ed25519` writes.
+	KeyFile string
+	// KeyID names the signing key. It is stamped on every checkpoint this
+	// process produces and is required whenever a key is configured.
+	KeyID string
+	// VerifyKeys are additional public keys verification accepts, by
+	// identifier: the retired halves of previous rotations, and — on a host
+	// that holds no signing key at all, which is what an auditor running
+	// `stamp audit verify` has — every key the series was ever signed under.
+	VerifyKeys map[string]string
+	// SinkFile is the append-only file signed checkpoints are written to. It
+	// is the default sink because the guarantee has to hold in the
+	// single-container deployment with no second system configured, and it is
+	// the only sink shape verification can read back.
+	SinkFile string
+	// SinkWebhook is an optional additional destination, delivered through the
+	// egress gate. It is an addition and not a replacement: a webhook cannot be
+	// read back, so a deployment whose only sink is one cannot verify itself.
+	SinkWebhook string
+	// Interval is how often a checkpoint is taken. Zero selects
+	// DefaultCheckpointInterval.
+	Interval time.Duration
+}
+
+// Configured reports whether the deployment asked for audit checkpoints at all.
+func (c CheckpointConfig) Configured() bool {
+	return strings.TrimSpace(c.KeyFile) != "" || strings.TrimSpace(c.SinkFile) != "" ||
+		strings.TrimSpace(c.SinkWebhook) != ""
+}
+
+// Sinks reports whether a destination was named.
+func (c CheckpointConfig) Sinks() bool {
+	return strings.TrimSpace(c.SinkFile) != "" || strings.TrimSpace(c.SinkWebhook) != ""
+}
+
+// validate refuses a half-configured checkpoint subsystem.
+//
+// Every case below is one where the deployment would start, report itself
+// healthy, and produce no tamper evidence — with an operator who wrote a key
+// path in the manifest and has every reason to believe otherwise. A control
+// that is absent is recoverable; a control that is believed to be present and
+// is not is the failure this refuses to boot into.
+func (c CheckpointConfig) validate() []error {
+	if !c.Configured() {
+		return nil
+	}
+	var errs []error
+	if strings.TrimSpace(c.KeyFile) == "" {
+		errs = append(errs, fmt.Errorf(
+			"%s is set but %s is not: a checkpoint sink with no signing key receives nothing, and an "+
+				"unsigned head is one anybody with database access can write",
+			firstSet(c.SinkFile, EnvCheckpointSinkFile, EnvCheckpointSinkWebhook), EnvCheckpointKeyFile))
+	}
+	if strings.TrimSpace(c.KeyFile) != "" && strings.TrimSpace(c.KeyID) == "" {
+		errs = append(errs, fmt.Errorf(
+			"%s is set but %s is not: a checkpoint records the key it was signed under, and a key with no "+
+				"identifier cannot be rotated without invalidating everything the previous one signed",
+			EnvCheckpointKeyFile, EnvCheckpointKeyID))
+	}
+	if !c.Sinks() {
+		errs = append(errs, fmt.Errorf(
+			"%s is set but no sink is: a checkpoint that never leaves the database is signed by a key the "+
+				"database does not hold and stored where the database can overwrite it. set %s",
+			EnvCheckpointKeyFile, EnvCheckpointSinkFile))
+	}
+	return errs
+}
+
+// firstSet reports which of two sink variables the operator actually set, so
+// the refusal names the one in their manifest.
+func firstSet(sinkFile, fileEnv, webhookEnv string) string {
+	if strings.TrimSpace(sinkFile) != "" {
+		return fileEnv
+	}
+	return webhookEnv
 }
 
 // KafkaConfig is the broker ingestion adapter's deployment configuration.
@@ -511,6 +628,17 @@ const (
 	EnvAuditCapacity      = "STAMP_AUDIT_CAPACITY"
 	EnvAuditBatchSize     = "STAMP_AUDIT_BATCH_SIZE"
 	EnvAuditFlushInterval = "STAMP_AUDIT_FLUSH_INTERVAL"
+
+	// The audit checkpoint surface. The signing key is named by a path and
+	// never by its value: there is deliberately no variable that carries key
+	// material, because a key in the environment is a key in the process
+	// listing and in whatever produced the manifest (R42).
+	EnvCheckpointKeyFile     = "STAMP_AUDIT_CHECKPOINT_KEY_FILE"
+	EnvCheckpointKeyID       = "STAMP_AUDIT_CHECKPOINT_KEY_ID"
+	EnvCheckpointVerifyKeys  = "STAMP_AUDIT_CHECKPOINT_VERIFY_KEYS"
+	EnvCheckpointSinkFile    = "STAMP_AUDIT_CHECKPOINT_SINK_FILE"
+	EnvCheckpointSinkWebhook = "STAMP_AUDIT_CHECKPOINT_SINK_WEBHOOK"
+	EnvCheckpointInterval    = "STAMP_AUDIT_CHECKPOINT_INTERVAL"
 
 	EnvPolicyRefreshInterval   = "STAMP_POLICY_REFRESH_INTERVAL"
 	EnvPolicyStalenessDeadline = "STAMP_POLICY_STALENESS_DEADLINE"
@@ -720,6 +848,8 @@ func ConfigFromEnv() (Config, error) {
 		PollRecords: envInt(EnvKafkaPollRecords, 0, fail),
 	}
 
+	cfg.Checkpoint = checkpointFromEnv(fail)
+
 	groups, err := idpGroupSourcesFrom(os.Getenv(EnvIdPGroupSources))
 	if err != nil {
 		fail("%s: %w", EnvIdPGroupSources, err)
@@ -819,6 +949,9 @@ func (c Config) withDefaults() Config {
 	if c.RetentionSweepInterval <= 0 {
 		c.RetentionSweepInterval = DefaultRetentionSweepInterval
 	}
+	if c.Checkpoint.Interval <= 0 {
+		c.Checkpoint.Interval = DefaultCheckpointInterval
+	}
 	// A declaration that names no adapter takes the HTTP one. That is the
 	// deployment every install has — the Kafka adapter is the optional
 	// dependency D20 keeps optional — so it is the only default that could be
@@ -882,6 +1015,7 @@ func (c Config) validate() error {
 			EnvAuthoringMode, c.AuthoringMode, revision.AuthoringModes()))
 	}
 	errs = append(errs, c.Kafka.validate()...)
+	errs = append(errs, c.Checkpoint.validate()...)
 	errs = append(errs, c.MFA.validate(c.OIDC)...)
 	return errors.Join(errs...)
 }
@@ -1239,6 +1373,85 @@ func idpGroupSourcesFrom(spec string) ([]idpgroup.Declaration, error) {
 			return nil, fmt.Errorf("source %q: timeout: %w", d.Name, err)
 		}
 		out = append(out, decl)
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// audit checkpoints
+//
+// The one part of the deployment surface whose secret is not read here at all.
+// Every other credential on this surface — the CIBA client secret, an external
+// target's shared secret, a directory credential — is a value a manifest can
+// carry. The checkpoint signing key is not, and the reason is what the key is
+// for: it signs the statement the database is not allowed to be able to make.
+// A key that travelled through the same channel as the deployment manifest is a
+// key whoever can write the manifest can sign with, and the whole value of the
+// checkpoint is that it was signed by something the database — and the person
+// who can rewrite it — does not hold.
+// ---------------------------------------------------------------------------
+
+// CheckpointConfigFromEnv reads the audit checkpoint configuration on its own.
+//
+// `stamp audit verify` needs exactly this surface and none of the rest: it
+// serves nothing, so making it supply an issuer, an audience and a listen
+// address before it could read a checkpoint file would be configuration for its
+// own sake — and configuration an auditor running the command from a laptop
+// does not have. It is the same reader [ConfigFromEnv] uses, so the command and
+// the process that wrote the checkpoints cannot drift apart on what a variable
+// means.
+func CheckpointConfigFromEnv() (CheckpointConfig, error) {
+	var errs []error
+	fail := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+	cfg := checkpointFromEnv(fail)
+	if len(errs) > 0 {
+		return CheckpointConfig{}, errors.Join(errs...)
+	}
+	return cfg, nil
+}
+
+func checkpointFromEnv(fail func(string, ...any)) CheckpointConfig {
+	keys, err := checkpointVerifyKeysFrom(os.Getenv(EnvCheckpointVerifyKeys))
+	if err != nil {
+		fail("%s: %w", EnvCheckpointVerifyKeys, err)
+	}
+	return CheckpointConfig{
+		KeyFile:     strings.TrimSpace(os.Getenv(EnvCheckpointKeyFile)),
+		KeyID:       strings.TrimSpace(os.Getenv(EnvCheckpointKeyID)),
+		VerifyKeys:  keys,
+		SinkFile:    strings.TrimSpace(os.Getenv(EnvCheckpointSinkFile)),
+		SinkWebhook: strings.TrimSpace(os.Getenv(EnvCheckpointSinkWebhook)),
+		Interval:    envDuration(EnvCheckpointInterval, DefaultCheckpointInterval, fail),
+	}
+}
+
+// checkpointVerifyKeysFrom reads the retired public keys, written as
+// "key-id=/path/to/key.pub,other-id=/path/to/other.pub".
+//
+// A public key is not a secret, so unlike the signing key it could have been
+// carried inline. It is a path anyway: the two halves of one rotation should be
+// configured the same way, and an operator who has to remember that one of them
+// is a path and the other is a literal is an operator who will paste the wrong
+// one into the wrong variable exactly once.
+func checkpointVerifyKeysFrom(spec string) (map[string]string, error) {
+	entries := splitList(spec)
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		id, path, ok := strings.Cut(entry, "=")
+		id, path = strings.TrimSpace(id), strings.TrimSpace(path)
+		if !ok || id == "" || path == "" {
+			return nil, fmt.Errorf("entry %q is not of the form key-id=/path/to/public-key.pem", entry)
+		}
+		if _, dup := out[id]; dup {
+			// Two answers for one identifier is a rotation nobody can read: a
+			// checkpoint naming that key has two public keys and no rule for
+			// which one decides.
+			return nil, fmt.Errorf("key id %q is given twice", id)
+		}
+		out[id] = path
 	}
 	return out, nil
 }
