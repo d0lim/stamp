@@ -238,6 +238,11 @@ func New(cfg Config) (*Service, error) {
 func (s *Service) Now() time.Time { return s.now().UTC() }
 
 // ChallengeView is one challenge's progress in a decision response.
+//
+// Everything here is either kind-agnostic or published by the handler through
+// [challenge.Viewer]. Nothing is read out of the challenge row directly: this
+// package cannot tell a stored URL from a stored secret without knowing the
+// kind, and it does not know the kind on purpose (KTD1).
 type ChallengeView struct {
 	Ordinal  int                  `json:"ordinal"`
 	Kind     policy.ChallengeType `json:"kind"`
@@ -245,6 +250,10 @@ type ChallengeView struct {
 	Have     int                  `json:"have"`
 	Need     int                  `json:"need"`
 	Deadline *time.Time           `json:"deadline,omitempty"`
+	// AuthorizationURL is where the subject must be sent to complete this
+	// challenge, for the kinds completed in a browser. Absent otherwise, so a
+	// quorum, a delay and an external challenge serialize as they always did.
+	AuthorizationURL string `json:"authorization_url,omitempty"`
 }
 
 // Result is a decision as a caller sees it (R2): the state, the challenges and
@@ -705,6 +714,35 @@ func (s *Service) status(ctx context.Context, d store.Decision, p store.Challeng
 	return st, nil
 }
 
+// publish asks a handler what a caller may be told about a challenge.
+//
+// [challenge.Viewer] is optional, so the type assertion failing is an answer and
+// not a fault: a quorum, a delay and an external callback each have nothing to
+// publish, and a decision that mixes them with one that does still assembles.
+// A handler that answers with an error does not, for the reason status does not:
+// the detail it could not read is the same row, and half a view of a challenge
+// is worse than a refused read of the decision.
+func (s *Service) publish(ctx context.Context, d store.Decision, p store.ChallengeProgress, now time.Time) (challenge.View, error) {
+	handler, err := s.challenges.Handler(p.Kind)
+	if err != nil {
+		return challenge.View{}, err
+	}
+	viewer, ok := handler.(challenge.Viewer)
+	if !ok {
+		return challenge.View{}, nil
+	}
+	v, err := viewer.View(ctx, challenge.ViewRequest{
+		Instance: challenge.Instance{DecisionID: d.ID, Ordinal: p.Ordinal, Kind: p.Kind},
+		Decision: contextOf(d),
+		Detail:   p.Detail,
+		Now:      now,
+	})
+	if err != nil {
+		return challenge.View{}, fmt.Errorf("decision: view of challenge %d of %s: %w", p.Ordinal, d.ID, err)
+	}
+	return v, nil
+}
+
 // view assembles the response a caller sees.
 func (s *Service) view(ctx context.Context, d store.Decision, progress []store.ChallengeProgress, now time.Time) (Result, error) {
 	obligations, err := decodeObligations(d.Obligations)
@@ -747,6 +785,11 @@ func (s *Service) view(ctx context.Context, d store.Decision, progress []store.C
 			return Result{}, err
 		}
 		view.Have, view.Need = st.Have, st.Need
+		published, err := s.publish(ctx, d, p, now)
+		if err != nil {
+			return Result{}, err
+		}
+		view.AuthorizationURL = published.AuthorizationURL
 		// The stored state is what the response reports. A handler's live
 		// reading is used for progress counts, but promoting a challenge to
 		// satisfied is a write, and a read path must not perform one.

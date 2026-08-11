@@ -106,27 +106,30 @@ completion. It does not show the challenge being satisfied, because **no client
 can satisfy one today.** Two seams are missing, both in the delegated MFA
 handler rather than in this bundle:
 
-1. **The authorization URL is not reachable.** Issuance builds the step-up
-   redirect and stores it in the challenge detail
-   (`internal/challenge/mfa/contract.go`, `AuthorizationURL`), but no HTTP
-   response carries it: `decision.ChallengeView` reports `ordinal`, `kind`,
-   `state`, `have`, `need` and `deadline` and nothing else, and the audit
-   console's challenge view is narrower still. Nothing in `console/src` reads it
-   either. So a caller that opens an MFA-challenged decision has no way to learn
-   where to send the subject, and no way to obtain the correlator the completion
-   has to echo.
+1. ~~**The authorization URL is not reachable.**~~ **Closed.**
+   `decision.ChallengeView` now carries `authorization_url`, published by the
+   handler through the optional `challenge.Viewer` interface so that the decision
+   layer still does not import a challenge kind. The stored detail does not
+   travel: the handler names the one field that may leave, and the correlator and
+   the nonce are not among them. See `docs/contracts/decision-api.md` (1.2.0) and
+   `docs/contracts/challenge-interface.md` (1.1.0).
 2. **Nothing turns the IdP's redirect into a completion.** The step-up is built
    with `response_type=code` and the configured redirect target is the
    per-challenge callback path, which is a `POST` route expecting a JSON body
    with an `id_token`. The IdP redirects a browser there with `GET ?code=…`, and
    there is no handler that receives that, exchanges the code and posts the
-   completion.
+   completion. **Still open**, and it is what keeps the flow from completing.
 
-This is reported rather than patched: it is the delegated-MFA unit's seam, it
-needs a new challenge-handler interface to expose a redirect without the
-decision layer importing a specific challenge kind, and it changes the shape of
-a response that landed in its own pull request. The demo makes the gap concrete
-and reproducible instead of hiding it.
+The demo makes the remaining gap concrete and reproducible instead of hiding it.
+
+One consequence of closing the first seam is worth naming: the step-up
+authorization request currently carries the correlator as its `state`, so
+publishing the URL publishes the correlator to the decision's caller and, once
+the subject opens it, to a browser address bar. The correlator binds a completion
+rather than authorizing one — a completion is still refused without a verified
+subject, the right issuer, a matching nonce and a sufficient `acr` — and the unit
+that closes the second seam also makes `state` a CSRF token, since the callback
+path already identifies the challenge.
 
 ## What this bundle is not
 

@@ -3,6 +3,7 @@ package mfa
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -840,5 +841,187 @@ func TestHandlerServesTheContract(t *testing.T) {
 	}
 	if _, err := reg.Handler(policy.ChallengeMFA); err != nil {
 		t.Fatalf("look up the mfa handler: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what a caller may be told (R2, R28, KTD1)
+//
+// The lifecycle cannot read this detail — it must not import this package — so
+// the handler names what leaves. Everything not named stays on the row.
+// ---------------------------------------------------------------------------
+
+// viewableDetail is a frozen challenge with every field populated, so that a
+// view that copied more than it was supposed to has something to copy.
+//
+// Its authorization URL deliberately carries no secret of its own: what this
+// test judges is the handler's choice of fields, and a URL that happened to
+// contain a correlator would confuse that question with the separate one
+// TestTheStepUpURLStillCarriesTheCorrelator asks.
+func viewableDetail() Detail {
+	consumedBy := "alice"
+	return Detail{
+		Mode:              policy.MFADelegated,
+		Method:            MethodStepUp,
+		Correlator:        "correlator-3f9c1d2b4a6e8f0c1d2b4a6e8f0c1d2b",
+		Reference:         "STAMP-ABCDEFGHIJ",
+		Nonce:             "nonce-9a8b7c6d5e4f0011223344556677889900",
+		SubjectID:         testSubject,
+		RequiredACRValues: []string{acrGold},
+		AllowedACRValues:  []string{acrGold, acrSilver},
+		Issuer:            testIssuer,
+		ClientID:          testClientID,
+		Audience:          testAudience,
+		IssuedAt:          testNow,
+		ContextHash:       "ff00ff00ff00ff00",
+		AuthorizationURL:  "https://idp.example.test/authorize?client_id=stamp-stepup&state=csrf-0f0f0f",
+		AuthReqID:         "auth-req-7788990011",
+		ConsumedBy:        consumedBy,
+	}
+}
+
+// TestViewPublishesTheAuthorizationURLAndNothingElse is this handler's half of
+// KTD1: one field crosses, chosen by name.
+func TestViewPublishesTheAuthorizationURLAndNothingElse(t *testing.T) {
+	t.Parallel()
+	h := newTestHandler(t, testConfig(&recordingInitiator{}))
+	detail := viewableDetail()
+	raw, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatalf("encode detail: %v", err)
+	}
+
+	view, err := h.View(t.Context(), challenge.ViewRequest{
+		Instance: challenge.Instance{DecisionID: "dec-A", Ordinal: 0, Kind: policy.ChallengeMFA},
+		Decision: testDecision(t),
+		Detail:   raw,
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view.AuthorizationURL != detail.AuthorizationURL {
+		t.Fatalf("authorization url = %q, want %q", view.AuthorizationURL, detail.AuthorizationURL)
+	}
+
+	// Scanned by value, not by field name: a secret copied into a field with an
+	// innocent name has leaked exactly as much.
+	published, err := json.Marshal(view)
+	if err != nil {
+		t.Fatalf("encode view: %v", err)
+	}
+	for name, secret := range map[string]string{
+		"correlator":  detail.Correlator,
+		"nonce":       detail.Nonce,
+		"reference":   detail.Reference,
+		"auth_req_id": detail.AuthReqID,
+		"subject":     detail.SubjectID,
+		"client id":   detail.ClientID,
+		"consumer":    detail.ConsumedBy,
+	} {
+		if secret != "" && strings.Contains(string(published), secret) {
+			t.Errorf("the published view carries the challenge's %s: %s", name, published)
+		}
+	}
+}
+
+// TestViewOfAChallengeWithNoDestinationPublishesNothing: a CIBA challenge is
+// answered on the subject's phone, so there is nowhere to send anybody. The
+// backchannel request identifier is not a substitute — it is a value the token
+// exchange uses and a caller has no business holding.
+func TestViewOfAChallengeWithNoDestinationPublishesNothing(t *testing.T) {
+	t.Parallel()
+	h := newTestHandler(t, testConfig(&recordingInitiator{method: MethodCIBA}))
+	detail := viewableDetail()
+	detail.Method = MethodCIBA
+	detail.AuthorizationURL = ""
+	raw, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatalf("encode detail: %v", err)
+	}
+
+	view, err := h.View(t.Context(), challenge.ViewRequest{
+		Instance: challenge.Instance{DecisionID: "dec-A", Ordinal: 0, Kind: policy.ChallengeMFA},
+		Decision: testDecision(t),
+		Detail:   raw,
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	if view != (challenge.View{}) {
+		t.Fatalf("view = %+v, want nothing published", view)
+	}
+}
+
+// TestViewRefusesAnUnreadableDetail: the view path decodes the same row Status
+// and Submit decode, and answers a corrupt one the same way rather than
+// publishing a zero value that would read as "no destination".
+func TestViewRefusesAnUnreadableDetail(t *testing.T) {
+	t.Parallel()
+	h := newTestHandler(t, testConfig(&recordingInitiator{}))
+	_, err := h.View(t.Context(), challenge.ViewRequest{
+		Instance: challenge.Instance{DecisionID: "dec-A", Ordinal: 0, Kind: policy.ChallengeMFA},
+		Decision: testDecision(t),
+		Detail:   json.RawMessage(`{"mode":`),
+		Now:      testNow,
+	})
+	if !errors.Is(err, challenge.ErrInvalidPayload) {
+		t.Fatalf("view err = %v, want ErrInvalidPayload", err)
+	}
+}
+
+// TestTheCorrelatorReachesACallerOnlyAsTheOAuthState bounds an exposure this
+// unit opens and does not close.
+//
+// [StepUp.Initiate] sends the correlator as the authorization request's `state`
+// (stepup.go), and this unit makes that URL reach a caller for the first time.
+// So a 32-byte binding value now travels in a response and, once the subject
+// opens the URL, in an address bar, a referrer and a history entry — which is
+// what KTD2 of the open-issues plan rejects. **KTD2 belongs to U2**: `state`
+// becomes a CSRF token, the per-challenge callback path identifies the
+// challenge, and the correlator stops travelling. This test passes either way,
+// and in the meantime it holds the exposure to exactly one query parameter: a
+// correlator anywhere else in the published view is a leak with no owner.
+//
+// It is a bounded hazard rather than a fresh one — the correlator binds, it does
+// not authorize, and a completion is still refused without a verified subject,
+// the right issuer, a matching nonce and a sufficient acr.
+func TestTheCorrelatorReachesACallerOnlyAsTheOAuthState(t *testing.T) {
+	t.Parallel()
+	// The real step-up initiator, not the recording one: the question is what
+	// the URL a deployment actually builds carries.
+	h := newTestHandler(t, testConfig(testStepUpInitiator(t)))
+	dec := testDecision(t)
+	detail, raw := issue(t, h, policy.MFA{Mode: policy.MFADelegated, ACRValues: []string{acrGold}}, dec, testNow)
+
+	view, err := h.View(t.Context(), challenge.ViewRequest{
+		Instance: challenge.Instance{DecisionID: dec.DecisionID, Ordinal: 0, Kind: policy.ChallengeMFA},
+		Decision: dec,
+		Detail:   raw,
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("view: %v", err)
+	}
+	u, err := url.Parse(view.AuthorizationURL)
+	if err != nil {
+		t.Fatalf("parse the published authorization url %q: %v", view.AuthorizationURL, err)
+	}
+	q := u.Query()
+	if q.Get("state") == detail.Correlator {
+		t.Logf("KNOWN GAP (KTD2, owned by U2): the published authorization url carries "+
+			"the correlator as `state`: %s", view.AuthorizationURL)
+		q.Del("state")
+	}
+	u.RawQuery = q.Encode()
+	if strings.Contains(u.String(), detail.Correlator) {
+		t.Errorf("the correlator reaches a caller somewhere other than `state`: %s", view.AuthorizationURL)
+	}
+	// The nonce is a one-way derivation of the correlator and belongs in an
+	// authorization request by protocol, so its presence is not a leak of the
+	// correlator — but it must be the derived value and never the raw one.
+	if got := q.Get("nonce"); got != NonceFor(detail.Correlator) {
+		t.Errorf("nonce = %q, want the derived %q", got, NonceFor(detail.Correlator))
 	}
 }

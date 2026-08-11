@@ -133,6 +133,10 @@ type harnessOptions struct {
 	obligations    []decision.Obligation
 	policies       []*policy.Policy
 	resolver       engine.SourceResolver
+	// mfaHandler replaces the default delegated-MFA stand-in, so that a test
+	// can register a handler that publishes the wrong thing and check that the
+	// assertions notice.
+	mfaHandler challenge.Handler
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -211,9 +215,14 @@ func (h *harness) newService(writer *store.AuditWriter, opts harnessOptions) *de
 	if err != nil {
 		h.t.Fatalf("new snapshot: %v", err)
 	}
+	var mfa challenge.Handler = &stepUpHandler{}
+	if opts.mfaHandler != nil {
+		mfa = opts.mfaHandler
+	}
 	registry, err := challenge.NewRegistry(
 		&quorumHandler{writer: writer, pool: h.store.Pool()},
 		&delayHandler{},
+		mfa,
 	)
 	if err != nil {
 		h.t.Fatalf("new challenge registry: %v", err)
@@ -570,6 +579,146 @@ func (*delayHandler) Status(_ context.Context, req challenge.StatusRequest) (cha
 		state = challenge.StateSatisfied
 	}
 	return challenge.Status{State: state, Deadline: req.Deadline}, nil
+}
+
+// stepUpHandler is the shape a delegated MFA challenge has, and the only shape
+// this package is allowed to know about it: a handler whose stored detail holds
+// secrets and which publishes one derived, public value through the optional
+// [challenge.Viewer] seam.
+//
+// The real handler lives in internal/challenge/mfa and this package must not
+// import it — TestTheLifecycleDoesNotImportAChallengeKind is that rule as an
+// assertion. So the hazard is reproduced rather than borrowed: the detail below
+// carries a correlator, a nonce and a PKCE verifier, and the view answers with
+// none of them.
+type stepUpHandler struct{}
+
+// The secrets a delegated MFA challenge keeps on its row. They are distinctive
+// strings so that a test can scan a serialized response for the values
+// themselves and not merely for the field names carrying them.
+const (
+	testCorrelator   = "correlator-3f9c1d2b4a6e8f0c1d2b4a6e8f0c1d2b"
+	testMFANonce     = "nonce-9a8b7c6d5e4f0011223344556677889900"
+	testCodeVerifier = "verifier-11223344556677889900aabbccddeeff"
+
+	// testAuthorizationURL is what the subject's browser must be sent to. It
+	// deliberately carries none of the three values above: what a handler
+	// publishes is a decision the handler makes, and this one publishes a URL
+	// whose `state` is a CSRF token rather than the correlator (KTD2).
+	testAuthorizationURL = "https://idp.test/authorize?client_id=stamp-stepup&state=csrf-0f0f0f&acr_values=mfa"
+)
+
+type stepUpDetail struct {
+	Correlator   string `json:"correlator"`
+	Nonce        string `json:"nonce"`
+	CodeVerifier string `json:"code_verifier"`
+	SubjectID    string `json:"subject_id"`
+	AuthURL      string `json:"authorization_url"`
+}
+
+func (*stepUpHandler) Kind() policy.ChallengeType { return policy.ChallengeMFA }
+
+func (*stepUpHandler) Issue(_ context.Context, req challenge.IssueRequest) (challenge.IssueResult, error) {
+	if _, ok := req.Spec.(policy.MFA); !ok {
+		return challenge.IssueResult{}, fmt.Errorf("%w: %T", challenge.ErrUnsupportedSpec, req.Spec)
+	}
+	return challenge.IssueResult{
+		State: challenge.StatePending,
+		Detail: stepUpDetail{
+			Correlator:   testCorrelator,
+			Nonce:        testMFANonce,
+			CodeVerifier: testCodeVerifier,
+			SubjectID:    req.Decision.SubjectID,
+			AuthURL:      testAuthorizationURL,
+		},
+	}, nil
+}
+
+func (*stepUpHandler) Submit(_ context.Context, _ challenge.SubmitRequest) (challenge.SubmitResult, error) {
+	return challenge.SubmitResult{}, challenge.ErrNotSubmittable
+}
+
+func (*stepUpHandler) Status(_ context.Context, req challenge.StatusRequest) (challenge.Status, error) {
+	state := req.Stored
+	if state == challenge.StatePending && req.Deadline != nil && !req.Now.Before(*req.Deadline) {
+		state = challenge.StateFailed
+	}
+	return challenge.Status{State: state, Have: 0, Need: 1, Deadline: req.Deadline}, nil
+}
+
+// View implements [challenge.Viewer]: one field, chosen by name.
+func (*stepUpHandler) View(_ context.Context, req challenge.ViewRequest) (challenge.View, error) {
+	detail, err := decodeStepUpDetail(req.Detail)
+	if err != nil {
+		return challenge.View{}, err
+	}
+	return challenge.View{AuthorizationURL: detail.AuthURL}, nil
+}
+
+func decodeStepUpDetail(raw json.RawMessage) (stepUpDetail, error) {
+	var detail stepUpDetail
+	if err := json.Unmarshal(raw, &detail); err != nil {
+		return stepUpDetail{}, fmt.Errorf("%w: %w", challenge.ErrInvalidPayload, err)
+	}
+	return detail, nil
+}
+
+// leakyStepUpHandler is stepUpHandler with the mistake this unit exists to
+// prevent: it publishes the stored detail instead of a chosen field. It is the
+// mutation the secret tests are pointed at.
+type leakyStepUpHandler struct{ stepUpHandler }
+
+func (*leakyStepUpHandler) View(_ context.Context, req challenge.ViewRequest) (challenge.View, error) {
+	detail, err := decodeStepUpDetail(req.Detail)
+	if err != nil {
+		return challenge.View{}, err
+	}
+	return challenge.View{AuthorizationURL: detail.AuthURL + "#" + detail.Correlator}, nil
+}
+
+// mfaPolicy demands a delegated MFA challenge and nothing else.
+func mfaPolicy(id string) *policy.Policy {
+	return &policy.Policy{
+		ID:        id,
+		Subject:   "user",
+		Resource:  "account",
+		Actions:   []string{"transfer"},
+		Condition: policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+		Challenges: []policy.Challenge{
+			policy.MFA{Mode: policy.MFADelegated, ACRValues: []string{"urn:stamp:acr:mfa"}},
+		},
+	}
+}
+
+// quorumAndDelayPolicy is the two kinds that publish nothing, in one decision.
+func quorumAndDelayPolicy(id string, threshold int, approvers ...string) *policy.Policy {
+	return &policy.Policy{
+		ID:        id,
+		Subject:   "user",
+		Resource:  "account",
+		Actions:   []string{"transfer"},
+		Condition: policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+		Challenges: []policy.Challenge{
+			policy.Quorum{Threshold: threshold, Approvers: policy.ApproverSet{Members: approvers}},
+			policy.Delay{Duration: time.Hour},
+		},
+	}
+}
+
+// mfaAndQuorumPolicy pairs a kind that publishes something with one that does
+// not, so a single decision exercises both branches of the type assertion.
+func mfaAndQuorumPolicy(id string, approvers ...string) *policy.Policy {
+	return &policy.Policy{
+		ID:        id,
+		Subject:   "user",
+		Resource:  "account",
+		Actions:   []string{"transfer"},
+		Condition: policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+		Challenges: []policy.Challenge{
+			policy.MFA{Mode: policy.MFADelegated, ACRValues: []string{"urn:stamp:acr:mfa"}},
+			policy.Quorum{Threshold: 1, Approvers: policy.ApproverSet{Members: approvers}},
+		},
+	}
 }
 
 func contains(values []string, want string) bool {

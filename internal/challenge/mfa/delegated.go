@@ -130,11 +130,12 @@ type recentIssue struct {
 	detail Detail
 }
 
-// Compile-time proof that the handler serves the whole contract, including the
-// optional read rule.
+// Compile-time proof that the handler serves the whole contract, including both
+// optional interfaces: the read rule and the publishable view.
 var (
 	_ challenge.Handler  = (*Delegated)(nil)
 	_ challenge.Targeter = (*Delegated)(nil)
+	_ challenge.Viewer   = (*Delegated)(nil)
 )
 
 // NewDelegated builds the handler, refusing a configuration that would leave
@@ -410,6 +411,28 @@ func (d *Delegated) Status(_ context.Context, req challenge.StatusRequest) (chal
 		}
 	}
 	return challenge.Status{State: state, Have: have, Need: 1, Deadline: req.Deadline}, nil
+}
+
+// View implements [challenge.Viewer]: it answers with the step-up destination
+// and with nothing else on the row.
+//
+// A delegated MFA challenge is the one kind a caller cannot make progress on
+// without being told something. The other three are completed by other people,
+// by waiting, or by a system that was handed its own callback at issue; this one
+// needs a browser sent somewhere, and until this seam existed the address was
+// stored and never published (#41).
+//
+// One field crosses. The correlator is a binding value the completion has to
+// carry, the nonce ties a token to this request, and neither is a caller's to
+// hold — so this is a copy of a named field and never a copy of the detail. A
+// CIBA challenge publishes nothing at all: its `auth_req_id` addresses the token
+// exchange, not the subject, and there is nowhere to send anybody.
+func (d *Delegated) View(_ context.Context, req challenge.ViewRequest) (challenge.View, error) {
+	detail, err := DecodeDetail(req.Detail)
+	if err != nil {
+		return challenge.View{}, err
+	}
+	return challenge.View{AuthorizationURL: detail.AuthorizationURL}, nil
 }
 
 // IsTarget implements [challenge.Targeter] for R40's read rule.
