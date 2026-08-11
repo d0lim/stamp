@@ -1,0 +1,244 @@
+---
+# Source: stamp/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stamp
+  labels:
+    helm.sh/chart: stamp-0.1.0
+    app.kubernetes.io/name: stamp
+    app.kubernetes.io/instance: stamp
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: stamp
+    stamp.dev/topology: all-in-one
+# The process talks to Postgres and to the IdP. It reads nothing from the
+# Kubernetes API, so it is given no token to read it with.
+automountServiceAccountToken: false
+---
+# Source: stamp/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stamp-env
+  labels:
+    helm.sh/chart: stamp-0.1.0
+    app.kubernetes.io/name: stamp
+    app.kubernetes.io/instance: stamp
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: stamp
+    stamp.dev/topology: all-in-one
+data:
+  STAMP_OIDC_ISSUER: "https://idp.example"
+  STAMP_OIDC_JWKS_URL: "https://idp.example/.well-known/jwks.json"
+  STAMP_OIDC_AUDIENCE: "stamp"
+  STAMP_OIDC_WORKLOAD_CLIENTS: "pep-1"
+  STAMP_OIDC_ALLOW_INSECURE_TRANSPORT: "false"
+
+  STAMP_DB_MAX_CONNS: "24"
+  STAMP_EGRESS_ALLOW: "https://risk.internal.example"
+  STAMP_EGRESS_ALLOW_LOOPBACK: "false"
+  STAMP_EGRESS_ALLOW_PRIVATE: "false"
+  STAMP_FACT_ALLOW_FAIL_OPEN: "false"
+
+  STAMP_AUDIT_FAIL_CLOSED: "true"
+
+  STAMP_AUTHORING_MODE: "both"
+  STAMP_GOVERNANCE_PROPOSER_MAY_APPROVE: "false"
+  STAMP_CONSOLE_OIDC_CLIENT_ID: "stamp-console"
+  STAMP_CONSOLE_OIDC_AUTHORIZATION_ENDPOINT: "https://idp.example/authorize"
+  STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT: "https://idp.example/token"
+  STAMP_CONSOLE_ALLOW_INSECURE_TRANSPORT: "false"
+---
+# Source: stamp/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: stamp
+  labels:
+    helm.sh/chart: stamp-0.1.0
+    app.kubernetes.io/name: stamp
+    app.kubernetes.io/instance: stamp
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: stamp
+    stamp.dev/topology: all-in-one
+    app.kubernetes.io/component: all
+spec:
+  type: ClusterIP
+  # A Service publishes exactly the surfaces its tier binds. A check tier has no
+  # console port to reach even by mistake, which is the point of splitting the
+  # listeners rather than the paths.
+  ports:
+    - name: pep
+      port: 8080
+      targetPort: pep
+      protocol: TCP
+    - name: console
+      port: 8081
+      targetPort: console
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: stamp
+    app.kubernetes.io/instance: stamp
+    app.kubernetes.io/component: all
+---
+# Source: stamp/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stamp
+  labels:
+    helm.sh/chart: stamp-0.1.0
+    app.kubernetes.io/name: stamp
+    app.kubernetes.io/instance: stamp
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: stamp
+    stamp.dev/topology: all-in-one
+    app.kubernetes.io/component: all
+    stamp.dev/roles: "all"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stamp
+      app.kubernetes.io/instance: stamp
+      app.kubernetes.io/component: all
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: stamp-0.1.0
+        app.kubernetes.io/name: stamp
+        app.kubernetes.io/instance: stamp
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: stamp
+        stamp.dev/topology: all-in-one
+        app.kubernetes.io/component: all
+      annotations:
+        checksum/config: 8631451cced223e54c4a15acfd29c07a8f7b819a4305b2f05b9819d891b42638
+    spec:
+      serviceAccountName: stamp
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stamp
+          image: "ghcr.io/d0lim/stamp:0.1.0"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          # One image, one flag. This is the only argument that differs between
+          # the all-in-one topology and the split one.
+          args:
+            - --roles=all
+          ports:
+            - name: pep
+              containerPort: 8080
+              protocol: TCP
+            - name: console
+              containerPort: 8081
+              protocol: TCP
+          env:
+            # R42: the connection string is a credential and arrives by
+            # reference. Each tier reads its own Secret, which is how per-role
+            # database privileges reach the process (R39) — the grant lives on
+            # the login, not in the manifest.
+            - name: STAMP_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: "stamp-db"
+                  key: "dsn"
+            # An empty address unbinds a surface; an absent variable would bind
+            # it to its default. A tier says what it does not serve.
+            - name: STAMP_PEP_ADDR
+              value: ":8080"
+            - name: STAMP_CONSOLE_ADDR
+              value: ":8081"
+            - name: STAMP_CALLBACK_ADDR
+              value: ""
+            - name: STAMP_DB_MIGRATE
+              value: "true"
+            - name: STAMP_DB_APPLY_GRANTS
+              value: "true"
+            # R32 and R42. The api role is the only one that registers the
+            # checkpointer, so these six variables are rendered on this tier and
+            # on no other — the key is mounted where it is used, and a check tier
+            # compromised through the PEP surface holds no key that could sign a
+            # replacement for the evidence of its own compromise.
+            #
+            # Every one of them is a path or a scalar. There is no variable here
+            # that a key's bytes could be written into, because the binary has
+            # none: a private key handed over in the environment is a key in the
+            # process listing, in `docker inspect` and in the values that
+            # produced this manifest.
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_FILE
+              value: "/etc/stamp/checkpoint/signing-key.pem"
+            - name: STAMP_AUDIT_CHECKPOINT_KEY_ID
+              value: "stamp-2026-08"
+            - name: STAMP_AUDIT_CHECKPOINT_SINK_FILE
+              value: "/var/lib/stamp/checkpoints/checkpoints.jsonl"
+            # STAMP_AUDIT_WRITER_ID is deliberately unset: exactly one live
+            # process may hold a writer identifier, and the default derives one
+            # from the pod's hostname. Setting it to a literal here would make
+            # the second replica fail to boot.
+          envFrom:
+            - configMapRef:
+                name: stamp-env
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: pep
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: pep
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: checkpoint-key
+              mountPath: "/etc/stamp/checkpoint/signing-key.pem"
+              subPath: "signing-key.pem"
+              readOnly: true
+            # The one writable path in this container, and the reason
+            # readOnlyRootFilesystem can stay on. The sink is append-only and
+            # holds no credential — a checkpoint is a signature over public
+            # chain heads — so it is the only mount here that is not a Secret
+            # and not read-only.
+            - name: checkpoint-sink
+              mountPath: "/var/lib/stamp/checkpoints"
+      # The documents are mounted, not templated: three of the six may carry a
+      # credential and none of them may appear in a manifest. The signing key is
+      # mounted for the same reason and a stronger one — the chart has no field
+      # its bytes could have been written into.
+      volumes:
+        - name: checkpoint-key
+          secret:
+            secretName: "stamp-checkpoint-key"
+            defaultMode: 0400
+            items:
+              - key: "signing-key.pem"
+                path: "signing-key.pem"
+        - name: checkpoint-sink
+          # An emptyDir loses the file when the pod is replaced, and the series
+          # survives anyway: the repair pass at the head of each tick
+          # republishes from the database every checkpoint this host's copy is
+          # missing, so a restarted pod converges on the whole series rather
+          # than starting a new one. Give sink.file.volume a claim if you want
+          # the file itself to persist.
+          emptyDir: {}

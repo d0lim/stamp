@@ -1,0 +1,63 @@
+# A release the chart is supposed to refuse, kept as an input so that the
+# refusal is a gate rather than a claim.
+#
+# It is values-split.yaml with the api tier switched off and the checkpoints
+# left on. Every manifest it would produce is valid, every pod would start and
+# report itself healthy, and no process in the release would record a single
+# checkpoint: internal/runtime/wiring.go registers the checkpointer under the
+# api role alone. The operator who wrote a signing key into these values would
+# have a deployment they believe is tamper-evident and is not.
+#
+# deploy/helm/render.sh renders this and requires a non-zero exit, and keeps the
+# chart's own message in deploy/helm/snapshots/split-no-api.err.txt so that
+# internal/release can assert what the refusal says without needing helm.
+topology: split
+
+image:
+  repository: ghcr.io/d0lim/stamp
+  tag: ""
+
+listeners:
+  callback:
+    enabled: true
+
+oidc:
+  issuer: https://idp.example
+  jwksUrl: https://idp.example/.well-known/jwks.json
+  audience: stamp
+
+database:
+  credentials:
+    check:
+      secretName: stamp-db-check
+      key: dsn
+    decide:
+      secretName: stamp-db-decide
+      key: dsn
+    consumer:
+      secretName: stamp-db-consumer
+      key: dsn
+    console:
+      secretName: stamp-db-console
+      key: dsn
+
+audit:
+  checkpoint:
+    enabled: true
+    keyId: stamp-2026-08
+    signingKey:
+      secretName: stamp-checkpoint-key
+      key: signing-key.pem
+
+roles:
+  check:
+    enabled: true
+  decide:
+    enabled: true
+  consumer:
+    enabled: true
+  # The whole of the difference from values-split.yaml.
+  api:
+    enabled: false
+  console:
+    enabled: true

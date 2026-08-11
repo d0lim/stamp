@@ -1,0 +1,29 @@
+apiVersion: v2
+name: stamp
+description: |
+  Stateful authorization for multi-party approvals. One image, two topologies:
+  all-in-one, or a tier per role.
+type: application
+
+# The chart version and the application version move together: the release
+# workflow stamps both from the git tag, so a chart pulled at 1.2.3 installs the
+# image tagged 1.2.3 and nothing else has to be kept in step by hand.
+version: 0.1.0
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/d0lim/stamp
+sources:
+  - https://github.com/d0lim/stamp
+keywords:
+  - authorization
+  - policy
+  - approvals
+  - authzen
+maintainers:
+  - name: d0lim
+    url: https://github.com/d0lim
+annotations:
+  # The two topologies are the chart's whole reason to exist; a values file that
+  # only scales replicas would not need one.
+  stamp.dev/topologies: "all-in-one,split"

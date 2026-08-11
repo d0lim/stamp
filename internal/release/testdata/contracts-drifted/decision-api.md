@@ -1,0 +1,8 @@
+---
+contract: decision-api
+version: 1.0.0
+---
+
+# Fixture: correctly versioned
+
+Present so that the drift fixture fails for one reason and not three.

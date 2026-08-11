@@ -1,0 +1,188 @@
+# The split topology: one Deployment per role (D14).
+#
+# What actually differs from all-in-one, and why it is a topology rather than a
+# replica count:
+#
+#   - five Deployments, each started with a different --roles value from the
+#     same image;
+#   - five database logins, each granted one of the roles internal/store's
+#     grants file provisions, so a compromised check tier holds credentials that
+#     cannot write a policy (R39);
+#   - the listeners are split, not merely scaled: the check tier binds the PEP
+#     surface and unbinds the console one, the api and console tiers bind the
+#     console surface and unbind the PEP one, and the consumer tier binds only
+#     the callback surface where HTTP velocity ingest is mounted;
+#   - only the api tier migrates and applies grants;
+#   - the console is served by a tier that serves no API, and the API is served
+#     by a tier that serves no console (R51), which is why the bundle needs an
+#     API base address to call.
+#
+# It is also the input to deploy/helm/snapshots/split.yaml.
+topology: split
+
+image:
+  repository: ghcr.io/d0lim/stamp
+  tag: ""
+
+listeners:
+  pep:
+    port: 8080
+  console:
+    port: 8081
+  callback:
+    # The consumer role serves HTTP velocity ingest on this surface, and the
+    # decide role receives external challenge completions and the MFA step-up
+    # return on it. A split deployment that runs either needs it bound.
+    enabled: true
+    port: 8082
+
+oidc:
+  issuer: https://idp.example
+  jwksUrl: https://idp.example/.well-known/jwks.json
+  audience: stamp
+  workloadClients:
+    - pep-1
+    - svc-payments
+
+approverIssuer: https://idp.example
+
+database:
+  # One login per tier. The Secrets already exist; the chart creates none.
+  credentials:
+    check:
+      secretName: stamp-db-check
+      key: dsn
+    decide:
+      secretName: stamp-db-decide
+      key: dsn
+    consumer:
+      secretName: stamp-db-consumer
+      key: dsn
+    api:
+      secretName: stamp-db-api
+      key: dsn
+    console:
+      secretName: stamp-db-console
+      key: dsn
+  migrate: true
+  applyGrants: true
+
+egress:
+  allow:
+    - https://risk.internal.example
+    - https://directory.internal.example
+    - https://audit-sink.internal.example
+
+# R49: this deployment authors policy from files and closes the console's
+# policy authoring. The approval inbox, the audit views, the dry run and the
+# lock stay open — no mode closes those.
+authoring:
+  mode: file
+
+governance:
+  minApprovers: 2
+
+# R32 across five tiers. One of them records checkpoints — the api tier, because
+# that is the role the composition root registers the checkpointer under — and
+# the rendered manifest shows the signing key mounted there and nowhere else.
+# The rotation this deployment has already been through is in verifyKeys: the
+# checkpoints stamp-2026-05 signed stay verifiable without being re-signed.
+audit:
+  checkpoint:
+    enabled: true
+    keyId: stamp-2026-08
+    signingKey:
+      secretName: stamp-checkpoint-key
+      key: signing-key.pem
+    verifyKeys:
+      secretName: stamp-checkpoint-verify
+      keys:
+        - id: stamp-2026-05
+          key: stamp-2026-05.pub.pem
+    sink:
+      file:
+        enabled: true
+        # This tier's copy of the sink outlives the pod, so the repair pass has
+        # nothing to republish on a routine restart.
+        volume:
+          persistentVolumeClaim:
+            claimName: stamp-checkpoints
+      # An addition, never a replacement, and its origin is in egress.allow
+      # above because every outbound call this process makes goes through the
+      # same gate.
+      webhook: https://audit-sink.internal.example/checkpoints
+    interval: 1m
+
+console:
+  # R51 with R50: the console tier serves no API, so the bundle is told where
+  # the api tier is published. This is a browser-reachable address, and the CSP
+  # on every console response names it and the IdP and nothing else.
+  apiBaseUrl: https://stamp-api.example
+  oidc:
+    clientId: stamp-console
+    authorizationEndpoint: https://idp.example/authorize
+    tokenEndpoint: https://idp.example/token
+    endSessionEndpoint: https://idp.example/logout
+
+callbackBaseUrl: https://stamp-callback.example
+
+mfa:
+  acrValues:
+    - urn:example:acr:mfa
+  authorizationEndpoint: https://idp.example/authorize
+  clientId: stamp-stepup
+  redirectUri: https://stamp-callback.example/mfa/return
+  ciba:
+    backchannelEndpoint: https://idp.example/ciba
+    tokenEndpoint: https://idp.example/token
+    clientId: stamp-ciba
+    clientSecret:
+      # By reference. The chart has no field that would hold the value.
+      secretName: stamp-ciba
+      key: client-secret
+
+kafka:
+  brokers:
+    - kafka-0.kafka:9092
+  group: stamp-consumer
+
+documents:
+  factSources:
+    secretName: stamp-fact-sources
+    key: fact-sources.json
+  streamSources:
+    secretName: stamp-stream-sources
+    key: stream-sources.json
+  ingestCredentials:
+    secretName: stamp-ingest-credentials
+    key: ingest-credentials.json
+  externalTargets:
+    secretName: stamp-external-targets
+    key: external-targets.json
+  idpGroupSources:
+    secretName: stamp-idp-group-sources
+    key: idp-group-sources.json
+  kafkaTopics:
+    secretName: stamp-kafka-topics
+    key: kafka-topics.json
+
+roles:
+  check:
+    enabled: true
+    replicas: 3
+    resources:
+      requests:
+        cpu: "1"
+        memory: 512Mi
+  decide:
+    enabled: true
+    replicas: 2
+  consumer:
+    enabled: true
+    replicas: 2
+  api:
+    enabled: true
+    replicas: 2
+  console:
+    enabled: true
+    replicas: 2

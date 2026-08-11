@@ -159,6 +159,42 @@ jobs:
           path: console/playwright-report/
           retention-days: 7
 
+  # The Verification Contract's chart row. The assertions about what the chart
+  # renders are Go tests over committed snapshots, which run in the `test` job
+  # and need no helm; this job is the other half of that pin — it re-renders and
+  # fails on a diff, so a chart edit cannot land with the snapshots, and
+  # therefore the assertions, describing the previous chart.
+  chart:
+    name: helm lint and snapshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+      - name: lint both topologies and diff the snapshots
+        run: deploy/helm/render.sh --check
+      # The rendering has to be a manifest the API server would accept, which
+      # helm lint does not check: it validates the chart, not the Kubernetes
+      # objects. -strict rejects unknown fields, which is how a typo in a field
+      # name is caught rather than silently ignored on apply.
+      - name: the rendered manifests are valid Kubernetes objects
+        uses: docker://ghcr.io/yannh/kubeconform:latest
+        with:
+          args: >-
+            -strict -summary -kubernetes-version 1.30.0
+            deploy/helm/snapshots/all-in-one.yaml
+            deploy/helm/snapshots/split.yaml
+
+  # R11 as a merge gate and not only a release gate: the three public contract
+  # specifications stay in step with the constants the code ships.
+  contracts:
+    name: public contract versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/check-contract-versions.sh
+
   docker:
     name: docker build
     # The image build runs the console build inside its own stage, so a console

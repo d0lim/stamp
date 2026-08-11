@@ -1,0 +1,12 @@
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+.idea/
+.vscode/
+# The rendered snapshots live beside the chart and are inputs to a test, not
+# part of the packaged artifact.
+../snapshots/
+# A values file the chart is supposed to refuse. It is a test input, and
+# shipping it beside the two worked examples would read as a third one.
+values-split-no-api.yaml
