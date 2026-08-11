@@ -116,7 +116,7 @@ release-dryrun: ## Build the release artifacts locally, publishing nothing
 # enforcement. Running them from a pre-push hook is the one mechanism
 # available before the repository goes public.
 .PHONY: land
-land: fmt-check vet lint test vulncheck ## Run every gate a PR must pass before it lands
+land: fmt-check vet lint test vulncheck chart-check contracts ## Run every gate a PR must pass before it lands
 	@echo "land: all gates passed"
 
 .PHONY: hooks
