@@ -8,32 +8,47 @@
 -- for an authorization they were already asked about. Those decisions are
 -- orphans in the exact sense the issue names: nothing the caller holds refers to
 -- them, and they sit open until they expire.
+--
+-- **Everything in this file is catalog-only on purpose.** internal/store/migrate.go
+-- sends a migration file to Postgres in one Exec, so every statement here runs
+-- inside one implicit transaction and every lock any of them takes is held until
+-- the last one commits. `decisions` is the table the decide path reads and writes
+-- on every request and it is never pruned — internal/store/buckets.go sweeps
+-- `processed_events` and `velocity_buckets` and nothing else — so it is the
+-- largest table in the deployment and the one an ACCESS EXCLUSIVE lock hurts
+-- most. Migrations run at pod boot against a live cluster
+-- (internal/runtime/wiring.go), with no lock_timeout and no statement_timeout
+-- configured anywhere, so a scan held under that lock is an outage measured in
+-- however long the scan takes.
+--
+-- Both statements below take ACCESS EXCLUSIVE and neither scans the heap:
+-- ADD COLUMN of a nullable column with no default is a catalog write since
+-- Postgres 11, and a CHECK added NOT VALID is a catalog write by definition. The
+-- unique index — the one thing here that must read every row — moved out to
+-- 000009, where it can be built CONCURRENTLY.
 ALTER TABLE decisions ADD COLUMN idempotency_key text;
-
--- The key is scoped to the caller and never global. Two workloads that number
--- their retries the same way are two callers; collapsing them would hand one
--- workload a decision identifier the other created, which R40 then lets it read.
---
--- **This index is the backstop and not the mechanism.** The lookup that makes a
--- retry cheap lives in the decide path ahead of the evaluation, because a
--- decision issues its challenges before its row is written — so a key enforced
--- only here would still reach the IdP once per retry and refuse afterwards,
--- which is the failure this column exists to prevent rather than a fix for it.
--- What the index is for is the case the lookup structurally cannot cover: two
--- concurrent attempts that both read no row. One of them lands, the other gets
--- 23505 and reads the winner's decision, and the callers converge.
---
--- Partial, so that the decisions nobody named — every decision written before
--- this migration and every keyless decide after it — do not collide with each
--- other on a NULL. Postgres would not collide them anyway, since NULLs are
--- distinct in a unique index; the predicate says so out loud and keeps the index
--- to the rows that can actually conflict.
-CREATE UNIQUE INDEX decisions_unique_idempotency_key
-    ON decisions (caller_id, idempotency_key)
-    WHERE idempotency_key IS NOT NULL;
 
 -- A bound on what a caller can make the engine store and index. The surface
 -- refuses an over-long key before it reaches here; this is the same rule stated
 -- where it cannot be bypassed by a second write path.
+--
+-- `octet_length` and not `char_length`, because bytes are what the surface
+-- bounds: internal/api/decisions.go compares `len(key)` against
+-- MaxIdempotencyKeyBytes, and `len` on a Go string is bytes. The two agree on
+-- ASCII and diverge on everything else — 255 Korean characters are 765 bytes,
+-- which the surface refuses and a char_length check would admit. The whole point
+-- of restating the rule here is the writer that is *not* the HTTP surface, which
+-- is exactly the case where a check counting different units than the surface
+-- lets through what the surface would have refused.
+--
+-- NOT VALID, because validating it is a second full scan of `decisions` under
+-- ACCESS EXCLUSIVE and there is provably nothing to find: the column was created
+-- by the statement above, so every existing row holds NULL and NULL satisfies
+-- this predicate. NOT VALID only means "Postgres has not proved this about the
+-- rows that were already here"; it is enforced in full against every INSERT and
+-- UPDATE from the moment it exists, which is the entire job the constraint has.
+-- A later `VALIDATE CONSTRAINT` would take only SHARE UPDATE EXCLUSIVE and could
+-- be run by hand if some future planner transformation wanted the proof; nothing
+-- in this repository does, so it is not run here.
 ALTER TABLE decisions ADD CONSTRAINT decisions_idempotency_key_length
-    CHECK (idempotency_key IS NULL OR char_length(idempotency_key) BETWEEN 1 AND 255);
+    CHECK (idempotency_key IS NULL OR octet_length(idempotency_key) BETWEEN 1 AND 255) NOT VALID;

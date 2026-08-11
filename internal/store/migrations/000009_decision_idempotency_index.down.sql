@@ -1,0 +1,13 @@
+-- Drop the backstop and leave the column, the check and every row alone.
+--
+-- CONCURRENTLY on the way down for the same reason as on the way up: a plain
+-- DROP INDEX takes ACCESS EXCLUSIVE on `decisions` for as long as the drop takes,
+-- and this runs at pod boot against a live cluster. IF EXISTS because this is
+-- also the recovery path for a build that died half-finished: an interrupted
+-- CREATE INDEX CONCURRENTLY leaves an INVALID index holding the name, and this
+-- statement removes it whether it is valid, invalid, or absent entirely.
+--
+-- One statement, for the reason the up file spells out: DROP INDEX CONCURRENTLY
+-- cannot run inside a transaction block either, and a second statement in this
+-- file would put it in one.
+DROP INDEX CONCURRENTLY IF EXISTS decisions_unique_idempotency_key;

@@ -1,0 +1,52 @@
+-- The unique index that backstops the idempotency key, built without locking
+-- writers out of `decisions` (#47(a)).
+--
+-- The key is scoped to the caller and never global. Two workloads that number
+-- their retries the same way are two callers; collapsing them would hand one
+-- workload a decision identifier the other created, which R40 then lets it read.
+--
+-- **This index is the backstop and not the mechanism.** The lookup that makes a
+-- retry cheap lives in the decide path ahead of the evaluation, because a
+-- decision issues its challenges before its row is written — so a key enforced
+-- only here would still reach the IdP once per retry and refuse afterwards,
+-- which is the failure this column exists to prevent rather than a fix for it.
+-- What the index is for is the case the lookup structurally cannot cover: two
+-- concurrent attempts that both read no row. One of them lands, the other gets
+-- 23505 and reads the winner's decision, and the callers converge.
+--
+-- Partial, so that the decisions nobody named — every decision written before
+-- 000008 and every keyless decide after it — do not collide with each other on a
+-- NULL. Postgres would not collide them anyway, since NULLs are distinct in a
+-- unique index; the predicate says so out loud and keeps the index to the rows
+-- that can actually conflict. It does not make the build cheap: a partial index
+-- still reads every heap tuple to decide which ones qualify, which is why this
+-- is CONCURRENTLY and why it is alone in this file.
+--
+-- **The name is load-bearing.** internal/store/decisions.go's isUniqueViolationOn
+-- matches this string against the constraint name on a 23505 to tell "this
+-- caller already used this key" from "two decisions collided on an identifier".
+-- Renaming the index turns a retry into an internal error.
+--
+-- **This file must hold exactly one statement.** internal/store/migrate.go sends
+-- a migration file to Postgres in a single Exec with no arguments, which pgx
+-- routes through the simple query protocol; Postgres wraps a multi-statement
+-- simple query in an implicit transaction block, and CREATE INDEX CONCURRENTLY
+-- refuses to run inside one (SQLSTATE 25001). A one-statement file is not a
+-- transaction block, so the build is legal. Adding a second statement here —
+-- even something as small as a VALIDATE CONSTRAINT — breaks this migration, not
+-- just makes it slower. Comments do not count: the parser sees one statement.
+--
+-- **What a failed build leaves behind.** CONCURRENTLY buys its lock-free build
+-- by giving up atomicity: if the build fails, or a deadlock is detected, or the
+-- pod is killed mid-scan, Postgres leaves an INVALID index behind that is
+-- maintained by every subsequent write but used by no query and enforces no
+-- uniqueness. golang-migrate additionally marks the schema dirty at version 9,
+-- which makes the next Migrate refuse rather than retry — a retry that ran this
+-- statement again would fail on the name the corpse already holds. Recovery is
+-- to roll this migration back: 000009's down is a single DROP INDEX
+-- CONCURRENTLY IF EXISTS, which removes an INVALID index as readily as a valid
+-- one and takes no lock that blocks the decide path, and then to migrate up
+-- again. Until then the deployment is running on 000008 — the column and its
+-- CHECK exist, so the decide path's own idempotency lookup works and only the
+-- concurrent-retry backstop is missing.
+CREATE UNIQUE INDEX CONCURRENTLY decisions_unique_idempotency_key ON decisions (caller_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
