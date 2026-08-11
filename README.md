@@ -15,6 +15,25 @@ Two evaluation paths share one policy model:
 - **`check()`** — stateless, high-QPS, immediate. AuthZEN-compatible.
 - **`decide()`** — creates a decision that stays `pending` while challenges are collected, then resolves to allow, deny, or expired.
 
+## Trying it
+
+```sh
+scripts/quickstart.sh
+```
+
+Brings up Postgres, Keycloak and one STAMP process, loads an example policy set
+from files, and then drives it: a `check`, a `decide` that waits for two of
+three named approvers, a velocity limit closed by an event stream, a policy
+authored through the API the console calls and approved out of the inbox, the
+same set exported to files and applied back unchanged, and `stamp audit verify`
+over the resulting chain. It needs `docker`, `curl`, `jq` and `openssl`, and no
+Go toolchain.
+
+That script is the procedure and [`docs/quickstart.md`](docs/quickstart.md)
+explains it; CI runs it on both demo profiles on every pull request, which is
+what keeps the two from drifting. The bundle itself is documented in
+[`deploy/demo/README.md`](deploy/demo/README.md).
+
 ## Running it
 
 One image serves every topology. `--roles` is the only difference between an all-in-one install and a scaled-out one.
@@ -223,6 +242,10 @@ Contributions follow the landing strategy in the plan: one implementation unit p
 
 | Document | What it holds |
 |---|---|
+| [`docs/quickstart.md`](docs/quickstart.md) | The demo bundle and the script that drives it end to end |
+| [`docs/security.md`](docs/security.md) | The trust boundary, how secrets arrive, and what the demo does that you must not |
+| [`docs/break-glass.md`](docs/break-glass.md) | The offline recovery procedure for an unreachable governance quorum |
+| [`docs/file-authoring.md`](docs/file-authoring.md) | Authoring policy as a directory, and how it relates to the console |
 | [`STRATEGY.md`](STRATEGY.md) | Target problem, approach, who it's for, what we're not building |
 | [`docs/plans/2026-08-07-001-feat-stamp-feature-map-plan.md`](docs/plans/2026-08-07-001-feat-stamp-feature-map-plan.md) | What v1 is and how it gets built — requirements, units, verification, landing strategy |
 | [`docs/decisions/stamp-decision-log.md`](docs/decisions/stamp-decision-log.md) | Why it has this shape, and which alternatives were rejected |

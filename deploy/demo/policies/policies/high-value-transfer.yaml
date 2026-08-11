@@ -1,0 +1,38 @@
+# The decision path.
+#
+# A policy carrying a challenge cannot be satisfied by check(): the stateless
+# path answers `requires_decision` and denies, because there is nowhere for a
+# pending approval to live in a request that returns immediately. The same
+# policy through decide() opens a quorum challenge and the decision stays
+# pending until two of the three named approvers submit.
+#
+# The approvers are bare identifiers. STAMP qualifies them with
+# STAMP_APPROVER_ISSUER before comparing, because `ann` at one IdP and `ann` at
+# another are different people; the demo realm gives its users these exact
+# values as their token `sub`.
+apiVersion: stamp/v1
+kind: Policy
+id: high-value-transfer
+description: A domestic transfer of 10,000 or more needs two of the three named approvers.
+subject: user
+resource: transfer
+actions:
+  - execute
+condition:
+  all:
+    - left:
+        field: resource.destination
+      op: ne
+      right: offshore
+    - left:
+        field: resource.amount
+      op: ge
+      right: 10000.0
+challenges:
+  - type: quorum
+    threshold: 2
+    approvers:
+      members:
+        - ann
+        - bob
+        - cid
