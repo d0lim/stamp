@@ -289,6 +289,23 @@ type Config struct {
 	ChallengeIssueSubjectCeiling stream.RateLimit
 	ApprovalSubmitRate           stream.RateLimit
 
+	// CancellationRate is R43's bound on delay cancellation, per authority. A
+	// zero field selects [api.DefaultCancellationRate] for that field; a
+	// negative rate removes the limit.
+	//
+	// It is the fifth write surface and the last one to get a budget. What it
+	// bounds is not the cost of a cancellation that works — that one denies the
+	// decision and there is nothing left to cancel — but the cost of one that is
+	// refused: a caller without standing on an existing decision makes the
+	// lifecycle write an access-refused entry through a synchronous chain
+	// append, on the serialized audit write path, and that is reachable for the
+	// whole life of the decision rather than only while it is pending. The
+	// default is tighter than ApprovalSubmitRate because the action is rarer;
+	// api.DefaultCancellationRate says how much rarer and why.
+	//
+	// **Per instance**, like every budget above.
+	CancellationRate stream.RateLimit
+
 	// GovernanceFloor is R33's operator lower bound on a revision quorum.
 	GovernanceFloor revision.Floor
 	// RevisionTTL bounds how long a revision may stay pending. Zero selects
@@ -744,6 +761,8 @@ const (
 	EnvChallengeIssueCeilingBurst = "STAMP_CHALLENGE_ISSUE_SUBJECT_CEILING_BURST"
 	EnvApprovalRate               = "STAMP_APPROVAL_RATE_PER_SECOND"
 	EnvApprovalBurst              = "STAMP_APPROVAL_RATE_BURST"
+	EnvCancellationRate           = "STAMP_CANCELLATION_RATE_PER_SECOND"
+	EnvCancellationBurst          = "STAMP_CANCELLATION_RATE_BURST"
 
 	EnvFloorMinApprovers       = "STAMP_GOVERNANCE_MIN_APPROVERS"
 	EnvFloorProposerMayApprove = "STAMP_GOVERNANCE_PROPOSER_MAY_APPROVE"
@@ -856,6 +875,10 @@ func ConfigFromEnv() (Config, error) {
 		ApprovalSubmitRate: stream.RateLimit{
 			PerSecond: envFloat(EnvApprovalRate, fail),
 			Burst:     envFloat(EnvApprovalBurst, fail),
+		},
+		CancellationRate: stream.RateLimit{
+			PerSecond: envFloat(EnvCancellationRate, fail),
+			Burst:     envFloat(EnvCancellationBurst, fail),
 		},
 		RevisionTTL:           envDuration(EnvRevisionTTL, 0, fail),
 		ReconcileInterval:     envDuration(EnvReconcileInterval, DefaultReconcileInterval, fail),
@@ -1017,13 +1040,14 @@ func ConfigFromEnv() (Config, error) {
 	//
 	// Every R43 budget is checked by the same function, because an operator who
 	// mistyped the approval burst is in exactly the position the decide burst's
-	// check exists for, and a limit that is only validated on one of four
-	// surfaces is a limit somebody can be silently without.
+	// check exists for, and a limit validated on four of R43's five write
+	// surfaces is a limit somebody can be silently without on the fifth.
 	checkRate(EnvDecideRate, EnvDecideBurst, cfg.DecideRate, fail)
 	checkRate(EnvDecideSubjectRate, EnvDecideSubjectRateBurst, cfg.DecideSubjectRate, fail)
 	checkRate(EnvChallengeIssueRate, EnvChallengeIssueBurst, cfg.ChallengeIssueRate, fail)
 	checkRate(EnvChallengeIssueCeilingRate, EnvChallengeIssueCeilingBurst, cfg.ChallengeIssueSubjectCeiling, fail)
 	checkRate(EnvApprovalRate, EnvApprovalBurst, cfg.ApprovalSubmitRate, fail)
+	checkRate(EnvCancellationRate, EnvCancellationBurst, cfg.CancellationRate, fail)
 
 	aliases, err := aliasesFrom(os.Getenv(EnvCheckPropertyAliases))
 	if err != nil {
