@@ -65,6 +65,7 @@ import (
 
 	"github.com/d0lim/stamp/internal/fact"
 	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // Protocol constants of the external challenge. They are exported because they
@@ -107,6 +108,16 @@ const (
 	// revalidation transaction, while that transaction holds a row lock on
 	// every open decision.
 	ExternalFailureRetargeted = "retargeted"
+
+	// ExternalFailureRateLimited is a notification that was not sent because the
+	// subject was over the per-subject dispatch budget (R43).
+	//
+	// It is the second word STAMP writes about itself, and it is its own word
+	// rather than a reuse of `transport` for the reason the whole vocabulary is
+	// closed: an operator reading a denied decision has to be able to tell "the
+	// target was unreachable" — which is an incident — from "we declined to call
+	// it" — which is this deployment working as configured.
+	ExternalFailureRateLimited = "rate_limited"
 )
 
 // Defaults for an operator who configures a target and leaves the timings
@@ -125,9 +136,26 @@ const (
 	// what stands between an unauthenticated caller and an allow.
 	MinExternalSecretBytes = 16
 
+	// DefaultMaxTrackedSubjects bounds the dispatch-budget table, for the reason
+	// [stream.Limiter] is bounded at all: its keys are subject identifiers, and
+	// an unbounded table would let whoever can name subjects grow this process.
+	DefaultMaxTrackedSubjects = 4096
+
 	// externalNonceBytes is the correlator width.
 	externalNonceBytes = 32
 )
+
+// DefaultExternalSubjectRate is how often one subject's decisions may cause an
+// outbound notification in a deployment that configured no budget (R43).
+//
+// It is looser than the step-up budget because what it spends is a machine's
+// attention rather than a person's, and tighter than the decide budget because
+// every unit of it is a request this deployment makes to somebody else's system
+// — a limit that fires here is STAMP declining to be the load in an incident on
+// a target it does not operate.
+//
+// An operator who wants no limit says so with a negative rate.
+var DefaultExternalSubjectRate = stream.RateLimit{PerSecond: 1, Burst: 10}
 
 // ErrTargetUnknown reports a policy naming a target the operator did not
 // configure. It wraps [ErrUnsupportedSpec]: to a caller it is a declaration
@@ -169,6 +197,12 @@ type ExternalConfig struct {
 	// MaxResponseBytes caps a target's acknowledgement body. Zero selects
 	// [DefaultExternalResponseBytes].
 	MaxResponseBytes int64
+	// SubjectRate bounds how often one subject's decisions may cause an outbound
+	// notification (R43). A zero field selects [DefaultExternalSubjectRate] for
+	// that field; a negative rate removes the limit.
+	SubjectRate stream.RateLimit
+	// MaxTrackedSubjects overrides [DefaultMaxTrackedSubjects].
+	MaxTrackedSubjects int
 }
 
 // External is the webhook round-trip handler.
@@ -178,6 +212,12 @@ type External struct {
 	gate        *fact.Gate
 	callbackURL string
 	maxBytes    int64
+
+	// The per-subject dispatch budget, charged at the instant the lifecycle
+	// supplies rather than at wall time — see [stream.Limiter.AllowAt] for why
+	// that needs more than a bare limiter.
+	limiter     *stream.Limiter
+	subjectRate stream.RateLimit
 }
 
 // External deliberately does not implement [Targeter]. Its counterparty is a
@@ -198,14 +238,21 @@ func NewExternal(cfg ExternalConfig) (*External, error) {
 		return nil, errors.New("challenge: an external handler needs an egress gate")
 	}
 	x := &External{
-		targets:  make(map[string]ExternalTarget, len(cfg.Targets)),
-		client:   cfg.Gate.HTTPClient(),
-		gate:     cfg.Gate,
-		maxBytes: cfg.MaxResponseBytes,
+		targets:     make(map[string]ExternalTarget, len(cfg.Targets)),
+		client:      cfg.Gate.HTTPClient(),
+		gate:        cfg.Gate,
+		maxBytes:    cfg.MaxResponseBytes,
+		subjectRate: cfg.SubjectRate,
 	}
 	if x.maxBytes <= 0 {
 		x.maxBytes = DefaultExternalResponseBytes
 	}
+	x.subjectRate = x.subjectRate.WithZeroDefault(DefaultExternalSubjectRate)
+	tracked := cfg.MaxTrackedSubjects
+	if tracked <= 0 {
+		tracked = DefaultMaxTrackedSubjects
+	}
+	x.limiter = stream.NewLimiter(tracked, time.Now)
 	if cfg.CallbackBaseURL != "" {
 		u, err := url.Parse(cfg.CallbackBaseURL)
 		if err != nil || !u.IsAbs() || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -333,6 +380,29 @@ func (x *External) Issue(ctx context.Context, req IssueRequest) (IssueResult, er
 		deadline = &by
 	}
 
+	// The budget is charged before the call and not after it, which is the whole
+	// point of standing here: a limit applied after the POST has not declined to
+	// make the POST. The refusal takes the shape every other refused round trip
+	// takes — a failed challenge — because there is no HTTP response of this
+	// handler's own to put a status code on. Issue answers the decide path, not
+	// the target.
+	//
+	// Shed says which kind of refusal it is, and it is what keeps this off the
+	// decision's record: on the decide path the lifecycle now answers a shed
+	// issuance with a retryable deny and no decision row at all, rather than
+	// storing a failed challenge and resolving the decision onto the subject's
+	// history. The word for *which* budget shed it stays on the row, where a
+	// revalidation can still write one.
+	if !x.allowNotify(req.Decision.SubjectID, req.Now) {
+		detail.Failure = ExternalFailureRateLimited
+		return IssueResult{
+			State:      StateFailed,
+			Shed:       true,
+			RetryAfter: x.subjectRate.RefillInterval(),
+			Detail:     detail,
+		}, nil
+	}
+
 	if err := x.notify(ctx, target, detail, req.Instance, req.Decision); err != nil {
 		// The timer goes with the wait: a challenge that is already failed has
 		// nothing to wake up for, and a deadline on it would have the sweeper
@@ -342,6 +412,40 @@ func (x *External) Issue(ctx context.Context, req IssueRequest) (IssueResult, er
 	}
 	detail.Acknowledged = true
 	return IssueResult{State: StatePending, Detail: detail, Deadline: deadline}, nil
+}
+
+// allowNotify charges one outbound notification against the subject's budget.
+//
+// The key follows the decide surface's convention — prefixed, so that adding a
+// second namespace to this table later cannot silently collide with this one —
+// and it is the subject identifier alone. Not the target: a subject's budget has
+// to be one budget, or a caller with two targets to name would have two of them.
+// Not the caller, because what is being bounded is how much of somebody else's
+// system this deployment will consume on one subject's account, and N callers
+// each holding a full budget is N times the flood arriving at the same webhook.
+//
+// **This deliberately keeps the shape mfa.Delegated.allowIssue just gave up.**
+// That handler was re-keyed on (caller, subject) because a subject-only bucket
+// at one token every twenty seconds could be held empty by anyone who could name
+// a person, and the refusal fell on that person. Neither half of that reasoning
+// carries here. This budget is 1/s bursting to 10 — three orders of magnitude
+// more traffic to hold down, and traffic a caller cannot send without being
+// visibly the source of it — and what a refusal here protects is a machine this
+// deployment does not operate, whose defence is precisely that the total is
+// bounded rather than the per-caller share. Re-keying would multiply the flood
+// this handler is willing to send at one webhook by the number of callers, which
+// is the failure this key exists to prevent. The two handlers diverge because
+// what they are protecting diverges, and this comment is here so that the
+// divergence reads as a decision rather than as one of them being unfinished.
+//
+// A decision with no subject identifier is not charged. It cannot be keyed, and
+// inventing a shared key for it would put every such decision in one bucket.
+func (x *External) allowNotify(subjectID string, now time.Time) bool {
+	subjectID = strings.TrimSpace(subjectID)
+	if subjectID == "" {
+		return true
+	}
+	return x.limiter.AllowAt("subject\x1f"+subjectID, x.subjectRate, 1, now)
 }
 
 // notify performs the outbound leg.
@@ -498,7 +602,12 @@ func (x *External) Status(_ context.Context, req StatusRequest) (Status, error) 
 			state = StatePending
 		}
 	}
-	return Status{State: state, Deadline: deadline}, nil
+	// The one failure the decision layer has to be able to name. Every other
+	// word in this handler's vocabulary — a blocked egress, a timeout, a
+	// transport fault — is a round trip that was attempted and went wrong; this
+	// one is a round trip this deployment declined to make, so the target was
+	// never told and the decision's ground is load shedding rather than refusal.
+	return Status{State: state, Deadline: deadline, Shed: detail.Failure == ExternalFailureRateLimited}, nil
 }
 
 // externalState maps a recorded verdict to a challenge state. Anything that is

@@ -24,11 +24,13 @@ import (
 // differently on purpose: the cap has to be exact across a fleet, and this one
 // has to be cheap enough to stand in front of an evaluation.
 //
-// These tests are about four claims. That the limit refuses. That its refusal
+// These tests are about five claims. That the limit refuses. That its refusal
 // is a deny a PEP can tell apart from a policy deny. That the refusal happens
 // before anything expensive runs — which is the only reason a rate limit is
-// worth having. And that the limiter itself cannot be turned into the memory
-// leak its keys would otherwise invite.
+// worth having. That the limiter itself cannot be turned into the memory leak
+// its keys would otherwise invite. And that the two budgets are two budgets all
+// the way down: not merely two keys in one bounded table, whose entries they
+// would then be competing for.
 
 // generous is a budget large enough not to be the limit under test, so that a
 // test about one budget is not silently also a test about the other.
@@ -348,41 +350,151 @@ func TestDecideBudgetsRefill(t *testing.T) {
 	}
 }
 
-// TestDecideRateLimiterTableIsBounded: the limiter's keys are request-derived —
-// the subject identifier comes out of the body — so an unbounded table would let
-// an authenticated caller grow this process's memory by inventing subjects.
+// TestDecideRateLimiterTablesAreBounded: the limiter's keys are request-derived
+// — the subject identifier comes out of the body — so an unbounded table would
+// let an authenticated caller grow this process's memory by inventing subjects.
 //
-// When the table is full it is swept of buckets that have refilled to full, and
-// a sweep that frees nothing refuses: a limiter that cannot record a charge has
+// When a table is full it is swept of buckets that have refilled to full, and a
+// sweep that frees nothing refuses: a limiter that cannot record a charge has
 // not applied a limit, and admitting the request unmetered is the one answer
 // that would make the bound exploitable rather than merely inconvenient.
-func TestDecideRateLimiterTableIsBounded(t *testing.T) {
-	f := newDecideFixture(t, decideOptions{
-		rate:           stream.RateLimit{PerSecond: 1000, Burst: 1000},
-		subjectRate:    stream.RateLimit{PerSecond: 1000, Burst: 1000},
-		maxRateEntries: 2,
-	})
-	token := f.workload(t, "svc-inventive")
+//
+// There are two tables and the bound is each table's own, so both halves are
+// exercised: a table that was bounded only in company with the other would be a
+// table nothing had checked.
+func TestDecideRateLimiterTablesAreBounded(t *testing.T) {
+	// Enormous budgets, so every refusal below is a full table and not a spent
+	// bucket.
+	huge := stream.RateLimit{PerSecond: 1000, Burst: 1000}
 
-	// The first request fills the table: one bucket for the caller, one for the
-	// subject. Both budgets are enormous, so nothing here is a rate refusal.
-	if rec := f.create(t, token, decideBodyFor("acct-0")); rec.Code != http.StatusCreated {
-		t.Fatalf("the first subject = %d %s", rec.Code, rec.Body.String())
-	}
-	// Every further subject has nowhere to be recorded, and no bucket has
-	// refilled to full, so each is refused rather than admitted unmetered.
-	for i := 1; i < 200; i++ {
-		rec := f.create(t, token, decideBodyFor(fmt.Sprintf("acct-%d", i)))
+	t.Run("the subject table", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{rate: huge, subjectRate: huge, maxRateEntries: 2})
+		token := f.workload(t, "svc-inventive")
+
+		// Two invented subjects fill the subject table. The caller's own table
+		// holds one entry and is not what is being filled here.
+		for i := range 2 {
+			rec := f.create(t, token, decideBodyFor(fmt.Sprintf("acct-%d", i)))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("subject %d = %d %s", i, rec.Code, rec.Body.String())
+			}
+		}
+		// Every further subject has nowhere to be recorded, and no bucket has
+		// refilled to full, so each is refused rather than admitted unmetered.
+		for i := 2; i < 200; i++ {
+			rec := f.create(t, token, decideBodyFor(fmt.Sprintf("acct-%d", i)))
+			if _, isDeny := denied(t, rec); !isDeny {
+				t.Fatalf("subject %d with the table full = %d %s, want a refusal", i, rec.Code, rec.Body.String())
+			}
+		}
+
+		// Once the buckets have refilled the sweep frees them, and an invented
+		// subject is charged again rather than being refused forever.
+		f.clock.Advance(2 * time.Second)
+		if rec := f.create(t, token, decideBodyFor("acct-200")); rec.Code != http.StatusCreated {
+			t.Errorf("a new subject after the buckets refilled = %d %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("the caller table", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{rate: huge, subjectRate: huge, maxRateEntries: 2})
+
+		// One subject throughout, so the subject table holds a single entry and
+		// the table that fills is the callers'.
+		for _, caller := range []string{"svc-1", "svc-2"} {
+			rec := f.create(t, f.workload(t, caller), decideBodyFor("acct-shared"))
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("%s = %d %s", caller, rec.Code, rec.Body.String())
+			}
+		}
+
+		rec := f.create(t, f.workload(t, "svc-3"), decideBodyFor("acct-shared"))
 		if _, isDeny := denied(t, rec); !isDeny {
-			t.Fatalf("subject %d with the table full = %d %s, want a refusal", i, rec.Code, rec.Body.String())
+			t.Fatalf("a third caller with the caller table full = %d %s, want a refusal",
+				rec.Code, rec.Body.String())
+		}
+		events := f.audit.snapshot()
+		if len(events) != 1 || events[0].Scope != "caller" {
+			t.Errorf("the refusal was attributed to the wrong budget: %+v", events)
+		}
+
+		f.clock.Advance(2 * time.Second)
+		if rec := f.create(t, f.workload(t, "svc-4"), decideBodyFor("acct-shared")); rec.Code != http.StatusCreated {
+			t.Errorf("a new caller after the buckets refilled = %d %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestDecideSubjectPressureDoesNotCrowdOutCallers is #47(b).
+//
+// The two budgets used to share one bounded table, keyed apart by a prefix. The
+// prefix kept the *keys* from colliding, which is not the same guarantee as
+// keeping the *budgets* apart: one table has one entry cap, and the entries a
+// flood of invented subjects puts in it are entries a caller's bucket cannot
+// have. A caller that had spent none of its own budget was then refused for a
+// table it had not filled — the limit answering for traffic it was not
+// measuring, which is the thing the prefix was there to prevent.
+//
+// So the assertion is about a caller that has done nothing: it arrives while
+// subject pressure holds the table at its cap and it is still admitted.
+func TestDecideSubjectPressureDoesNotCrowdOutCallers(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{
+		// Both budgets are enormous, so nothing here is a rate refusal: the only
+		// thing under test is which table the pressure lands in.
+		rate:           generous,
+		subjectRate:    generous,
+		maxRateEntries: 4,
+	})
+
+	busy := f.workload(t, "svc-busy")
+	for i := range 3 {
+		if rec := f.create(t, busy, decideBodyFor(fmt.Sprintf("acct-%d", i))); rec.Code != http.StatusCreated {
+			t.Fatalf("subject %d for the busy caller = %d %s", i, rec.Code, rec.Body.String())
 		}
 	}
 
-	// Once the buckets have refilled the sweep frees them, and an invented
-	// subject is charged again rather than being refused forever.
-	f.clock.Advance(2 * time.Second)
-	if rec := f.create(t, token, decideBodyFor("acct-200")); rec.Code != http.StatusCreated {
-		t.Errorf("a new subject after the buckets refilled = %d %s", rec.Code, rec.Body.String())
+	// Three subjects now hold the subject table at its cap, and no bucket has
+	// refilled, so a sweep would free nothing. A second caller has spent no part
+	// of its own budget and asks about a subject that is already tracked.
+	rec := f.create(t, f.workload(t, "svc-fresh"), decideBodyFor("acct-0"))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("a caller that had spent nothing = %d %s, want the request admitted: "+
+			"subject pressure is being paid for out of the caller budget's table",
+			rec.Code, rec.Body.String())
+	}
+	if events := f.audit.snapshot(); len(events) != 0 {
+		t.Errorf("subject pressure produced %d refusal(s) on another budget: %+v", len(events), events)
+	}
+}
+
+// TestDecideCallerAndSubjectKeysCannotCollide: an identifier that names a caller
+// and an identifier that names a subject are unrelated strings from unrelated
+// namespaces, and both are attacker-influenced. One bucket answering for both
+// would be a budget spendable by someone it was not measuring.
+//
+// That guarantee used to live in a `\x1f` prefix on the key. It now lives in the
+// structure — two tables — and this test is what keeps it from being deleted
+// along with the prefix.
+func TestDecideCallerAndSubjectKeysCannotCollide(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{
+		// Two requests' worth of caller budget, and no subject limit worth
+		// hitting: if a subject charge landed in the caller's bucket, the second
+		// request would spend the budget twice and be refused.
+		rate:        stream.RateLimit{PerSecond: 1000, Burst: 2},
+		subjectRate: generous,
+	})
+	token := f.workload(t, "svc-collide")
+
+	if rec := f.create(t, token, decideBodyFor("acct-ordinary")); rec.Code != http.StatusCreated {
+		t.Fatalf("the first request = %d %s", rec.Code, rec.Body.String())
+	}
+	// The caller identifier as the surface itself renders it, used as a subject
+	// identifier — the collision an attacker who knows the format would try.
+	callerID := f.lastCaller(t).CallerID()
+
+	if rec := f.create(t, token, decideBodyFor(callerID)); rec.Code != http.StatusCreated {
+		t.Fatalf("a subject named %q = %d %s, want the request admitted: the subject charge "+
+			"landed in the caller's bucket", callerID, rec.Code, rec.Body.String())
 	}
 }
 
@@ -441,4 +553,141 @@ func TestDecideRateDefaultsAndTheWayToTurnItOff(t *testing.T) {
 			t.Errorf("the applied limit = %+v, want the default rate with the configured burst", events)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// the transport-level signal (#45)
+// ---------------------------------------------------------------------------
+
+// TestARateLimitedDecideCarriesRetryAfter is #45's first half.
+//
+// The refusal is a denied decision object with HTTP 200 and stays one — a PEP
+// that had to branch on the transport to learn its request was judged would have
+// two answers to keep in step. But the *body* is only legible to something that
+// speaks this API, and a rate limit is the one deny in the vocabulary whose
+// answer to "should I come back" is yes. Everything between the PEP and here — a
+// retry middleware, a gateway, a dashboard — reads headers and status codes, and
+// with neither of those saying anything it cannot tell a shed request from a
+// judged one.
+//
+// The value is the refill interval, so a caller that honours it arrives when
+// there is a token waiting rather than into the same refusal.
+func TestARateLimitedDecideCarriesRetryAfter(t *testing.T) {
+	// One token every two seconds: a refill interval that is a whole number of
+	// seconds, so the header can be compared with the budget rather than with
+	// whatever rounding produced it.
+	limit := stream.RateLimit{PerSecond: 0.5, Burst: 1}
+	f := newDecideFixture(t, decideOptions{rate: generous, subjectRate: limit})
+	token := f.workload(t, "svc-shed")
+
+	if rec := f.create(t, token, decideBody("")); rec.Code != http.StatusCreated {
+		t.Fatalf("the first request = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec := f.create(t, token, decideBody(""))
+	if _, isDeny := denied(t, rec); !isDeny {
+		t.Fatalf("the second request = %d %s, want a denied decision", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want %q — the interval this budget refills in", got, "2")
+	}
+
+	// The header is not decoration: coming back earlier than it says is refused,
+	// and coming back when it says is admitted. A number that promised a token
+	// which is not there would send a well-behaved client into a retry loop.
+	f.clock.Advance(time.Second)
+	if _, isDeny := denied(t, f.create(t, token, decideBody(""))); !isDeny {
+		t.Error("a retry before Retry-After was admitted; the header over-promises")
+	}
+	f.clock.Advance(time.Second)
+	if rec := f.create(t, token, decideBody("")); rec.Code != http.StatusCreated {
+		t.Errorf("a retry at Retry-After = %d %s, want the budget to have refilled",
+			rec.Code, rec.Body.String())
+	}
+}
+
+// TestTheCallerBudgetRefusalCarriesItsOwnInterval: the two budgets refill at
+// different rates, and the header names the one that actually ran out. A caller
+// told to wait the subject budget's interval when it was its own that was spent
+// has been told a number about somebody else.
+func TestTheCallerBudgetRefusalCarriesItsOwnInterval(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{
+		rate:        stream.RateLimit{PerSecond: 0.25, Burst: 1},
+		subjectRate: generous,
+	})
+	token := f.workload(t, "svc-noisy")
+
+	if rec := f.create(t, token, decideBody("")); rec.Code != http.StatusCreated {
+		t.Fatalf("the first request = %d", rec.Code)
+	}
+	rec := f.create(t, token, decideBody(""))
+	if _, isDeny := denied(t, rec); !isDeny {
+		t.Fatalf("the second request = %d, want a denied decision", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "4" {
+		t.Errorf("Retry-After = %q, want %q — the caller budget's interval, not the subject's", got, "4")
+	}
+}
+
+// TestRetryAfterIsClampedForAVerySlowBudget: the clamp is reachable from an
+// ordinary refusal, so it is tested from one.
+//
+// A budget of one request every three hours is a configuration an operator can
+// write, and 1/PerSecond for it is a number no client will honour. Clamping
+// under-promises — a caller comes back too early and is refused again, which is
+// the state it was already in — and over-promising is the failure that matters,
+// because a caller told to wait longer than the budget needs has been made
+// slower than the limit asks for, by the limit.
+func TestRetryAfterIsClampedForAVerySlowBudget(t *testing.T) {
+	// One token every 10,000 seconds: an interval well past the hour the clamp
+	// allows.
+	f := newDecideFixture(t, decideOptions{
+		rate:        generous,
+		subjectRate: stream.RateLimit{PerSecond: 0.0001, Burst: 1},
+	})
+	token := f.workload(t, "svc-glacial")
+
+	if rec := f.create(t, token, decideBody("")); rec.Code != http.StatusCreated {
+		t.Fatalf("the first request = %d %s", rec.Code, rec.Body.String())
+	}
+	rec := f.create(t, token, decideBody(""))
+	if _, isDeny := denied(t, rec); !isDeny {
+		t.Fatalf("the second request = %d %s, want a denied decision", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "3600" {
+		t.Errorf("Retry-After = %q, want %q — the clamp, not the budget's 10000s interval", got, "3600")
+	}
+
+	// The clamp under-promises on purpose: at the hour it names the budget still
+	// has no token, and the caller is refused again rather than admitted.
+	f.clock.Advance(time.Hour)
+	if _, isDeny := denied(t, f.create(t, token, decideBody(""))); !isDeny {
+		t.Error("the clamped header was treated as a promise the budget had not made")
+	}
+}
+
+// TestAPolicyDenyCarriesNoRetryAfter is the other side of the same claim. A
+// policy deny is a judgement, and a judgement does not expire on a timer; a
+// caller that retried it would get the same answer forever. The header is what
+// separates the retryable deny from the final one at the transport level, so
+// putting it on both would be worse than putting it on neither.
+func TestAPolicyDenyCarriesNoRetryAfter(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.result = decision.Result{
+		State:       store.DecisionDenied,
+		Outcome:     engine.Deny,
+		Reason:      engine.ReasonNoMatchingPolicy,
+		Obligations: []decision.Obligation{},
+	}
+
+	rec := f.create(t, f.workload(t, "svc-payments"), decideBody(""))
+	reason, isDeny := denied(t, rec)
+	if !isDeny {
+		t.Fatalf("a policy deny = %d %s, want a denied decision", rec.Code, rec.Body.String())
+	}
+	if reason != string(engine.ReasonNoMatchingPolicy) {
+		t.Fatalf("reason = %q, want the policy's ground", reason)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("a policy deny carries Retry-After %q; retrying it is not a thing to invite", got)
+	}
 }

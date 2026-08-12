@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"github.com/d0lim/stamp/internal/decision"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // The approval surface owns three things and no more: it puts the endpoint on
@@ -90,14 +92,25 @@ type approvalFixture struct {
 	server    *api.Server
 	idp       *mockIdP
 	collector *recordingCollector
+	audit     *recordingEvents
+	clock     *decideClock
+}
+
+// approvalOptions are the knobs a test turns. Zero is the deployment default
+// for each, which is what most of these tests want to exercise.
+type approvalOptions struct {
+	maxBytes int64
+	rate     stream.RateLimit
 }
 
 func newApprovalFixture(t *testing.T) *approvalFixture {
 	t.Helper()
-	return newApprovalFixtureWith(t, 0)
+	// A budget large enough not to be the limit under test, so that a test about
+	// the approver boundary is not silently also a test about the rate.
+	return newApprovalFixtureWith(t, approvalOptions{rate: generous})
 }
 
-func newApprovalFixtureWith(t *testing.T, maxBytes int64) *approvalFixture {
+func newApprovalFixtureWith(t *testing.T, opts approvalOptions) *approvalFixture {
 	t.Helper()
 	idp := newMockIdP(t)
 	sink := identity.AuditSinkFunc(func(context.Context, identity.AuthRecord) {})
@@ -114,10 +127,15 @@ func newApprovalFixtureWith(t *testing.T, maxBytes int64) *approvalFixture {
 	collector := &recordingCollector{
 		result: decision.Result{ID: testDecisionID, State: store.DecisionPending},
 	}
+	audit := &recordingEvents{}
+	clock := &decideClock{at: fixedNow}
 	approvals, err := api.NewApprovals(api.ApprovalsConfig{
 		Decisions:       collector,
 		Reviews:         collector,
-		MaxRequestBytes: maxBytes,
+		MaxRequestBytes: opts.maxBytes,
+		Rate:            opts.rate,
+		Audit:           audit,
+		Now:             clock.Now,
 	})
 	if err != nil {
 		t.Fatalf("build approvals: %v", err)
@@ -125,7 +143,7 @@ func newApprovalFixtureWith(t *testing.T, maxBytes int64) *approvalFixture {
 	if err := server.Mount(approvals); err != nil {
 		t.Fatalf("mount approvals: %v", err)
 	}
-	return &approvalFixture{server: server, idp: idp, collector: collector}
+	return &approvalFixture{server: server, idp: idp, collector: collector, audit: audit, clock: clock}
 }
 
 // userToken mints an end-user token: a client the operator did not declare as a
@@ -288,8 +306,12 @@ func TestCollectorErrorsBecomeActionableStatuses(t *testing.T) {
 		err  error
 		want int
 	}{
-		{name: "not a target", err: fmt.Errorf("wrapped: %w", challenge.ErrNotTarget), want: http.StatusForbidden},
-		{name: "not entitled", err: decision.ErrNotAuthorized, want: http.StatusForbidden},
+		// The first two are 404 rather than 403 on purpose: see
+		// TestNotAnApproverIsByteIdenticalToNoSuchDecision. A caller who may not
+		// act on a decision is told what a caller asking about a decision that
+		// does not exist is told.
+		{name: "not a target", err: fmt.Errorf("wrapped: %w", challenge.ErrNotTarget), want: http.StatusNotFound},
+		{name: "not entitled", err: decision.ErrNotAuthorized, want: http.StatusNotFound},
 		{name: "no such challenge", err: decision.ErrNoSuchChallenge, want: http.StatusNotFound},
 		{name: "no such decision", err: store.ErrNotFound, want: http.StatusNotFound},
 		{name: "already resolved", err: decision.ErrNotPending, want: http.StatusConflict},
@@ -392,15 +414,202 @@ func TestReviewRefusedToANonTarget(t *testing.T) {
 	f := newApprovalFixture(t)
 	f.collector.reviewErr = challenge.ErrNotTarget
 	rec := f.do(t, api.SurfaceConsole, http.MethodGet, reviewPath, f.userToken(t, "mallory"), "")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("review answered %d, want 403", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("review answered %d, want 404 — the answer a decision that does not exist gets", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R40's answer is one answer, on every surface (#38)
+// ---------------------------------------------------------------------------
+
+// TestNotAnApproverIsByteIdenticalToNoSuchDecision is #38.
+//
+// The comment on the mapping said the two were deliberately the same answer, and
+// they were not: a non-approver got `403 not_an_approver` and a decision that
+// does not exist got `404 not_found`, which is a two-request oracle for "does
+// this identifier name a decision" — ask, and the status code answers. R40's
+// rule is that a decision is readable by its creator or a targeted approver, and
+// a rule that leaks the existence of what it refuses is a rule about content
+// rather than about existence.
+//
+// The comparison is on the bytes rather than on the status, because a body that
+// differs is the same oracle one layer down: a client reads `{"error":…}` as
+// readily as it reads a status line.
+//
+// The consequence is deliberate and it is a real cost: an approver whose
+// approver set was revised out from under them now reads "no such decision"
+// instead of "this decision is not waiting on you". The console's inbox is what
+// tells them the truth — it lists what is actually waiting — and that list is
+// the surface where saying so leaks nothing, because being on it is already the
+// proof of standing.
+func TestNotAnApproverIsByteIdenticalToNoSuchDecision(t *testing.T) {
+	t.Parallel()
+	// Every error the surface answers "you may not have this" with, whatever the
+	// layer beneath called it.
+	refusals := map[string]error{
+		"not a target of the challenge": challenge.ErrNotTarget,
+		"not entitled to the decision":  decision.ErrNotAuthorized,
+		"no such challenge":             decision.ErrNoSuchChallenge,
+		"no such decision":              store.ErrNotFound,
+	}
+
+	submit := func(t *testing.T, err error) *httptest.ResponseRecorder {
+		t.Helper()
+		f := newApprovalFixture(t)
+		f.collector.submitErr = err
+		return f.approve(t, "mallory", "")
+	}
+	review := func(t *testing.T, err error) *httptest.ResponseRecorder {
+		t.Helper()
+		f := newApprovalFixture(t)
+		f.collector.reviewErr = err
+		return f.do(t, api.SurfaceConsole, http.MethodGet, reviewPath, f.userToken(t, "mallory"), "")
+	}
+
+	for name, call := range map[string]func(*testing.T, error) *httptest.ResponseRecorder{
+		"submission": submit,
+		"review":     review,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			base := call(t, store.ErrNotFound)
+			if base.Code != http.StatusNotFound {
+				t.Fatalf("a decision that does not exist = %d, want 404: %s", base.Code, base.Body.String())
+			}
+			for what, err := range refusals {
+				rec := call(t, fmt.Errorf("decision: submit: %w", err))
+				if rec.Code != base.Code {
+					t.Errorf("%s: status %d, want %d — the status tells the two apart",
+						what, rec.Code, base.Code)
+				}
+				if !bytes.Equal(rec.Body.Bytes(), base.Body.Bytes()) {
+					t.Errorf("%s: body\n got %q\nwant %q", what, rec.Body.String(), base.Body.String())
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the submission budget (R43)
+// ---------------------------------------------------------------------------
+
+// TestSubmissionsAreRefusedOverTheApproverBudget is R43's submission half.
+//
+// Its refusal is a 4xx, which the other two budgets this unit added are not, and
+// that difference is deliberate. A challenge issue has no HTTP response of its
+// own to carry a status code — the caller there is a PEP asking for a decision —
+// so a refusal can only be challenge state. This one is answering a console over
+// a request the approver made themselves, so it is answered where they asked.
+//
+// The refusal must also happen before the lifecycle is touched, because what a
+// submission costs behind this door is a row lock on the decision; a limit
+// applied after that has limited nothing.
+func TestSubmissionsAreRefusedOverTheApproverBudget(t *testing.T) {
+	t.Parallel()
+	const burst = 3
+	f := newApprovalFixtureWith(t, approvalOptions{
+		rate: stream.RateLimit{PerSecond: 1, Burst: burst},
+	})
+
+	for i := range burst {
+		if rec := f.approve(t, "bob", ""); rec.Code != http.StatusOK {
+			t.Fatalf("submission %d within the burst = %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	rec := f.approve(t, "bob", "")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("the submission past the burst = %d, want 429: %s", rec.Code, rec.Body.String())
+	}
+	if f.collector.submitted() != burst {
+		t.Errorf("%d submissions reached the lifecycle, want %d: the refusal happened behind the row lock",
+			f.collector.submitted(), burst)
+	}
+
+	// The code is the console's, and it is its own code: a caller has to be able
+	// to tell "slow down" from "you are not an approver" and from "the decision
+	// changed", both of which are also refusals with a body.
+	var body struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode %q: %v", rec.Body.String(), err)
+	}
+	if body.Error != api.ApprovalRateLimitedCode {
+		t.Errorf("error code = %q, want %q", body.Error, api.ApprovalRateLimitedCode)
+	}
+
+	// And it says when to come back. On this surface the header is doing what
+	// RFC 9110 specifies it for — a 429 is one of the statuses it is defined on —
+	// so a console with a retry button and everything between it and here read
+	// the same number: one token every second is this budget's interval.
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want %q — this budget's refill interval", got, "1")
+	}
+
+	// And it is audited, with its own ground: an operator reading the chain has
+	// to be able to tell an approver who was shed from a PEP that was.
+	var refusals []api.Event
+	for _, e := range f.audit.snapshot() {
+		if e.Kind == api.EventRateLimited {
+			refusals = append(refusals, e)
+		}
+	}
+	if len(refusals) != 1 {
+		t.Fatalf("%d rate-limit events were recorded, want 1", len(refusals))
+	}
+	got := refusals[0]
+	switch {
+	case got.Reason != api.ApprovalRateLimitedReason:
+		t.Errorf("audited reason = %q, want %q", got.Reason, api.ApprovalRateLimitedReason)
+	case got.Reason == string(decision.ReasonRateLimited):
+		t.Error("the approval refusal is indistinguishable from the decide path's")
+	}
+	if got.CallerID == "" || !strings.Contains(got.CallerID, "bob") {
+		t.Errorf("audited caller = %q, want the approver's identifier", got.CallerID)
+	}
+	if got.Path != approvalPath || got.Method != http.MethodPost {
+		t.Errorf("audited request = %s %s, want POST %s", got.Method, got.Path, approvalPath)
+	}
+	if got.Limit == "" || got.Scope == "" {
+		t.Errorf("audited scope/limit = %q/%q, want both: a reader cannot tell which budget bound", got.Scope, got.Limit)
+	}
+}
+
+// TestTheApprovalBudgetIsPerApproverAndRefills guards the key and the recovery.
+// A budget shared across approvers would let one flooding console user stop
+// everybody else approving, which is the limit becoming the incident.
+func TestTheApprovalBudgetIsPerApproverAndRefills(t *testing.T) {
+	t.Parallel()
+	const burst = 2
+	f := newApprovalFixtureWith(t, approvalOptions{
+		rate: stream.RateLimit{PerSecond: 1, Burst: burst},
+	})
+
+	for range burst {
+		if rec := f.approve(t, "bob", ""); rec.Code != http.StatusOK {
+			t.Fatalf("submission within the burst = %d", rec.Code)
+		}
+	}
+	if rec := f.approve(t, "bob", ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("the submission past the burst = %d, want 429", rec.Code)
+	}
+	if rec := f.approve(t, "carol", ""); rec.Code != http.StatusOK {
+		t.Fatalf("a second approver's first submission = %d: one approver spent another's budget", rec.Code)
+	}
+
+	f.clock.Advance(time.Second)
+	if rec := f.approve(t, "bob", ""); rec.Code != http.StatusOK {
+		t.Fatalf("a full refill window later the submission = %d, want 200", rec.Code)
 	}
 }
 
 // A body big enough to be an attack is refused before it is parsed.
 func TestOversizedSubmissionIsRefused(t *testing.T) {
 	t.Parallel()
-	f := newApprovalFixtureWith(t, 64)
+	f := newApprovalFixtureWith(t, approvalOptions{maxBytes: 64, rate: generous})
 	rec := f.approve(t, "bob", `{"binding_hash":"`+strings.Repeat("a", 200)+`"}`)
 	if rec.Code != http.StatusRequestEntityTooLarge && rec.Code != http.StatusBadRequest {
 		t.Fatalf("oversized body answered %d, want a refusal", rec.Code)

@@ -391,6 +391,12 @@ func TestMalformedRequestIsRefusedRatherThanJudged(t *testing.T) {
 		`{"subject": {"type": "user"}, "action": {"name": "read"}, "resource": {"type": "doc", "id": "d"}}`,
 		`{"subject": {"type": "user", "id": "alice"}, "resource": {"type": "doc", "id": "d"}}`,
 		`not json`,
+		// The shape check is shared with the decide surface, so the bound the
+		// decide surface needs (its limiter's table is keyed by the subject
+		// identifier) is enforced here too. A check request is not charged
+		// against that table, and the request is still refused: one definition
+		// of a well-formed access request, not two.
+		evaluationBody(strings.Repeat("s", api.MaxEntityIDBytes+1), "read", "doc"),
 	} {
 		req := httptest.NewRequest(http.MethodPost, api.EvaluationPath, strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+f.idp.token(t, "svc-a", testClientID))

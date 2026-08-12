@@ -61,9 +61,27 @@ call is made by the approver's browser, and the CSP on every console response
 names that origin and the IdP and nothing else.
 {{- end }}
 
-Health: every bound listener answers GET /healthz. It is a liveness signal
-only — it does not consult the database — so a pod that is Ready is a process
-that is running, not a deployment whose database is reachable.
+Health: every bound listener answers GET /healthz and GET /readyz. /healthz is
+the liveness signal and consults nothing, so a 200 there means a process that is
+running and not a deployment whose database is reachable. /readyz is what the
+readinessProbe asks, and it answers 503 until the database has reached the
+schema this image's queries are written against.
+
+Schema before traffic: only the tier holding the api role migrates, and `helm
+upgrade` rolls every Deployment at once. A serving pod on the new image must not
+take traffic before the schema reaches the version that image needs — every read
+it issues would name a column the database does not have yet. /readyz is what
+enforces that, so an upgrade that appears stalled with pods Running but not
+Ready is usually the migration not having landed:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ default "the api tier" $apiTier }} | grep -i schema
+
+Two things follow. Do not point the readinessProbe back at /healthz: that is
+what this chart used to do, and it is what let a pod serve errors during an
+upgrade. And an image older than this chart does not answer /readyz at all — it
+404s, the pod never becomes Ready, and the rollout stops with the old pods still
+serving. Upgrade the chart and the image together.
 
 {{- if not .Values.egress.allow }}
 

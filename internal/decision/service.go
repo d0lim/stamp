@@ -2,9 +2,13 @@ package decision
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"time"
 
 	"github.com/d0lim/stamp/internal/challenge"
@@ -33,16 +37,40 @@ var (
 	// ErrNoSuchChallenge reports a submission against an ordinal the decision
 	// does not have.
 	ErrNoSuchChallenge = errors.New("decision: decision has no such challenge")
+
+	// ErrIdempotencyKeyReused reports a caller that sent a key it has already
+	// used, for a request that is not the one the key names.
+	//
+	// It is a distinct sentinel and not a variant of ErrConflict because it is
+	// the only conflict on this surface that is the *caller's* mistake and is
+	// safe to tell the caller about: the lookup behind it is scoped to the
+	// caller's own keys, so the answer says nothing about anybody else's traffic
+	// and opens no oracle (R40).
+	//
+	// Returning the first decision instead — which is what this path did before
+	// the fingerprint existed — is the failure that makes this sentinel
+	// necessary. A PEP that reuses `job-91` for a different subject, resource or
+	// action got back `201 allowed` for an authorization this engine never
+	// evaluated, and decision.Result carries no subject, resource or action, so
+	// nothing in the answer let the PEP notice the substitution. There is no
+	// safe way to answer a key that names a different request; the only honest
+	// answer is that the key is spent.
+	ErrIdempotencyKeyReused = errors.New("decision: idempotency key was already used for a different request")
 )
 
 // Audit kinds this package appends. The store's set is open; these names are
 // stable because an operator alerts on them.
 const (
 	// AuditKindDecisionRefused records a decide that produced no decision
-	// object: a deny with no policy to pin a row to, or a refusal under the
-	// outstanding-decision cap. R43 requires the refusal itself to be audited,
-	// and a refusal that leaves no trace is indistinguishable from a request
-	// that was never made.
+	// object: a deny with no policy to pin a row to, a refusal under the
+	// outstanding-decision cap, or a decide whose challenge issuance was shed.
+	// R43 requires the refusal itself to be audited, and a refusal that leaves
+	// no trace is indistinguishable from a request that was never made.
+	//
+	// The third case is the one worth naming, because it is the whole of what a
+	// shed decide leaves behind. It is an entry saying a limit fired, not a
+	// decision saying a person was refused — which is the distinction the shed
+	// path was getting wrong when it wrote a denied decision row instead.
 	AuditKindDecisionRefused = "decision.refused"
 
 	// AuditKindAccessRefused records a read or a submission refused because the
@@ -76,6 +104,38 @@ const (
 	// ReasonChallengeFailed is the ground for a decision denied by a failed or
 	// timed-out challenge.
 	ReasonChallengeFailed engine.Reason = "challenge_failed"
+
+	// ReasonChallengeRateLimited is the ground for a decide denied because a
+	// challenge it needed was never opened: the issuance was shed by a challenge
+	// issue budget (R43).
+	//
+	// It has parity with ReasonOutstandingCap above, and for the same reason
+	// that one is not folded into the policy's vocabulary: what happened is a
+	// limit this deployment applied, not a judgement anybody made about the
+	// request. Without it the answer reads `challenge_failed`, which is also
+	// what a rejected step-up reads — so an operator watching denies could not
+	// tell "the subject refused the prompt" from "we never sent the prompt", and
+	// those call for opposite responses. One is final; the other clears when the
+	// window does.
+	//
+	// **It carries a decision identifier on one path and not the other, and the
+	// difference is not cosmetic.** On the decide path there is no row: Decide
+	// reads the shed bit at issue and refuses through refuseShed before anything
+	// is written, because a decision row here is a terminal deny on the history
+	// of a person nobody asked anything — which is what this path used to write,
+	// once per legitimate authorization, for as long as somebody else held that
+	// person's issue budget empty. On the revalidation path (R31) the decision
+	// already exists and its challenge is re-issued into a row that is already
+	// there, so the ground resolves onto it as any other failure would. A client
+	// branches on the presence of `id`, never on the reason, exactly as it must
+	// for every other answer this surface gives.
+	//
+	// It is deliberately not `rate_limited`. That value is the decide surface's
+	// own caller and subject budgets, refused before the lifecycle was entered;
+	// this one is a challenge handler's issue budget, refused on the way to an
+	// IdP or a webhook. They are configured separately and an operator raising
+	// one has not raised the other.
+	ReasonChallengeRateLimited engine.Reason = "challenge_rate_limited"
 
 	// ReasonExpired is the ground for a decision the sweeper expired.
 	ReasonExpired engine.Reason = "expired"
@@ -270,6 +330,17 @@ type Result struct {
 	CreatedAt     time.Time           `json:"created_at,omitzero"`
 	ExpiresAt     time.Time           `json:"expires_at,omitzero"`
 	ResolvedAt    *time.Time          `json:"resolved_at,omitempty"`
+
+	// RetryAfter is how long until the budget that shed this request has room
+	// again, and zero for every answer that was not shed.
+	//
+	// It is not serialized, for the reason Outcome is not: the body of a decide
+	// answer is the decision, and a number about this instance's token bucket is
+	// not part of it. It travels so that the HTTP surface can render the header
+	// — the surface knows its own budgets and does not know a challenge
+	// handler's, and the handler that shed the issuance is the only thing that
+	// does.
+	RetryAfter time.Duration `json:"-"`
 }
 
 // Allowed reports whether the decision has resolved to allow. A pending
@@ -297,6 +368,12 @@ type Request struct {
 
 	// TTL overrides the service default for this decision. Zero uses it.
 	TTL time.Duration
+
+	// IdempotencyKey names this decide attempt, so that a retry of it returns
+	// the decision the first attempt created instead of creating a second one.
+	// Empty means the caller is not retrying anything and every call is a new
+	// decision, which is what every caller did before this field existed.
+	IdempotencyKey string
 }
 
 // Decide evaluates a request and creates the decision object it calls for
@@ -314,6 +391,38 @@ func (s *Service) Decide(ctx context.Context, req Request) (Result, error) {
 		return Result{}, ErrUnauthenticated
 	}
 	now := s.Now()
+
+	// The lookup stands here — ahead of the cap, ahead of the evaluation, ahead
+	// of the challenge issuance — and that placement is the whole unit (KTD5).
+	//
+	// This function mints the identifier, issues every challenge and only then
+	// writes the row, so the IdP call and the outbound webhook both happen before
+	// the database has heard of the decision. A key enforced only as a uniqueness
+	// constraint at insert time would therefore push a second step-up at the
+	// subject on every retry and refuse afterwards: the caller would be protected
+	// from a duplicate row and the person would not be protected from anything.
+	//
+	// It is ahead of the outstanding cap for a second reason. A decision counts
+	// against its own subject's cap while it is open, so a retry arriving at a
+	// full cap would be refused by the very decision it is asking after.
+	fingerprint := requestFingerprint(req.Input)
+	if req.IdempotencyKey != "" {
+		existing, err := store.DecisionByIdempotencyKey(ctx, s.store.Pool(),
+			req.Caller.CallerID(), req.IdempotencyKey)
+		switch {
+		case err == nil:
+			if !sameRequest(existing, fingerprint) {
+				return Result{}, keyReused(req, existing)
+			}
+			// Answered through advance rather than through a bare read, so that
+			// a retry sees the decision as it stands now — a delay that has since
+			// elapsed, a quorum that has since been met — which is what the first
+			// call would have reported had it arrived at this instant.
+			return s.advance(ctx, existing.ID, now)
+		case !errors.Is(err, store.ErrNotFound):
+			return Result{}, err
+		}
+	}
 
 	if s.maxOutstanding > 0 {
 		outstanding, err := s.countOutstanding(ctx, req.Input.Subject.ID, now)
@@ -407,6 +516,46 @@ func (s *Service) Decide(ctx context.Context, req Request) (Result, error) {
 		if !issued.State.Valid() {
 			return Result{}, fmt.Errorf("decision: handler for %s returned state %q", instance, issued.State)
 		}
+		// A shed issuance ends the decide here, with no decision object at all.
+		//
+		// **It used to end as a terminal deny on the subject's record.** The shed
+		// challenge was stored failed, `failed > 0` resolved the decision through
+		// s.resolve(..., Fail, ...), and the person nobody had been asked about
+		// was left holding a decision that says `denied / challenge_rate_limited`
+		// on their history — for every legitimate authorization they needed while
+		// somebody else held their issue budget empty. A limit that shed traffic
+		// was writing judgements about people.
+		//
+		// So it takes the shape api.Decisions.refuseRate takes for the surface's
+		// own budget, and the shape s.refuse already takes for the outstanding
+		// cap: a deny with a ground that says a limit fired, no row, and a
+		// Retry-After. The three refusals now differ only in which limit they
+		// name, which is the difference a caller has to act on.
+		//
+		// **What is stranded, said out loud.** A challenge at a lower ordinal may
+		// already have opened — a webhook posted, a prompt sent — and no decision
+		// row will exist to record that it did. That residue is unavoidable in
+		// this direction: a handler owns its own budget, so nothing here can know
+		// a later issuance will be shed before the earlier ones have run. The
+		// audit entry names how many opened, which is the trace that keeps it
+		// from being invisible; the alternative — keeping the row so the opened
+		// challenge has somewhere to hang — is the terminal deny this is
+		// removing, and a decision nobody can satisfy is worse than a webhook
+		// nobody answers.
+		//
+		// The state is checked alongside the bit rather than trusted from it.
+		// Shed is only meaningful on a failed issue — the contract says so where
+		// it is declared — and a handler that set it on a challenge it actually
+		// opened would, without this, have that challenge thrown away here along
+		// with the decision that was going to carry it. Reading both means the
+		// worst a handler bug can do is leave the old behaviour in place.
+		if issued.Shed && issued.State == challenge.StateFailed {
+			return s.refuseShed(ctx, req, issued.RetryAfter, map[string]any{
+				"challenge_ordinal": ordinal,
+				"challenge_kind":    string(spec.ChallengeType()),
+				"opened_before_it":  len(opened),
+			})
+		}
 		// A decision has to outlive the challenges it opened. A delay longer
 		// than the default lifetime would otherwise be structurally
 		// unsatisfiable: the decision would expire while its own timer was
@@ -424,19 +573,51 @@ func (s *Service) Decide(ctx context.Context, req Request) (Result, error) {
 	}
 
 	created, err := s.audit.CreateDecision(ctx, store.NewDecision{
-		ID:            id,
-		CallerID:      req.Caller.CallerID(),
-		PolicyID:      policyID,
-		PolicyVersion: version,
-		SubjectID:     req.Input.Subject.ID,
-		ResourceID:    req.Input.Resource.ID,
-		Action:        req.Input.Action,
-		Request:       requestPayload(req.Input),
-		FactSnapshot:  factSnapshot,
-		Obligations:   obligations,
-		ExpiresAt:     expiresAt,
-		Challenges:    opened,
+		ID:             id,
+		CallerID:       req.Caller.CallerID(),
+		PolicyID:       policyID,
+		PolicyVersion:  version,
+		SubjectID:      req.Input.Subject.ID,
+		ResourceID:     req.Input.Resource.ID,
+		Action:         req.Input.Action,
+		Request:        requestPayload(req.Input),
+		FactSnapshot:   factSnapshot,
+		Obligations:    obligations,
+		ExpiresAt:      expiresAt,
+		Challenges:     opened,
+		IdempotencyKey: req.IdempotencyKey,
+		// Frozen in the same row and the same transaction as the key it
+		// qualifies. A fingerprint stored anywhere else is a fingerprint that
+		// can be absent for a key that is present, which is exactly the state
+		// the lookup above cannot answer safely.
+		IdempotencyFingerprint: fingerprintFor(req.IdempotencyKey, fingerprint),
 	})
+	// A conflict on a keyed create means another attempt under the same key
+	// landed while this one was issuing its challenges. The two callers are the
+	// same caller retrying, so the loser answers with the winner's decision
+	// rather than reporting a conflict to somebody who did nothing wrong.
+	//
+	// The challenges this attempt opened are already open, and that is the
+	// residue the unique index cannot remove — it is a backstop, and it can only
+	// act after the pushes it would have wanted to prevent. Bounding the damage
+	// to a genuine race is what it is for; the lookup at the top is what keeps a
+	// retry from being one.
+	//
+	// The winner is held to the same fingerprint the lookup holds it to. Two
+	// concurrent attempts under one key that name *different* requests are not a
+	// retry racing itself, they are the substitution the fingerprint exists to
+	// refuse, arriving through the one window where the lookup could not see it.
+	if req.IdempotencyKey != "" && errors.Is(err, store.ErrConflict) {
+		winner, lookupErr := store.DecisionByIdempotencyKey(ctx, s.store.Pool(),
+			req.Caller.CallerID(), req.IdempotencyKey)
+		if lookupErr != nil {
+			return Result{}, err
+		}
+		if !sameRequest(winner, fingerprint) {
+			return Result{}, keyReused(req, winner)
+		}
+		return s.advance(ctx, winner.ID, now)
+	}
 	if err != nil {
 		return Result{}, err
 	}
@@ -495,14 +676,55 @@ type Submission struct {
 // whole reason the sweeper is allowed to be late: an approval that arrives
 // after the deadline but before the sweep is refused here, so it cannot satisfy
 // a quorum that a background job has not gotten around to closing yet.
+//
+// # Standing is settled before state, and that ordering is the security property
+//
+// The two checks are in this order and not the other one. Whether the caller has
+// any standing on this decision does not depend on what state the decision is
+// in, but the answer a caller *reads* does: "not collecting" and "expired" are
+// 409s, "you may not have this" and "there is no such decision" are one 404
+// (#38), so asking the state first hands a caller with no standing a 404 while
+// the decision is pending and a 409 the moment it resolves. That is the
+// existence oracle R40 forbids, with the resolution time thrown in, and it
+// survived the fix to the error table because the error table never saw it — the
+// only authorization signal on this path came from the challenge handler, which
+// ran after the state check had already answered.
+//
+// The 409s are kept for callers who do have standing, and that is deliberate
+// rather than an oversight: an approver being waited on has to be able to tell
+// "you are too late" from "there is nothing here", and folding their answer into
+// the stranger's 404 would degrade the person this endpoint exists for in order
+// to protect against a person who is now getting one answer either way.
 func (s *Service) Submit(ctx context.Context, sub Submission) (Result, error) {
 	if sub.Caller == nil {
 		return Result{}, ErrUnauthenticated
 	}
 	now := s.Now()
 
-	d, target, err := s.collecting(ctx, sub.DecisionID, sub.Ordinal, now)
+	d, progress, err := s.decisionWithProgress(ctx, sub.DecisionID)
 	if err != nil {
+		return Result{}, err
+	}
+	// Resolving which challenge was named is not judging its state: an ordinal
+	// the decision does not have is refused with the same 404 a decision that
+	// does not exist is, so doing it here — where the caller's standing has not
+	// been established yet — tells a stranger nothing a missing decision would
+	// not have told them, and the standing rule below needs the kind.
+	target, err := challengeAt(d, progress, sub.Ordinal)
+	if err != nil {
+		return Result{}, err
+	}
+
+	allowed, err := s.mayActOn(ctx, sub.Caller, d, progress, target)
+	if err != nil {
+		return Result{}, err
+	}
+	if !allowed {
+		s.auditAccessRefusal(ctx, sub.Caller, d, "submit")
+		return Result{}, ErrNotAuthorized
+	}
+
+	if err := stillCollecting(d, target, now); err != nil {
 		return Result{}, err
 	}
 
@@ -543,48 +765,94 @@ func (s *Service) Submit(ctx context.Context, sub Submission) (Result, error) {
 
 // collecting resolves one challenge that is open for evidence as of now.
 //
-// It is the entry check both [Service.Submit] and [Service.Redeem] make, and it
-// is one function so that the two cannot drift: an authorization code arriving
-// after the decision expired must be refused on exactly the terms an approval
-// arriving then is, and a second copy of "is this still collecting" is a second
-// copy that can answer differently.
+// It is the entry check [Service.Redeem] makes, and [Service.Submit] makes the
+// same one in two halves with the standing rule between them (see there). The
+// three steps below are shared functions rather than a second copy so that the
+// two cannot drift: an authorization code arriving after the decision expired
+// must be refused on exactly the terms an approval arriving then is, and a
+// second copy of "is this still collecting" is a second copy that can answer
+// differently.
+//
+// Redeem has no standing check to make and is not missing one. The party on that
+// path is a browser following an IdP's `Location` header, holding no credential
+// at all; what it holds instead is a `state` this server minted for this
+// challenge, and the handler is what judges that. Its surface answers one
+// uniform 403 for every refusal, so the ordering here leaks nothing there.
 func (s *Service) collecting(
 	ctx context.Context, decisionID string, ordinal int, now time.Time,
 ) (store.Decision, store.ChallengeProgress, error) {
-	d, err := s.store.ActiveDecision(ctx, decisionID)
+	d, progress, err := s.decisionWithProgress(ctx, decisionID)
 	if err != nil {
 		return store.Decision{}, store.ChallengeProgress{}, err
 	}
-	if d.State != store.DecisionPending {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("decision %q is %s: %w", d.ID, d.State, ErrNotPending)
+	target, err := challengeAt(d, progress, ordinal)
+	if err != nil {
+		return store.Decision{}, store.ChallengeProgress{}, err
 	}
+	if err := stillCollecting(d, target, now); err != nil {
+		return store.Decision{}, store.ChallengeProgress{}, err
+	}
+	return d, target, nil
+}
 
+// decisionWithProgress reads a decision and its challenge rows, judging nothing.
+//
+// It is separate from the tests that follow it because the caller's standing has
+// to be settled against a decision that has been read but not yet judged. Every
+// refusal it can produce is store.ErrNotFound, which is the same 404 a caller
+// with no standing gets for a decision that does exist.
+func (s *Service) decisionWithProgress(
+	ctx context.Context, decisionID string,
+) (store.Decision, []store.ChallengeProgress, error) {
+	d, err := store.GetDecision(ctx, s.store.Pool(), decisionID)
+	if err != nil {
+		return store.Decision{}, nil, err
+	}
 	progress, err := store.ChallengeProgressFor(ctx, s.store.Pool(), d.ID)
 	if err != nil {
-		return store.Decision{}, store.ChallengeProgress{}, err
+		return store.Decision{}, nil, err
 	}
-	var target *store.ChallengeProgress
+	return d, progress, nil
+}
+
+// challengeAt picks the challenge an ordinal names.
+func challengeAt(
+	d store.Decision, progress []store.ChallengeProgress, ordinal int,
+) (store.ChallengeProgress, error) {
 	for i := range progress {
 		if progress[i].Ordinal == ordinal {
-			target = &progress[i]
-			break
+			return progress[i], nil
 		}
 	}
-	if target == nil {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("decision %q has no challenge %d: %w", d.ID, ordinal, ErrNoSuchChallenge)
+	return store.ChallengeProgress{},
+		fmt.Errorf("decision %q has no challenge %d: %w", d.ID, ordinal, ErrNoSuchChallenge)
+}
+
+// stillCollecting is the state half: the decision is open, and so is the
+// challenge.
+//
+// The decision's own deadline is tested through [store.EnsureActive] rather than
+// re-read through store.ActiveDecision, so the rule stays in the one place the
+// store states it. The clock is the service's, which is the clock the challenge
+// timer below is already judged against — an entry check that read the decision's
+// deadline off one clock and the challenge's off another could refuse a
+// submission for being late and accept the next one.
+func stillCollecting(d store.Decision, target store.ChallengeProgress, now time.Time) error {
+	if err := store.EnsureActive(d, now); err != nil {
+		return err
+	}
+	if d.State != store.DecisionPending {
+		return fmt.Errorf("decision %q is %s: %w", d.ID, d.State, ErrNotPending)
 	}
 	if challengeState(target.State) != challenge.StatePending {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("challenge %d of decision %q is %s: %w", ordinal, d.ID, target.State, ErrNotPending)
+		return fmt.Errorf("challenge %d of decision %q is %s: %w",
+			target.Ordinal, d.ID, target.State, ErrNotPending)
 	}
 	if target.Deadline != nil && !now.Before(*target.Deadline) {
-		return store.Decision{}, store.ChallengeProgress{},
-			fmt.Errorf("challenge %d of decision %q closed at %s: %w",
-				ordinal, d.ID, target.Deadline, store.ErrDecisionExpired)
+		return fmt.Errorf("challenge %d of decision %q closed at %s: %w",
+			target.Ordinal, d.ID, target.Deadline, store.ErrDecisionExpired)
 	}
-	return d, *target, nil
+	return nil
 }
 
 // Callback is one transport-level redirect arriving for a challenge.
@@ -666,6 +934,18 @@ func (s *Service) advance(ctx context.Context, id string, now time.Time) (Result
 
 	changed := false
 	satisfied, failed := 0, 0
+	// Whether any challenge failed because it was never opened. It is collected
+	// from the same Status answers that decide the states, so it cannot disagree
+	// with them. A challenge already stored terminal is skipped here and its bit
+	// is not read — which cannot lose anything, because a shed challenge is
+	// recorded failed by the very pass that observes it, and that pass is the one
+	// that resolves the decision. The read path recomputes the ground from every
+	// challenge regardless, so a decision read back afterwards still says it.
+	//
+	// Only a revalidation can put a shed challenge on a row that reaches here.
+	// Decide refuses a shed issuance before it writes anything, so a decision
+	// that exists was never shed at creation — see the issue loop in Decide.
+	shed := false
 	for i := range progress {
 		p := progress[i]
 		if stored := challengeState(p.State); stored.Terminal() {
@@ -704,13 +984,14 @@ func (s *Service) advance(ctx context.Context, id string, now time.Time) (Result
 			satisfied++
 		case challenge.StateFailed, challenge.StateCancelled:
 			failed++
+			shed = shed || st.Shed
 		case challenge.StatePending:
 		}
 	}
 
 	switch {
 	case failed > 0:
-		if _, err := s.resolve(ctx, d, Fail, ReasonChallengeFailed); err != nil {
+		if _, err := s.resolve(ctx, d, Fail, failureReason(shed)); err != nil {
 			return Result{}, err
 		}
 	case satisfied == len(progress):
@@ -739,6 +1020,28 @@ func reasonFor(challenges int) engine.Reason {
 		return engine.ReasonPolicyMatched
 	}
 	return ReasonChallengeSatisfied
+}
+
+// failureReason names the ground of a decision its challenges denied.
+//
+// The distinction is between a challenge that was put to somebody and not met,
+// and a challenge that was never put to anybody because a limit refused to open
+// it. Both leave the decision denied and only the ground says which, so the
+// ground is the whole difference between "this was refused" and "ask again".
+//
+// **The shed branch is not dead, and it is not the decide path's.** Decide reads
+// challenge.IssueResult.Shed at issue and refuses without writing a row at all,
+// so no decision this function sees was shed on the way in. What reaches here is
+// the revalidation path (R31): a decision that already exists has its challenge
+// re-issued after a policy revision, that re-issue is shed, and the row it is
+// written into is already somebody's. The row exists, so the ground has to be
+// right on it — an operator reading that decision back is owed the same
+// distinction as one reading a decide answer.
+func failureReason(shed bool) engine.Reason {
+	if shed {
+		return ReasonChallengeRateLimited
+	}
+	return ReasonChallengeFailed
 }
 
 // resolve applies a transition and writes it.
@@ -845,6 +1148,7 @@ func (s *Service) view(ctx context.Context, d store.Decision, progress []store.C
 		out.Outcome = engine.Deny
 		out.Reason = ReasonChallengeFailed
 	}
+	shed := false
 	for _, p := range progress {
 		view := ChallengeView{
 			Ordinal:  p.Ordinal,
@@ -856,6 +1160,9 @@ func (s *Service) view(ctx context.Context, d store.Decision, progress []store.C
 		if err != nil {
 			return Result{}, err
 		}
+		if st.Shed {
+			shed = true
+		}
 		view.Have, view.Need = st.Have, st.Need
 		published, err := s.publish(ctx, d, p, now)
 		if err != nil {
@@ -866,6 +1173,14 @@ func (s *Service) view(ctx context.Context, d store.Decision, progress []store.C
 		// reading is used for progress counts, but promoting a challenge to
 		// satisfied is a write, and a read path must not perform one.
 		out.Challenges = append(out.Challenges, view)
+	}
+	// The ground of a denied decision is recomputed here rather than remembered,
+	// because nothing on the row remembers it: the state is written, the reason
+	// is derived. Deriving it from the same Status answers the resolution used
+	// is what keeps a decision reading the same afterwards as it did in the
+	// response that created it.
+	if out.Reason == ReasonChallengeFailed {
+		out.Reason = failureReason(shed)
 	}
 	return out, nil
 }
@@ -902,6 +1217,49 @@ func (s *Service) mayAccess(ctx context.Context, caller *identity.Subject, d sto
 	return false, nil
 }
 
+// mayActOn answers whether a submitter is allowed to learn anything about this
+// decision beyond "no such decision".
+//
+// It is R40's read rule plus one case the read rule has no room for. A caller
+// who may read the decision — its creator, or a target of any of its challenges
+// — obviously may be told why their submission was refused. The case underneath
+// is a challenge kind whose handler names no targets at all: an external
+// challenge's counterparty is a system STAMP called out to, it holds no identity
+// this service could compare against anything, and what it holds instead is a
+// signature over a nonce this server minted, which only the handler can check.
+// Refusing it here would not close an oracle, it would break the challenge kind
+// — every callback would be turned away before the handler ever saw the
+// credential that authenticates it.
+//
+// That fallback is narrowed to non-people. The counterparty of a handler with no
+// targets arrives as a workload on the callback listener, whose refusals are one
+// uniform 403; an end-user credential is never that counterparty, and admitting
+// one would hand the console's callers back the state oracle for every decision
+// gated on an external challenge.
+//
+// A kind this build has no handler for is nobody's to act on. The 501 that says
+// so is preserved for a caller with standing through some other challenge, and
+// withheld from everyone else — a build that cannot load a handler cannot
+// identify that handler's targets either, so "no such decision" is the only
+// answer it can give without guessing.
+func (s *Service) mayActOn(
+	ctx context.Context, caller *identity.Subject,
+	d store.Decision, progress []store.ChallengeProgress, target store.ChallengeProgress,
+) (bool, error) {
+	allowed, err := s.mayAccess(ctx, caller, d, progress)
+	if err != nil || allowed {
+		return allowed, err
+	}
+	handler, err := s.challenges.Handler(target.Kind)
+	if err != nil {
+		return false, nil //nolint:nilerr // an unknown kind is not a failure to answer, it is the answer
+	}
+	if _, named := handler.(challenge.Targeter); named {
+		return false, nil
+	}
+	return caller.Kind != identity.SubjectUser, nil
+}
+
 // refuse records a decide that produced no decision object and returns the deny
 // the caller sees.
 func (s *Service) refuse(ctx context.Context, req Request, reason engine.Reason, detail map[string]any) (Result, error) {
@@ -928,6 +1286,31 @@ func (s *Service) refuse(ctx context.Context, req Request, reason engine.Reason,
 		Reason:      reason,
 		Obligations: []Obligation{},
 	}, nil
+}
+
+// refuseShed is [Service.refuse] for a decide whose challenge issuance was shed,
+// with the wait the handler asked for attached.
+//
+// It is a wrapper and not a parameter on refuse because every other refusal this
+// service makes is one a caller must not be invited to repeat. An outstanding
+// cap clears when another decision closes, not when a timer expires, and a
+// policy deny never clears at all — handing either of them a Retry-After would
+// tell a PEP to come back and be refused identically, at a cadence this
+// deployment chose. Only a shed request has an answer to that question, so only
+// this path can carry one.
+func (s *Service) refuseShed(ctx context.Context, req Request,
+	retryAfter time.Duration, detail map[string]any,
+) (Result, error) {
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	detail["retry_after_seconds"] = int(math.Ceil(retryAfter.Seconds()))
+	out, err := s.refuse(ctx, req, ReasonChallengeRateLimited, detail)
+	if err != nil {
+		return Result{}, err
+	}
+	out.RetryAfter = retryAfter
+	return out, nil
 }
 
 // auditAccessRefusal records a caller turned away from a decision. The error it
@@ -1033,6 +1416,134 @@ func requestPayload(in engine.Input) map[string]any {
 		"resource": entity(in.Resource),
 		"context":  entity(in.Context),
 	}
+}
+
+// idempotencyFingerprintBinding is the domain separator in the digest. It is
+// there for the reason mfa.ContextBindingContext is there: a digest with no
+// label is a digest that can be replayed as some other digest the day this
+// repository hashes a second thing shaped like a request.
+const idempotencyFingerprintBinding = "stamp/idempotency-fingerprint/v1"
+
+// requestFingerprint is the digest an idempotency key is bound to: what the
+// decision the key names was actually about.
+//
+// **Why a key needs one at all.** The lookup used to compare `(caller, key)` and
+// nothing else, and the header's documentation said out loud that the server
+// does not compare the key against the request body — without saying what that
+// costs. It costs this: a caller reusing `job-91` for a different subject,
+// resource or action was handed the first decision back, `201`, `state:
+// allowed`, for an authorization this engine had never evaluated. And
+// [Result] carries no subject, resource or action, so the PEP had nothing to
+// compare either — the substitution was not merely undetected, it was
+// undetectable from the answer. A generated key makes this a bug in a client;
+// a key derived from something a request carries — an order number, a job id —
+// makes it reachable from outside the client, by anyone who can get two
+// different requests to name themselves the same way.
+//
+// **What it covers.** The action, the subject, the resource and the context,
+// which is to say [requestPayload] — everything the evaluation read from the
+// caller. The evidence is deliberately not in it: facts are resolved by this
+// engine and move on their own, so hashing them would turn "the same request,
+// asked again" into a mismatch every time a velocity counter ticked, and a
+// retry that reports 409 because a fact changed is the orphaned-decision
+// failure #47 exists to prevent, wearing a different word.
+//
+// **Why hashing requestPayload is canonical and not merely convenient.** Two
+// requests that mean the same thing have to produce the same digest, or a
+// retry of an unchanged request is refused. Three properties make that true and
+// all three are load-bearing:
+//
+//   - encoding/json sorts map keys, so the attribute maps here encode in one
+//     order regardless of how the JSON arrived or how Go's map iteration ran;
+//   - the values in those maps are not the caller's bytes but the typed values
+//     api.attributeValue produced against the declared schema — an int64, a
+//     float64, a time.Time in UTC — so `25000`, `25000.0` and `2.5e4` for a
+//     declared int all arrive here as one value and hash alike;
+//   - an attribute the schema does not declare never reaches this function,
+//     having been dropped at the surface, so a caller cannot move the digest
+//     with a field the policy could not read.
+//
+// What the third property costs is worth stating: two requests that differ only
+// in an undeclared property are one request to this digest, and the second is
+// answered with the first's decision. That is correct — they are one request to
+// the evaluation too, which is the thing the decision froze — but it is only
+// correct as long as the fingerprint is computed from the evaluated input and
+// never from the raw body.
+//
+// The one shape that is not canonical is a `double` attribute, where a caller
+// writing `1.0` and `1` produces the same float64 and hashes alike, but
+// `0.1+0.2` and `0.3` do not. That is float equality, it is the same answer the
+// policy evaluation gives, and a fingerprint that disagreed with the evaluator
+// about whether two requests are the same would be the worse failure.
+func requestFingerprint(in engine.Input) string {
+	// mustJSON and not json.Marshal-with-error, on the same reasoning: the value
+	// hashed here is the value about to be frozen onto the row by the same call,
+	// so an encoding failure would have to be a failure that happens exactly
+	// once. If it ever did, mustJSON's `{}` would make every request hash alike,
+	// so the binding label is not enough on its own — the digest covers the
+	// encoded bytes and the length of them.
+	payload := mustJSON(requestPayload(in))
+	h := sha256.New()
+	h.Write([]byte(idempotencyFingerprintBinding))
+	h.Write([]byte{0x1f})
+	h.Write([]byte(strconv.Itoa(len(payload))))
+	h.Write([]byte{0x1f})
+	h.Write(payload)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// fingerprintFor pairs a fingerprint with the key it qualifies: a decision
+// nobody named carries neither.
+//
+// The two columns are NULL together or set together, and the schema says so as
+// a CHECK — see migration 000008. A row with a key and no fingerprint is a row
+// the lookup cannot answer for, and this is the one place that could have
+// written one.
+func fingerprintFor(key, fingerprint string) string {
+	if key == "" {
+		return ""
+	}
+	return fingerprint
+}
+
+// sameRequest reports whether a stored decision is the one a key names.
+//
+// It is fail-closed on a stored decision that carries a key and no fingerprint.
+// Such a row cannot be proved to name this request, and "cannot prove" has to
+// answer the same way as "proved different": the alternative is that a row
+// written before the fingerprint existed becomes a row where the substitution
+// still works, which is a hole with a shape an attacker can look for.
+//
+// Nothing can be in that state. The key column, the fingerprint column and the
+// unique index arrived unreleased in migrations 8 and 9, so there is no
+// deployment where a keyed decision was written by a binary that did not compute
+// a fingerprint, and the CHECK makes one unwritable from now on. The branch is
+// here because a security property that rests on "no such row exists" should
+// still be safe on the day one does.
+func sameRequest(stored store.Decision, fingerprint string) bool {
+	if stored.IdempotencyFingerprint == "" {
+		return false
+	}
+	// Not constant time, deliberately. Both sides are digests of values this
+	// caller already holds — it sent one of them and created the other — so
+	// there is no secret here to leak the comparison of, and subtle.ConstantTimeCompare
+	// where it buys nothing is how the next reader learns to distrust the places
+	// it does buy something.
+	return stored.IdempotencyFingerprint == fingerprint
+}
+
+// keyReused is the refusal a spent key gets.
+//
+// The message names the key and not the decision. Which decision the key already
+// holds is something the caller is entitled to know — it created that decision —
+// but it learns it by asking with the request that key names, not by sending a
+// different one; and an identifier in an error string is an identifier in every
+// log that error reaches, on a path whose whole subject is a caller confusing
+// two requests for each other.
+func keyReused(req Request, existing store.Decision) error {
+	return fmt.Errorf("%w: caller %q used key %q for %s on %s, and it names %s on %s",
+		ErrIdempotencyKeyReused, req.Caller.CallerID(), req.IdempotencyKey,
+		req.Input.Action, req.Input.Resource.ID, existing.Action, existing.ResourceID)
 }
 
 func decodeObligations(raw json.RawMessage) ([]Obligation, error) {

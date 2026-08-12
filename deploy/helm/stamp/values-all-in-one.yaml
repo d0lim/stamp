@@ -10,6 +10,24 @@ image:
   repository: ghcr.io/d0lim/stamp
   tag: ""
 
+# The listener the documents below make necessary. This release mounts the
+# ingest grants and the external targets, and both of those are spent on the
+# callback surface: a producer's batches arrive on POST /ingest/v1/events and an
+# external target answers on POST /external/{id}/{ordinal}. Leaving it at its
+# default here would render a manifest that carries the credentials for two
+# routes nothing in the release listens on — which is what the chart now refuses
+# (see values-no-callback.yaml). It stays off in values.yaml because it is the
+# one surface a deployment may have to publish past its perimeter (R39); a
+# release that needs it says so, and this one does.
+listeners:
+  callback:
+    enabled: true
+
+# Where that listener is published. It is told to an external target so the
+# target knows where to answer, and it is a different address from the bind
+# address above.
+callbackBaseUrl: https://stamp.example
+
 oidc:
   issuer: https://idp.example
   jwksUrl: https://idp.example/.well-known/jwks.json

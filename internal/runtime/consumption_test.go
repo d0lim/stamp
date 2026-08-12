@@ -48,7 +48,10 @@ package runtime
 //   - All four historical cases are "no read at all", not "read and
 //     discarded". (a) detects the first exactly. It cannot detect the second,
 //     and that is stated here rather than hidden: a line that reads a field
-//     into a variable the composition root then ignores would pass this test.
+//     into a variable the composition root then ignores would pass this test,
+//     and so would one in a function nothing calls. The second half of that is
+//     asserted rather than only asserted about — see
+//     TestConfigConsumptionCheckReportsADeadRead and the note at the bottom.
 //   - The strength (b) buys is bought back partly by the coverage rules below.
 //     A read only counts when it happens at the composition root, so the
 //     round trip through ConfigFromEnv and Config.validate — reading a field
@@ -184,6 +187,62 @@ func TestConfigConsumptionCheckDetectsAnUnwiredField(t *testing.T) {
 	}
 }
 
+// deadConfigRead is a delivery that never happens, in the shape the scan is
+// least able to tell from a real one.
+//
+// Nothing calls the function, and the read inside it sits behind a constant that
+// is never true, so no execution of this process can reach it. The scan is a
+// syntactic one: it sees a selector on a rooted name and records the path. The
+// text is planted into an in-memory copy of a composition-root file, so it is
+// parsed and never compiled — which is why an `if false` the compiler would
+// object to is fine here.
+const deadConfigRead = `
+func deadReadPlantedByAConsumptionTest(cfg Config) {
+	if false {
+		_ = cfg.AuditCapacity
+	}
+}
+`
+
+// TestConfigConsumptionCheckReportsADeadRead pins the check's blind spot as a
+// tested fact rather than a documented one.
+//
+// The scan cannot tell a read that runs from a read that cannot run, and the
+// note at the bottom of this file says so. A limitation that is only written
+// down drifts: the next person to touch the scan has nothing telling them which
+// side of the line they are on. So the case below removes a field's real
+// delivery, plants an unreachable read of it, and requires the scan to call the
+// field consumed — the wrong answer, asserted on purpose, because it is the
+// answer this design chose.
+//
+// The choice is deliberate and this test is not a request to revisit it. Making
+// the scan reachability-aware means call-graph analysis over the composition
+// root, which is a large amount of machinery, and every historical case this
+// file exists for was a field with no read at all rather than a read that could
+// not run. If someone builds it anyway, this test fails, and that failure is the
+// notification that the limitation moved — delete the case and the note together.
+func TestConfigConsumptionCheckReportsADeadRead(t *testing.T) {
+	leaves, typePaths := configLeaves(t)
+	const field = "AuditCapacity"
+	const delivery = "cfg.AuditCapacity," // the one line that really delivers it
+
+	// Without the plant the field is unconsumed, which is what makes the plant
+	// the only thing the next assertion can be reacting to.
+	gone := compositionRootReads(t, leaves, typePaths, mutation{file: "wiring.go", remove: delivery})
+	if consumedBy(gone, field) {
+		t.Fatalf("Config.%s is still consumed with %q removed, so this case would prove nothing",
+			field, delivery)
+	}
+
+	reads := compositionRootReads(t, leaves, typePaths,
+		mutation{file: "wiring.go", remove: delivery, plant: deadConfigRead})
+	if !consumedBy(reads, field) {
+		t.Fatalf("the scan no longer counts an unreachable read of Config.%s as consumption. if that is "+
+			"deliberate — the scan became reachability-aware — this case and the limitation recorded at "+
+			"the bottom of this file both need deleting, together", field)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the walk over Config
 // ---------------------------------------------------------------------------
@@ -285,31 +344,43 @@ func consumedBy(reads map[string]bool, leaf string) bool {
 // the scan of the composition root
 // ---------------------------------------------------------------------------
 
-// mutation removes one line from one file before it is parsed, for the check on
-// the check. remove is a fragment of that line rather than the whole of it, so
-// that a reformatting of the file does not silently turn the mutation into a
-// no-op — which would leave the case passing for the wrong reason.
+// mutation edits one file before it is parsed, for the checks on the check.
+//
+// remove is a fragment of the single line to delete rather than the whole of it,
+// so that a reformatting of the file does not silently turn the mutation into a
+// no-op — which would leave the case passing for the wrong reason. plant is
+// source text appended to the file afterwards, which is how the reachability
+// case below gets a read into the scan's path that no execution can reach.
+// Either half may be empty.
 type mutation struct {
 	file   string
 	remove string
+	plant  string
 }
 
-// applyMutation deletes the single line holding the fragment.
+// applyMutation deletes the single line holding the fragment and appends the
+// planted source.
 func applyMutation(t *testing.T, name, text string, m mutation) string {
 	t.Helper()
-	lines := strings.Split(text, "\n")
-	var hits []int
-	for i, line := range lines {
-		if strings.Contains(line, m.remove) {
-			hits = append(hits, i)
+	if m.remove != "" {
+		lines := strings.Split(text, "\n")
+		var hits []int
+		for i, line := range lines {
+			if strings.Contains(line, m.remove) {
+				hits = append(hits, i)
+			}
 		}
+		if len(hits) != 1 {
+			t.Fatalf("the mutation case expects exactly one line of %s to hold %q and %d do: the case has "+
+				"drifted from the code it mutates", name, m.remove, len(hits))
+		}
+		lines[hits[0]] = ""
+		text = strings.Join(lines, "\n")
 	}
-	if len(hits) != 1 {
-		t.Fatalf("the mutation case expects exactly one line of %s to hold %q and %d do: the case has "+
-			"drifted from the code it mutates", name, m.remove, len(hits))
+	if m.plant != "" {
+		text += "\n" + m.plant + "\n"
 	}
-	lines[hits[0]] = ""
-	return strings.Join(lines, "\n")
+	return text
 }
 
 // compositionRootReads returns every configuration path the assembly reads.
@@ -538,6 +609,23 @@ func isConfigPath(path string, leaves []string) bool {
 // ---------------------------------------------------------------------------
 // what this check does not cover
 // ---------------------------------------------------------------------------
+//
+// A read that cannot run still counts as consumption. The scan is syntactic: it
+// resolves a selector to a configuration path and records it, and it has no idea
+// whether the function holding it is ever called, or whether the branch it sits
+// in is ever taken. A field delivered only inside a function nobody calls, or
+// only on the far side of a condition that is never true, passes this check —
+// so does a field read into a variable the composition root then ignores, which
+// is the same blindness said the other way round.
+//
+// That is not an oversight and it is not free to remove: knowing which reads run
+// means call-graph analysis over the composition root, and all four cases in the
+// header were fields with no read at all rather than reads that could not run.
+// The boundary is where it is on purpose, and
+// TestConfigConsumptionCheckReportsADeadRead asserts it from the wrong side —
+// plant an unreachable read, watch the check call the field consumed — so that
+// the limitation is a test rather than a paragraph. Anyone who moves the
+// boundary gets a failure telling them what they changed.
 //
 // Two of the four cases in the header are not Config fields, and no walk over
 // Config can reach them: the checkpoint subsystem had no configuration surface

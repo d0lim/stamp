@@ -43,7 +43,9 @@ package api
 
 import (
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/d0lim/stamp/internal/decision"
@@ -80,43 +82,135 @@ const (
 	rateScopeSubject = "subject"
 )
 
-// decideLimiter charges the two budgets and reports which one ran out.
-type decideLimiter struct {
-	limiter *stream.Limiter
-	caller  stream.RateLimit
-	subject stream.RateLimit
+// RetryAfterHeader is the one transport-level thing a shed request says.
+//
+// The header exists because the refusal's body does not travel. A denied
+// decision object is legible to something that speaks this API, and the things
+// between a PEP and this handler — a retry middleware, a gateway, a dashboard —
+// do not: they read a status line and a header table. Without one of those
+// saying anything, a request that was shed and a request that was judged are the
+// same event to every one of them, which is the blindness #45 names.
+const RetryAfterHeader = "Retry-After"
+
+// maxRetryAfterSeconds bounds what a refusal will ask a caller to wait.
+//
+// A budget can be configured arbitrarily slow, and 1/PerSecond for a very small
+// rate is a number no client will honour and float arithmetic will eventually
+// stop representing. Clamping under-promises — a caller comes back too early and
+// is refused again, which is the state it was already in. Over-promising is the
+// failure that matters, because a caller told to wait longer than the budget
+// needs has been made slower than the limit asks for, by the limit.
+const maxRetryAfterSeconds = 3600
+
+// retryAfterSeconds is how long until this budget has a token again, in the
+// whole seconds RFC 9110 gives the header.
+//
+// It is the refill interval — one token's worth of time at the sustained rate —
+// and not the time until the bucket is full. What a refused caller needs is the
+// moment one more request will be admitted, and the burst above that is capacity
+// they have already spent.
+//
+// It rounds up, because the alternative rounds a sub-second interval to zero and
+// invites the retry storm the limit exists to shed: every budget this surface
+// ships by default refills faster than once a second, so zero would be the
+// common answer rather than the edge case.
+func retryAfterSeconds(l stream.RateLimit) int {
+	return retryAfterSecondsFor(l.RefillInterval())
 }
 
+// retryAfterSecondsFor is [retryAfterSeconds] for a wait somebody else computed.
+//
+// It exists because the surface is no longer the only thing that sheds. A
+// challenge handler owns its own issuance budgets and is the only thing that
+// knows which of them refused, so it reports a duration and this renders it —
+// rather than the surface guessing from a budget it does not hold. Two renderers
+// would be two clamps and eventually two answers to "how long", which is the one
+// number the header exists to carry.
+func retryAfterSecondsFor(d time.Duration) int {
+	if d <= 0 {
+		// Not reachable from a refusal — an unlimited budget refuses nothing —
+		// but a header that said "0" or "-1" would be worse than the one second
+		// this answers with if a later caller finds a path here.
+		return 1
+	}
+	interval := math.Ceil(d.Seconds())
+	if interval < 1 {
+		return 1
+	}
+	if interval > maxRetryAfterSeconds {
+		return maxRetryAfterSeconds
+	}
+	return int(interval)
+}
+
+// decideLimiter charges the two budgets and reports which one ran out.
+//
+// The two budgets get two tables, and that is the part worth stating, because
+// one table with two key namespaces in it is the shape this started as. A
+// bounded table refuses when it is full and a sweep frees nothing, so the
+// entries in it are a resource the keys compete for: a flood of invented
+// subjects would fill a shared table, and the next caller to arrive — one that
+// had spent none of its own budget — would be refused for pressure it did not
+// create. Prefixing the keys kept the two namespaces from naming the same
+// bucket; it did nothing about the one cap they were both spending.
+type decideLimiter struct {
+	callers  *stream.Limiter
+	subjects *stream.Limiter
+	caller   stream.RateLimit
+	subject  stream.RateLimit
+}
+
+// newDecideLimiter gives each budget a table of maxEntries.
+//
+// maxEntries bounds each table rather than the two together, so the split costs
+// memory rather than capacity. Measured, a limiter entry — the bucket, the map
+// slot and the key's bytes at the length the decide surface's keys actually run
+// to — is 136 bytes, so a table at the 8192-entry default holds about 1.06 MiB
+// and the second one costs that again. That is the whole of the price, and it
+// is paid by a process that already holds a policy set, a schema cache and a
+// database pool.
+//
+// That arithmetic is only true because the keys are bounded, and it used not to
+// be. A map key retains its own bytes, the subject table's key is the subject
+// identifier the caller sent, and until [MaxEntityIDBytes] existed the only
+// ceiling on one was the 1 MiB body cap — so the sentence above was a
+// measurement of what well-behaved callers happened to send, and the same 8192
+// entries could be made to hold gigabytes by a caller who chose to. The worst
+// case is now stated rather than assumed: an entry whose key sits at the
+// 255-byte bound costs the 136 above plus the difference, which is roughly 365
+// bytes, so a table an adversary filled holds under 3 MiB and the pair under 6.
+// The 1.06 MiB is what it costs in practice; this is what it cannot exceed.
+//
+// The alternative was to divide the existing 8192 between the two tables, and it
+// is the wrong trade in the direction that matters. The caller table needs one
+// entry per credential — a deployment has as many as it has PEPs — while the
+// subject table needs one per distinct subject in flight, which is the number
+// that grows with traffic. Halving that one narrows the window before
+// sweep-or-refuse starts refusing legitimate requests, which is to say it would
+// buy back a megabyte by making the availability property worse under exactly
+// the load this limit exists for.
 func newDecideLimiter(caller, subject stream.RateLimit, maxEntries int, now func() time.Time) *decideLimiter {
-	// A zero field takes the default for that field, so an operator who raised
-	// the burst does not have to restate the rate.
-	if caller.PerSecond == 0 {
-		caller.PerSecond = DefaultDecideRate.PerSecond
-	}
-	if caller.Burst == 0 {
-		caller.Burst = DefaultDecideRate.Burst
-	}
-	if subject.PerSecond == 0 {
-		subject.PerSecond = DefaultDecideSubjectRate.PerSecond
-	}
-	if subject.Burst == 0 {
-		subject.Burst = DefaultDecideSubjectRate.Burst
-	}
+	caller = caller.WithZeroDefault(DefaultDecideRate)
+	subject = subject.WithZeroDefault(DefaultDecideSubjectRate)
 	return &decideLimiter{
-		limiter: stream.NewLimiter(maxEntries, now),
-		caller:  caller,
-		subject: subject,
+		callers:  stream.NewLimiter(maxEntries, now),
+		subjects: stream.NewLimiter(maxEntries, now),
+		caller:   caller,
+		subject:  subject,
 	}
 }
 
 // allowCaller charges one decide against the caller's budget.
 //
-// The key is prefixed so that a caller identifier can never collide with a
-// subject identifier: the two namespaces are unrelated and both are attacker
-// influenced, and one budget answering for the other is a limit that can be
-// spent by someone it was not measuring.
+// The key is the caller identifier unprefixed, because the table it goes in
+// holds nothing else. A caller identifier and a subject identifier are unrelated
+// strings from unrelated namespaces and both are attacker influenced, so one
+// bucket answering for both would be a budget spendable by someone it was not
+// measuring — that guarantee used to be a `\x1f` prefix on a shared table's key
+// and is now the separation of the tables themselves. Merging them back
+// reintroduces both the collision and the crowding out above it.
 func (l *decideLimiter) allowCaller(callerID string) bool {
-	return l.limiter.Allow("caller\x1f"+callerID, l.caller, 1)
+	return l.callers.Allow(callerID, l.caller, 1)
 }
 
 // allowSubject charges one decide against the subject's budget.
@@ -127,7 +221,7 @@ func (l *decideLimiter) allowCaller(callerID string) bool {
 // identifier be charged twice as much by being called two things. No caller, for
 // the reason at the top of this file.
 func (l *decideLimiter) allowSubject(subjectID string) bool {
-	return l.limiter.Allow("subject\x1f"+subjectID, l.subject, 1)
+	return l.subjects.Allow(subjectID, l.subject, 1)
 }
 
 // rateRefusal is everything the surface has to say about a request it shed.
@@ -147,6 +241,27 @@ type rateRefusal struct {
 // to learn that its request was judged has two answers to keep in step. What
 // makes this deny distinguishable from a policy deny is the reason, which is
 // the mechanism decision.ReasonOutstandingCap already established.
+//
+// The response carries `Retry-After`, and that is the one part of it that is
+// unusual enough to want stating. RFC 9110 specifies the header on 429, 503 and
+// the 3xx redirects, and this is a 200 — so it is being used outside the letter
+// of the specification, deliberately, and with its eyes open. The alternative
+// was worse in both directions: changing the status to 429 breaks the property
+// above (a PEP would have to read the transport to learn it was judged), and
+// leaving the header off leaves every intermediary unable to tell a shed request
+// from a judged one, which is the whole of #45.
+//
+// **What it buys here is observability and not client back-off, and the claim
+// should not be made larger than that.** Every mainstream retry implementation
+// branches on the status line first — Go's http.Client, urllib3's Retry, Java's
+// HttpClient, the axios retry plugins all look for 429 or 5xx before they read a
+// header — so a 200 never reaches the layer that would honour this one. A client
+// that backs off does so because it read `state` and `reason` out of the body,
+// which is code it could have written before this header existed. What genuinely
+// changed is that meshes, log pipelines and exporters read header tables without
+// parsing bodies, and they can now count shed requests apart from judged ones.
+// On the approval surface's 429 the header is in its specified place and clients
+// do honour it; describing the two with one sentence would overstate this one.
 //
 // The audit goes through the buffer rather than through a synchronous chain
 // append, and the reasoning is in the shape of the thing being recorded. This is
@@ -179,6 +294,10 @@ func (d *Decisions) refuseRate(w http.ResponseWriter, r *http.Request, callerID 
 	}
 	d.audit.Record(r.Context(), e)
 
+	// The budget that ran out is the one whose interval is named: a caller told
+	// to wait the subject budget's interval when it was its own that was spent
+	// has been handed a number about somebody else's traffic.
+	w.Header().Set(RetryAfterHeader, strconv.Itoa(retryAfterSeconds(ref.limit)))
 	writeJSON(w, http.StatusOK, decision.Result{
 		State:       store.DecisionDenied,
 		Outcome:     engine.Deny,

@@ -33,6 +33,9 @@ func clearEnv(t *testing.T) {
 		EnvPolicyRefreshInterval, EnvPolicyStalenessDeadline,
 		EnvDecisionTTL, EnvMaxOutstanding,
 		EnvDecideRate, EnvDecideBurst, EnvDecideSubjectRate, EnvDecideSubjectRateBurst,
+		EnvChallengeIssueRate, EnvChallengeIssueBurst,
+		EnvChallengeIssueCeilingRate, EnvChallengeIssueCeilingBurst,
+		EnvApprovalRate, EnvApprovalBurst,
 		EnvFloorMinApprovers, EnvFloorProposerMayApprove,
 		EnvRevisionTTL, EnvReconcileInterval, EnvBootstrapWarnInterval,
 		EnvAuthoringMode, EnvCapabilityClaim,
@@ -832,6 +835,112 @@ func TestConfigFromEnvReadsTheDecideRateLimits(t *testing.T) {
 		}
 		if cfg.DecideRate.PerSecond != -1 {
 			t.Errorf("caller rate = %v, want the operator's -1 carried through", cfg.DecideRate.PerSecond)
+		}
+	})
+}
+
+// TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits is the other two axes
+// of R43 on the deployment surface.
+//
+// They are read the way the decide rates are, and validated by the same
+// function, because an operator who mistyped the approval burst is in exactly
+// the position the decide burst's check exists for: a limit validated on one
+// surface and not another is a limit somebody can be silently without.
+func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		clearEnv(t)
+		t.Setenv(EnvDSN, "postgres://stamp@localhost/stamp")
+		t.Setenv(EnvOIDCIssuer, "https://idp.example")
+		t.Setenv(EnvOIDCJWKSURL, "https://idp.example/jwks")
+		t.Setenv(EnvOIDCAudience, "stamp")
+	}
+
+	t.Run("unset leaves the defaults to the handlers", func(t *testing.T) {
+		base(t)
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		// Zero is "the operator said nothing", and each handler reads it as its
+		// own default — which is a real number, not "unlimited". An operator who
+		// means no limit writes a negative rate.
+		if cfg.ChallengeIssueRate != (stream.RateLimit{}) || cfg.ApprovalSubmitRate != (stream.RateLimit{}) ||
+			cfg.ChallengeIssueSubjectCeiling != (stream.RateLimit{}) {
+			t.Errorf("rates = %+v / %+v / %+v, want zero so the handlers default them",
+				cfg.ChallengeIssueRate, cfg.ChallengeIssueSubjectCeiling, cfg.ApprovalSubmitRate)
+		}
+	})
+
+	t.Run("the six variables are read", func(t *testing.T) {
+		base(t)
+		t.Setenv(EnvChallengeIssueRate, "0.1")
+		t.Setenv(EnvChallengeIssueBurst, "4")
+		t.Setenv(EnvChallengeIssueCeilingRate, "0.02")
+		t.Setenv(EnvChallengeIssueCeilingBurst, "12")
+		t.Setenv(EnvApprovalRate, "3")
+		t.Setenv(EnvApprovalBurst, "30")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("ConfigFromEnv: %v", err)
+		}
+		if want := (stream.RateLimit{PerSecond: 0.1, Burst: 4}); cfg.ChallengeIssueRate != want {
+			t.Errorf("challenge issue rate = %+v, want %+v", cfg.ChallengeIssueRate, want)
+		}
+		// The ceiling is its own pair of variables. One knob for both would be
+		// an operator raising what a caller may ask of a person and silently
+		// raising what the person can be asked in total, which are different
+		// questions with different right answers.
+		if want := (stream.RateLimit{PerSecond: 0.02, Burst: 12}); cfg.ChallengeIssueSubjectCeiling != want {
+			t.Errorf("challenge issue ceiling = %+v, want %+v", cfg.ChallengeIssueSubjectCeiling, want)
+		}
+		if want := (stream.RateLimit{PerSecond: 3, Burst: 30}); cfg.ApprovalSubmitRate != want {
+			t.Errorf("approval rate = %+v, want %+v", cfg.ApprovalSubmitRate, want)
+		}
+	})
+
+	for name, tc := range map[string]struct {
+		key, value string
+		names      string
+	}{
+		"an unparseable challenge rate": {key: EnvChallengeIssueRate, value: "slow", names: EnvChallengeIssueRate},
+		"a negative challenge burst":    {key: EnvChallengeIssueBurst, value: "-1", names: EnvChallengeIssueBurst},
+		// The ceiling is validated by the same function as every other R43
+		// budget. A limit checked on five of six surfaces is a limit somebody
+		// can be silently without.
+		"an unparseable ceiling rate":  {key: EnvChallengeIssueCeilingRate, value: "slow", names: EnvChallengeIssueCeilingRate},
+		"a negative ceiling burst":     {key: EnvChallengeIssueCeilingBurst, value: "-1", names: EnvChallengeIssueCeilingBurst},
+		"an unparseable approval rate": {key: EnvApprovalRate, value: "fast", names: EnvApprovalRate},
+		"a negative approval burst":    {key: EnvApprovalBurst, value: "-2", names: EnvApprovalBurst},
+		"an approval burst with no rate": {
+			key: EnvApprovalBurst, value: "10", names: EnvApprovalBurst,
+		},
+	} {
+		t.Run(name+" is a startup failure", func(t *testing.T) {
+			base(t)
+			if name == "an approval burst with no rate" {
+				// The operator who wrote down a limit and would have got none.
+				t.Setenv(EnvApprovalRate, "-1")
+			}
+			t.Setenv(tc.key, tc.value)
+			if _, err := ConfigFromEnv(); err == nil {
+				t.Fatalf("%s=%q was accepted", tc.key, tc.value)
+			} else if !strings.Contains(err.Error(), tc.names) {
+				t.Errorf("the refusal does not name %s:\n%v", tc.names, err)
+			}
+		})
+	}
+
+	t.Run("a negative rate on its own removes the limit", func(t *testing.T) {
+		base(t)
+		t.Setenv(EnvChallengeIssueRate, "-1")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("saying no limit out loud was refused: %v", err)
+		}
+		if cfg.ChallengeIssueRate.PerSecond != -1 {
+			t.Errorf("challenge issue rate = %v, want the operator's -1 carried through",
+				cfg.ChallengeIssueRate.PerSecond)
 		}
 	})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/fact"
 	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // The external tests are about a trust boundary and a fail-closed default.
@@ -716,6 +718,96 @@ func TestExternalFailsClosedWhenTheRoundTripDoesNotHappen(t *testing.T) {
 			t.Fatalf("failure = %q, want %q", detail.Failure, challenge.ExternalFailureTransport)
 		}
 	})
+}
+
+// TestExternalStopsDispatchingOverTheSubjectBudget is R43's dispatch half.
+//
+// The refusal shape is the point of the test. There is no HTTP response of this
+// handler's own to put a 429 on — Issue is answering the decide path, not the
+// target — so the limit has to be expressible as challenge state, and it is: a
+// failed challenge with its own word on the row, which the lifecycle turns into
+// a denied decision. What must not happen is the notification going out anyway,
+// which is why the target's own count is the assertion that matters.
+func TestExternalStopsDispatchingOverTheSubjectBudget(t *testing.T) {
+	t.Parallel()
+	tgt := newNotifiedTarget(t)
+	const burst = 3
+	h, err := challenge.NewExternal(challenge.ExternalConfig{
+		Gate: loopbackGate(t, originOf(t, tgt.server.URL)),
+		Targets: []challenge.ExternalTarget{{
+			Name: "risk-engine", URL: tgt.server.URL + "/hook", Secret: testExternalSecret,
+		}},
+		SubjectRate: stream.RateLimit{PerSecond: 1, Burst: burst},
+	})
+	if err != nil {
+		t.Fatalf("new external handler: %v", err)
+	}
+
+	issueAt := func(id string, subject string, at time.Time) challenge.ExternalDetail {
+		t.Helper()
+		dec := externalContext()
+		dec.DecisionID = id
+		dec.SubjectID = subject
+		issued, ierr := h.Issue(context.Background(), challenge.IssueRequest{
+			Instance: challenge.Instance{DecisionID: id, Ordinal: 0, Kind: policy.ChallengeExternal},
+			Spec:     policy.External{Target: "risk-engine"},
+			Decision: dec,
+			Now:      at,
+		})
+		if ierr != nil {
+			t.Fatalf("issue %s: %v", id, ierr)
+		}
+		detail, ok := issued.Detail.(challenge.ExternalDetail)
+		if !ok {
+			t.Fatalf("issue returned detail of type %T", issued.Detail)
+		}
+		// Status has to agree with what Issue returned, because the lifecycle
+		// writes every challenge pending and asks Status afterwards.
+		raw := mustJSONBody(t, detail)
+		st, serr := h.Status(context.Background(), challenge.StatusRequest{
+			Instance: challenge.Instance{DecisionID: id, Ordinal: 0, Kind: policy.ChallengeExternal},
+			Decision: dec, Detail: raw, Stored: challenge.StatePending, Now: at.Add(time.Second),
+		})
+		if serr != nil {
+			t.Fatalf("status %s: %v", id, serr)
+		}
+		if st.State != issued.State {
+			t.Fatalf("status of %s = %q but issue returned %q", id, st.State, issued.State)
+		}
+		// And it has to agree about *why*. Shed is set for the one failure that
+		// means the target was never called, and for no other — it is what the
+		// decision layer reads to deny on load shedding rather than on a refusal
+		// somebody made, and a bit that were set for every failure would collapse
+		// the two back together.
+		if want := detail.Failure == challenge.ExternalFailureRateLimited; st.Shed != want {
+			t.Fatalf("status of %s reported Shed=%v with failure %q, want %v",
+				id, st.Shed, detail.Failure, want)
+		}
+		return detail
+	}
+
+	for i := range burst {
+		if d := issueAt(fmt.Sprintf("dec-%02d", i), "alice", testNow); d.Failure != "" {
+			t.Fatalf("issue %d within the burst failed with %q", i, d.Failure)
+		}
+	}
+	shed := issueAt("dec-over", "alice", testNow)
+	if shed.Failure != challenge.ExternalFailureRateLimited {
+		t.Fatalf("failure = %q, want %q", shed.Failure, challenge.ExternalFailureRateLimited)
+	}
+	bodies, _ := tgt.received()
+	if len(bodies) != burst {
+		t.Errorf("the target received %d notifications, want %d: the refusal happened after the POST",
+			len(bodies), burst)
+	}
+
+	// Another subject is unaffected, and the budget comes back with time.
+	if d := issueAt("dec-other", "bob", testNow); d.Failure != "" {
+		t.Errorf("a second subject's first notification failed with %q", d.Failure)
+	}
+	if d := issueAt("dec-later", "alice", testNow.Add(time.Second)); d.Failure != "" {
+		t.Errorf("a refill window later the notification still failed with %q", d.Failure)
+	}
 }
 
 // TestExternalStatusFailsWhenTheCallbackNeverArrives is the other half of the

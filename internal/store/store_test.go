@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -210,14 +211,52 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean migrate")
 	}
-	if version != 7 {
-		t.Fatalf("schema version = %d, want 7", version)
+	if version != 9 {
+		t.Fatalf("schema version = %d, want 9", version)
 	}
 
-	// The newest migration is index-only. Its indexes are the audit console's
-	// query axes, so their absence is a silently slow console rather than a
-	// failure, which is exactly the kind of regression a count assertion alone
-	// would not catch.
+	// 000008 is the idempotency key and its length check; 000009 is the unique
+	// index that backstops the key, split off so it can be built CONCURRENTLY
+	// instead of holding ACCESS EXCLUSIVE on `decisions` for a full heap scan.
+	// The index is named here rather than counted, because its name is what the
+	// store reads off a 23505 to tell a repeated key from a collided identifier:
+	// an index that exists under another name is a conflict reported as the wrong
+	// thing.
+	//
+	// That the index exists at all after a plain Migrate is the assertion that
+	// CREATE INDEX CONCURRENTLY is legal through this driver at all. The driver
+	// sends a migration file in one argument-less Exec, which pgx routes through
+	// the simple query protocol; a multi-statement simple query is an implicit
+	// transaction block and CONCURRENTLY would fail there with 25001. 000009
+	// holds exactly one statement so that it does not. If someone adds a second
+	// statement to that file, Migrate above fails and this test is where it says
+	// so.
+	if !columnExists(t, s, "decisions", "idempotency_key") {
+		t.Error("decisions.idempotency_key is missing after migrate")
+	}
+	// The fingerprint rides in the same migration as the key, because a key
+	// without one is the substitution the two columns together prevent: the
+	// decide path's lookup is fail-closed on a row that holds a key and no
+	// digest, so a schema with only the first column is a schema where every
+	// keyed retry is refused.
+	if !columnExists(t, s, "decisions", "idempotency_fingerprint") {
+		t.Error("decisions.idempotency_fingerprint is missing after migrate")
+	}
+	if !indexExists(t, s, "decisions_unique_idempotency_key") {
+		t.Error("index \"decisions_unique_idempotency_key\" is missing after migrate")
+	}
+	// CONCURRENTLY's failure mode is an index that exists and enforces nothing,
+	// so existence is not enough: an INVALID index is exactly what a build that
+	// died half-way leaves behind, and it would satisfy the check above while
+	// letting a second decision through on a key another one already holds.
+	if !indexIsValid(t, s, "decisions_unique_idempotency_key") {
+		t.Error("decisions_unique_idempotency_key exists but is INVALID: a concurrent build " +
+			"did not finish, and the index enforces nothing")
+	}
+
+	// 000007 is index-only. Its indexes are the audit console's query axes, so
+	// their absence is a silently slow console rather than a failure, which is
+	// exactly the kind of regression a count assertion alone would not catch.
 	for _, index := range []string{
 		"decisions_history_idx", "decisions_policy_history_idx",
 		"decisions_subject_history_idx", "decisions_state_history_idx",
@@ -248,8 +287,61 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if dirty {
 		t.Fatal("schema is dirty after a clean rollback")
 	}
+	if version != 8 {
+		t.Fatalf("schema version after one rollback = %d, want 8", version)
+	}
+	// Rolling back the index migration takes the index and leaves the column and
+	// its check, because the two are separate migrations now: a deployment that
+	// has to undo a stuck concurrent build should not have to give up the column
+	// the decide path already reads.
+	if indexExists(t, s, "decisions_unique_idempotency_key") {
+		t.Error("decisions_unique_idempotency_key survived the rollback of its own migration")
+	}
+	if !columnExists(t, s, "decisions", "idempotency_key") {
+		t.Error("decisions.idempotency_key was dropped by a rollback that only owns the index")
+	}
+	if !columnExists(t, s, "decisions", "idempotency_fingerprint") {
+		t.Error("decisions.idempotency_fingerprint was dropped by a rollback that only owns the index")
+	}
+
+	if err := s.MigrateDown(ctx, 1); err != nil {
+		t.Fatalf("migrate down 1: %v", err)
+	}
+	version, dirty, ok, err = s.SchemaVersion(ctx)
+	if err != nil || !ok {
+		t.Fatalf("schema version after rollback: ok=%v err=%v", ok, err)
+	}
+	if dirty {
+		t.Fatal("schema is dirty after a clean rollback")
+	}
+	if version != 7 {
+		t.Fatalf("schema version after two rollbacks = %d, want 7", version)
+	}
+	// Rolling back a column takes the column and its check, and leaves every
+	// decision row where it was. A rollback that dropped rows to drop a column
+	// would be a rollback nobody could run on a live deployment.
+	if columnExists(t, s, "decisions", "idempotency_key") {
+		t.Error("decisions.idempotency_key survived the rollback of its own migration")
+	}
+	if columnExists(t, s, "decisions", "idempotency_fingerprint") {
+		t.Error("decisions.idempotency_fingerprint survived the rollback of its own migration")
+	}
+	if !tableExists(t, s, "decisions") {
+		t.Error("decisions was dropped by a rollback that only added a column to it")
+	}
+
+	if err := s.MigrateDown(ctx, 1); err != nil {
+		t.Fatalf("migrate down 1: %v", err)
+	}
+	version, dirty, ok, err = s.SchemaVersion(ctx)
+	if err != nil || !ok {
+		t.Fatalf("schema version after rollback: ok=%v err=%v", ok, err)
+	}
+	if dirty {
+		t.Fatal("schema is dirty after a clean rollback")
+	}
 	if version != 6 {
-		t.Fatalf("schema version after one rollback = %d, want 6", version)
+		t.Fatalf("schema version after three rollbacks = %d, want 6", version)
 	}
 	// Rolling back an index-only migration takes the indexes and leaves every
 	// row where it was.
@@ -271,7 +363,7 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 		t.Fatal("schema is dirty after a clean rollback")
 	}
 	if version != 5 {
-		t.Fatalf("schema version after two rollbacks = %d, want 5", version)
+		t.Fatalf("schema version after four rollbacks = %d, want 5", version)
 	}
 	// 000006 only adds columns to policy_revisions, so rolling it back leaves
 	// the table and takes the column.
@@ -309,6 +401,82 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	}
 }
 
+// TestDecisionReadsFailAgainstTheSchemaBeforeTheirOwn pins the hazard the
+// readiness gate exists for.
+//
+// decisionColumns names idempotency_key, and it backs every decision read and
+// the create insert. That column arrives in 000008. Only one tier migrates — the
+// chart hands `database.migrate` to the `api` role alone — and `helm upgrade`
+// rolls every Deployment at once with no hook, no Job and no initContainer
+// sequencing them. So there is a window in every upgrade where a decide pod is
+// running this binary against schema 7, and this test is what that window looks
+// like from inside the process: not a slow query, not a missing field, but every
+// read failing outright with 42703.
+//
+// It asserts the failure rather than fixing it, because it cannot be fixed here:
+// the query has to name the column it selects. What the failure buys is the
+// argument for [Store.SchemaBehind] and the /readyz gate in front of it — the
+// pod must not be in its Service while this is the answer. If someone later
+// makes decision reads tolerate a missing column, this test fails and the gate's
+// justification has to be rewritten rather than quietly outlived.
+func TestDecisionReadsFailAgainstTheSchemaBeforeTheirOwn(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t, freshDB(t))
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate up: %v", err)
+	}
+	// Down to 7: 000009's index and 000008's column, in that order.
+	if err := s.MigrateDown(ctx, 2); err != nil {
+		t.Fatalf("migrate down 2: %v", err)
+	}
+	version, _, _, err := s.SchemaVersion(ctx)
+	if err != nil {
+		t.Fatalf("schema version: %v", err)
+	}
+	if version != 7 {
+		t.Fatalf("schema version = %d, want 7 (the version a pod can be ahead of)", version)
+	}
+
+	_, err = store.GetDecision(ctx, s.Pool(), "any-decision-id")
+	if err == nil {
+		t.Fatal("GetDecision succeeded against schema 7, which does not have decisions.idempotency_key: " +
+			"either the column moved out of decisionColumns or this test stopped rolling back far enough")
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetDecision reported ErrNotFound against schema 7: the read is supposed to fail on the "+
+			"schema, not on the row, and a not-found here would mean the mismatch is invisible: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "42703" {
+		t.Fatalf("GetDecision against schema 7 failed with %v, want SQLSTATE 42703 (undefined_column)", err)
+	}
+	if !strings.Contains(pgErr.Message, "idempotency_key") {
+		t.Errorf("42703 does not name idempotency_key: %q", pgErr.Message)
+	}
+
+	// And the gate above the surface says so, which is the whole remedy: the
+	// same database state that breaks the read is one this process can see and
+	// refuse traffic on before a caller finds out the hard way.
+	latest, err := store.LatestSchemaVersion()
+	if err != nil {
+		t.Fatalf("latest schema version: %v", err)
+	}
+	at, dirty, ready, err := s.SchemaBehind(ctx, latest)
+	if err != nil {
+		t.Fatalf("schema behind: %v", err)
+	}
+	if dirty {
+		t.Error("a clean rollback left the schema dirty")
+	}
+	if ready {
+		t.Errorf("SchemaBehind reported ready at version %d against a binary needing %d, "+
+			"on a database where the decision read above just failed", at, latest)
+	}
+	if at != 7 {
+		t.Errorf("SchemaBehind reported version %d, want 7", at)
+	}
+}
+
 func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	s, _ := migratedStore(t)
@@ -327,6 +495,26 @@ func indexExists(t *testing.T, s *store.Store, name string) bool {
 		t.Fatalf("check index %q: %v", name, err)
 	}
 	return exists
+}
+
+// indexIsValid reports whether an index is one Postgres will enforce and plan
+// against. A CREATE INDEX CONCURRENTLY that is interrupted leaves the index in
+// pg_indexes with indisvalid = false: present, maintained on every write, and
+// enforcing nothing. Existence and validity are therefore different questions,
+// and only the second one is the one the unique backstop needs answered.
+func indexIsValid(t *testing.T, s *store.Store, name string) bool {
+	t.Helper()
+	var valid bool
+	err := s.Pool().QueryRow(context.Background(), `
+		SELECT i.indisvalid AND i.indisready
+		FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = current_schema() AND c.relname = $1`, name).Scan(&valid)
+	if err != nil {
+		t.Fatalf("check index validity %q: %v", name, err)
+	}
+	return valid
 }
 
 func tableExists(t *testing.T, s *store.Store, name string) bool {

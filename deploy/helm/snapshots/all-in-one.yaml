@@ -50,6 +50,7 @@ data:
   STAMP_CONSOLE_OIDC_AUTHORIZATION_ENDPOINT: "https://idp.example/authorize"
   STAMP_CONSOLE_OIDC_TOKEN_ENDPOINT: "https://idp.example/token"
   STAMP_CONSOLE_ALLOW_INSECURE_TRANSPORT: "false"
+  STAMP_CALLBACK_BASE_URL: "https://stamp.example"
 ---
 # Source: stamp/templates/service.yaml
 apiVersion: v1
@@ -78,6 +79,10 @@ spec:
     - name: console
       port: 8081
       targetPort: console
+      protocol: TCP
+    - name: callback
+      port: 8082
+      targetPort: callback
       protocol: TCP
   selector:
     app.kubernetes.io/name: stamp
@@ -118,7 +123,7 @@ spec:
         stamp.dev/topology: all-in-one
         app.kubernetes.io/component: all
       annotations:
-        checksum/config: 8631451cced223e54c4a15acfd29c07a8f7b819a4305b2f05b9819d891b42638
+        checksum/config: 4bab65dabbea6cb210619c316b0b26a0bb143cb6292761a128524e6d3e087277
     spec:
       serviceAccountName: stamp
       securityContext:
@@ -146,6 +151,9 @@ spec:
             - name: console
               containerPort: 8081
               protocol: TCP
+            - name: callback
+              containerPort: 8082
+              protocol: TCP
           env:
             # R42: the connection string is a credential and arrives by
             # reference. Each tier reads its own Secret, which is how per-role
@@ -163,7 +171,7 @@ spec:
             - name: STAMP_CONSOLE_ADDR
               value: ":8081"
             - name: STAMP_CALLBACK_ADDR
-              value: ""
+              value: ":8082"
             - name: STAMP_DB_MIGRATE
               value: "true"
             - name: STAMP_DB_APPLY_GRANTS
@@ -204,6 +212,19 @@ spec:
           envFrom:
             - configMapRef:
                 name: stamp-env
+          # /healthz is liveness and /readyz is readiness, and they are two
+          # endpoints because they have two remedies. /healthz asks whether the
+          # process is wedged — nothing it consults can be fixed by waiting, so
+          # a failure there means restart. /readyz asks whether a request routed
+          # here would work, which on this chart is mostly one question: has the
+          # database reached the schema this image's queries are written against?
+          # Only the api tier migrates, and `helm upgrade` rolls every Deployment
+          # at once, so a decide pod can be ahead of the schema for as long as
+          # the migration takes. Pointing readiness at /healthz — which is what
+          # this chart used to do — put that pod in its Service answering 42703;
+          # pointing liveness at /readyz would restart it instead of letting it
+          # wait. A rollout that stalls here is the gate working: `kubectl
+          # describe` on an unready pod prints the version it is waiting for.
           livenessProbe:
             httpGet:
               path: /healthz
@@ -212,7 +233,7 @@ spec:
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: pep
             initialDelaySeconds: 2
             periodSeconds: 5

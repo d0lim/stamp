@@ -165,6 +165,9 @@ describe('감사 목록', () => {
   })
 
   it('감사자 자격이 없으면 거부 화면을 보여주고 남은 경로를 알려준다', async () => {
+    // The one 403 that survived #38's collapse, and it is not an accident:
+    // standing to read a collection says nothing about whether any single
+    // decision exists, so it is an oracle for nothing (R22).
     renderShell({
       roles: ['auditor'],
       route: '/audit',
@@ -231,13 +234,25 @@ describe('결정 상세', () => {
     expect(await screen.findByRole('heading', { level: 1, name: /권한이 없습니다/ })).toBeInTheDocument()
   })
 
-  it('열람 권한이 없는 결정은 거부 문구를 보여준다', async () => {
+  it('열람할 수 없는 결정은 없는 것과 같은 답을 받고, 화면도 그렇게 말한다', async () => {
+    // The detail surface no longer has a `403 not_readable`: it and `404
+    // not_found` were the same existence oracle the approval surface had, so
+    // they became one answer with one body (#38). This test used to stub the
+    // 403 and pass against its own stub while the branch it exercised was
+    // already unreachable.
     renderShell({
       roles: ['approver'],
       route: `/audit/${DECISION_ID}`,
-      fetchImpl: stub({ detail: { status: 403, body: { error: 'not_readable', message: 'nope' } } }).impl,
+      fetchImpl: stub({ detail: { status: 404, body: { error: 'not_found', message: 'no such decision' } } })
+        .impl,
     })
-    expect(await screen.findByTestId('decision-refused')).toBeInTheDocument()
+    const notice = await screen.findByTestId('decision-unavailable')
+    // Both halves, and neither claimed as the one that happened.
+    expect(notice).toHaveTextContent('존재하지 않거나, 당신에게 열려 있지 않습니다')
+    expect(notice).toHaveTextContent('자신이 초기화했거나 자신이 대상인 결정만 열람할 수 있습니다')
+    // Not the generic read failure, which reads as an outage.
+    expect(screen.queryByTestId('decision-error')).toBeNull()
+    expect(screen.queryByText('결정을 읽는 중입니다…')).toBeNull()
   })
 
   it('JSON은 텍스트로 렌더링된다', () => {

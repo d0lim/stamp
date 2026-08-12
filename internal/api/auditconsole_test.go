@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -316,8 +317,8 @@ func TestAuditDetailFallsBackToTheOwnRecordRule(t *testing.T) {
 	f := newAuditFixture(t, api.AuditorRule{})
 
 	rec := f.get(t, "/audit/decisions/"+auditDecisionID, f.plainToken(t, "bob"))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("a reader the access rule refused got %d, want 403: %s", rec.Code, rec.Body)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("a reader the access rule refused got %d, want 404: %s", rec.Code, rec.Body)
 	}
 	if len(f.access.asked) != 1 {
 		t.Fatalf("the access rule was consulted %d times, want 1", len(f.access.asked))
@@ -387,6 +388,45 @@ func TestAuditDetailSurvivesAMissingPolicyVersion(t *testing.T) {
 	rec := f.get(t, "/audit/decisions/"+auditDecisionID, f.auditorToken(t, "ann"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("answered %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestAnUnreadableDecisionIsByteIdenticalToAMissingOne is #38 on the audit
+// console's detail read.
+//
+// This is the same claim as on the approval surface and it has to hold here too,
+// because R40's rule is one rule and this endpoint is the *other* door to it: a
+// targeted approver reads their decision here, since a workload credential and a
+// user token cannot be served by one route. A reader refused here who could have
+// asked the same question on the PEP surface and been answered "not found" would
+// simply ask twice, and the difference between the two answers is the existence
+// of the decision.
+//
+// The refusal of the *history list* is deliberately not folded in: `not_an_auditor`
+// is about standing to read a collection, answers no question about any
+// particular decision, and is the refusal R22 asks to be chained.
+func TestAnUnreadableDecisionIsByteIdenticalToAMissingOne(t *testing.T) {
+	t.Parallel()
+
+	// Both readers lack auditor standing, so both fall through to R40's rule —
+	// which is where the two answers used to part company.
+	read := func(t *testing.T, err error) *httptest.ResponseRecorder {
+		t.Helper()
+		f := newAuditFixture(t, api.AuditorRule{})
+		f.access.err = err
+		return f.get(t, "/audit/decisions/"+auditDecisionID, f.plainToken(t, "bob"))
+	}
+
+	base := read(t, store.ErrNotFound)
+	if base.Code != http.StatusNotFound {
+		t.Fatalf("a decision that does not exist = %d, want 404: %s", base.Code, base.Body)
+	}
+	refused := read(t, decision.ErrNotAuthorized)
+	if refused.Code != base.Code {
+		t.Errorf("an unreadable decision = %d, a missing one = %d", refused.Code, base.Code)
+	}
+	if !bytes.Equal(refused.Body.Bytes(), base.Body.Bytes()) {
+		t.Errorf("body\n got %q\nwant %q", refused.Body.String(), base.Body.String())
 	}
 }
 

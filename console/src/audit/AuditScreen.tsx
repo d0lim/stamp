@@ -262,6 +262,12 @@ function useHistory(api: ApiClient, query: AuditQuery, cursor: string) {
         setPage(null)
         // R22's refusal is its own screen, not an error string: it names a
         // standing the reader does not have and a path that still works.
+        //
+        // The 403 here is real and stays. It is `not_an_auditor` — standing to
+        // read the collection — and the server kept it out of the collapse that
+        // made "not yours" and "does not exist" one answer on the decision
+        // surfaces (#38): standing to read a list says nothing about whether any
+        // particular decision exists, so it is no oracle for anything.
         setRefused(cause instanceof ApiError && cause.isForbidden)
         setError(cause instanceof Error ? cause.message : String(cause))
       }

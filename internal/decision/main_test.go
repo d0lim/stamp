@@ -137,6 +137,10 @@ type harnessOptions struct {
 	// can register a handler that publishes the wrong thing and check that the
 	// assertions notice.
 	mfaHandler challenge.Handler
+	// externalHandler registers the fourth kind. It is off by default because
+	// most of this package's tests are about the three kinds that name people,
+	// and the whole point of this one is that it names nobody.
+	externalHandler challenge.Handler
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -219,11 +223,15 @@ func (h *harness) newService(writer *store.AuditWriter, opts harnessOptions) *de
 	if opts.mfaHandler != nil {
 		mfa = opts.mfaHandler
 	}
-	registry, err := challenge.NewRegistry(
+	handlers := []challenge.Handler{
 		&quorumHandler{writer: writer, pool: h.store.Pool()},
 		&delayHandler{},
 		mfa,
-	)
+	}
+	if opts.externalHandler != nil {
+		handlers = append(handlers, opts.externalHandler)
+	}
+	registry, err := challenge.NewRegistry(handlers...)
 	if err != nil {
 		h.t.Fatalf("new challenge registry: %v", err)
 	}
@@ -663,6 +671,88 @@ func decodeStepUpDetail(raw json.RawMessage) (stepUpDetail, error) {
 	return detail, nil
 }
 
+// countingStepUpHandler is stepUpHandler with a tally of how many times it was
+// asked to open a challenge.
+//
+// The tally is the assertion an idempotent retry is actually about. A retry that
+// returned the same decision identifier while quietly issuing a second challenge
+// would pass every test that only looks at rows, and would still have buzzed the
+// subject's phone twice — which is the failure the key exists to prevent, and the
+// one a unique index on the decision row cannot catch, because the push happens
+// before the row is written.
+type countingStepUpHandler struct {
+	stepUpHandler
+	issues atomic.Int64
+}
+
+func (c *countingStepUpHandler) Issue(ctx context.Context, req challenge.IssueRequest) (challenge.IssueResult, error) {
+	c.issues.Add(1)
+	return c.stepUpHandler.Issue(ctx, req)
+}
+
+func (c *countingStepUpHandler) count() int { return int(c.issues.Load()) }
+
+// refusingStepUpHandler is the shape a delegated MFA handler has when it opens
+// no challenge at all: the challenge is stored failed, nothing reached the IdP,
+// and the word for why travels on the row.
+//
+// It carries both branches because the branches are the point. `shed` is the
+// per-subject issuance budget refusing to prompt anybody (R43); the other is a
+// round trip that was attempted and went wrong. The lifecycle must tell them
+// apart without knowing either word, so the double publishes the contract's bit
+// exactly as the real handlers do.
+type refusingStepUpHandler struct{ shed bool }
+
+type refusedDetail struct {
+	Failure string `json:"failure"`
+	Shed    bool   `json:"shed"`
+}
+
+func (*refusingStepUpHandler) Kind() policy.ChallengeType { return policy.ChallengeMFA }
+
+// refusedIssueRetryAfter is the wait a shed issuance reports. It is a round
+// number rather than a real budget's interval so that a test reading the header
+// is reading this handler's answer and not arithmetic.
+const refusedIssueRetryAfter = 90 * time.Second
+
+func (r *refusingStepUpHandler) Issue(_ context.Context, _ challenge.IssueRequest) (challenge.IssueResult, error) {
+	failure := "transport"
+	if r.shed {
+		failure = "issue_rate_limited"
+	}
+	out := challenge.IssueResult{
+		State:  challenge.StateFailed,
+		Detail: refusedDetail{Failure: failure, Shed: r.shed},
+	}
+	// The contract's bit at issue as well as at Status, which is what lets the
+	// lifecycle refuse before it writes a row rather than resolving a decision
+	// onto the subject's history afterwards. A double that set it only on Status
+	// would be a double that could not exercise the path.
+	if r.shed {
+		out.Shed = true
+		out.RetryAfter = refusedIssueRetryAfter
+	}
+	return out, nil
+}
+
+func (*refusingStepUpHandler) Submit(_ context.Context, _ challenge.SubmitRequest) (challenge.SubmitResult, error) {
+	return challenge.SubmitResult{}, challenge.ErrNotSubmittable
+}
+
+// Status keeps a refused issue refused, which is what the lifecycle storing
+// every challenge pending obliges every handler to do.
+func (*refusingStepUpHandler) Status(_ context.Context, req challenge.StatusRequest) (challenge.Status, error) {
+	var detail refusedDetail
+	if err := json.Unmarshal(req.Detail, &detail); err != nil {
+		return challenge.Status{}, fmt.Errorf("%w: %w", challenge.ErrInvalidPayload, err)
+	}
+	state := req.Stored
+	if !state.Terminal() && detail.Failure != "" {
+		state = challenge.StateFailed
+	}
+	return challenge.Status{State: state, Have: 0, Need: 1, Shed: detail.Shed}, nil
+}
+
 // leakyStepUpHandler is stepUpHandler with the mistake this unit exists to
 // prevent: it publishes the stored detail instead of a chosen field. It is the
 // mutation the secret tests are pointed at.
@@ -717,6 +807,66 @@ func mfaAndQuorumPolicy(id string, approvers ...string) *policy.Policy {
 		Challenges: []policy.Challenge{
 			policy.MFA{Mode: policy.MFADelegated, ACRValues: []string{"urn:stamp:acr:mfa"}},
 			policy.Quorum{Threshold: 1, Approvers: policy.ApproverSet{Members: approvers}},
+		},
+	}
+}
+
+// externalHandler is the shape of the one kind that names no targets.
+//
+// It deliberately does not implement [challenge.Targeter], because the real one
+// does not: its counterparty is a system STAMP called out to, holding a
+// signature over a nonce this server minted rather than an identity the
+// lifecycle could compare against an approver set. That absence is load-bearing
+// — it is what the standing check in Submit has to fall through — so the double
+// reproduces it rather than being convenient.
+type externalHandler struct{ target string }
+
+func (*externalHandler) Kind() policy.ChallengeType { return policy.ChallengeExternal }
+
+func (x *externalHandler) Issue(_ context.Context, req challenge.IssueRequest) (challenge.IssueResult, error) {
+	spec, ok := req.Spec.(policy.External)
+	if !ok {
+		return challenge.IssueResult{}, fmt.Errorf("%w: %T", challenge.ErrUnsupportedSpec, req.Spec)
+	}
+	x.target = spec.Target
+	return challenge.IssueResult{
+		State:  challenge.StatePending,
+		Detail: map[string]any{"target": spec.Target, "nonce": "nonce-external-0f0f"},
+	}, nil
+}
+
+// Submit accepts the body that carries the nonce this challenge was opened with,
+// and nothing else. That check standing in for a signature is the point: the
+// counterparty proves itself to the handler, which is why the lifecycle must not
+// turn it away before the handler is asked.
+func (*externalHandler) Submit(_ context.Context, req challenge.SubmitRequest) (challenge.SubmitResult, error) {
+	var body struct {
+		Nonce string `json:"nonce"`
+	}
+	if err := json.Unmarshal(req.Payload, &body); err != nil {
+		return challenge.SubmitResult{}, fmt.Errorf("%w: %w", challenge.ErrInvalidPayload, err)
+	}
+	if body.Nonce != "nonce-external-0f0f" {
+		return challenge.SubmitResult{}, fmt.Errorf("%w: the callback carries no nonce of this challenge",
+			challenge.ErrNotTarget)
+	}
+	return challenge.SubmitResult{State: challenge.StateSatisfied, Have: 1, Need: 1}, nil
+}
+
+func (*externalHandler) Status(_ context.Context, req challenge.StatusRequest) (challenge.Status, error) {
+	return challenge.Status{State: req.Stored, Have: 0, Need: 1, Deadline: req.Deadline}, nil
+}
+
+// externallyGatedPolicy waits on a system rather than on a person.
+func externallyGatedPolicy(id string) *policy.Policy {
+	return &policy.Policy{
+		ID:        id,
+		Subject:   "user",
+		Resource:  "account",
+		Actions:   []string{"transfer"},
+		Condition: policy.Compare{Op: policy.OpEq, Left: policy.Field(policy.RoleSubject, "role"), Right: policy.String("admin")},
+		Challenges: []policy.Challenge{
+			policy.External{Target: "https://sanctions.test/screen"},
 		},
 	}
 }

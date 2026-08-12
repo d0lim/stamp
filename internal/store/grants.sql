@@ -35,6 +35,18 @@ GRANT USAGE ON SCHEMA public TO {{.Check}}, {{.Decide}}, {{.Consumer}}, {{.Admin
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM {{.Check}}, {{.Decide}}, {{.Consumer}}, {{.Admin}};
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM {{.Check}}, {{.Decide}}, {{.Consumer}}, {{.Admin}};
 
+-- Every role reads the applied schema version, because every role answers a
+-- readiness probe with it. Only one tier migrates, so the others have to be able
+-- to see whether the schema they were built against has arrived before they take
+-- traffic — a tier that cannot read this table cannot tell "the migration has not
+-- landed yet" from "I am ready", and answers requests with 42703 instead of
+-- staying out of its Service.
+--
+-- SELECT only, and it stays that way: reading which version is applied is not
+-- permission to claim one. A role that could write this table could tell the
+-- whole fleet the schema had arrived.
+GRANT SELECT ON schema_migrations TO {{.Check}}, {{.Decide}}, {{.Consumer}}, {{.Admin}};
+
 -- check: reads what it evaluates against and appends audit rows. It never
 -- writes a policy — a compromised check tier must not be able to author the
 -- rules it is judged by.

@@ -35,7 +35,7 @@ export function AuditDecisionScreen() {
   const { api } = useAuth()
   const params = useParams()
   const id = params.decisionId ?? ''
-  const { detail, error, refused } = useDecision(api, id)
+  const { detail, error, unavailable } = useDecision(api, id)
 
   return (
     <div className="panel">
@@ -45,11 +45,17 @@ export function AuditDecisionScreen() {
         <Link to="/audit">감사 목록으로 돌아가기</Link>
       </p>
 
-      {refused ? (
-        <p className="notice notice--warning" role="alert" data-testid="decision-refused">
-          이 결정을 열람할 권한이 없습니다. 감사자 자격이 없는 경우 자신이 초기화했거나 자신이
-          대상인 결정만 열람할 수 있습니다.
-        </p>
+      {unavailable ? (
+        <div className="notice notice--warning" role="alert" data-testid="decision-unavailable">
+          <p className="notice__text">
+            이 결정을 열람할 수 없습니다 — 존재하지 않거나, 당신에게 열려 있지 않습니다. 서버는 이
+            둘을 구분해 답하지 않습니다.
+          </p>
+          <p>
+            감사자 자격이 없는 경우 자신이 초기화했거나 자신이 대상인 결정만 열람할 수 있습니다.
+            결정 식별자를 다시 확인하십시오.
+          </p>
+        </div>
       ) : error === null ? null : (
         <p className="notice notice--warning" role="alert" data-testid="decision-error">
           결정을 읽지 못했습니다: {error}
@@ -57,7 +63,7 @@ export function AuditDecisionScreen() {
       )}
 
       {detail === null ? (
-        refused ? null : <p>결정을 읽는 중입니다…</p>
+        unavailable ? null : <p>결정을 읽는 중입니다…</p>
       ) : (
         <>
           <dl className="summary-list">
@@ -181,10 +187,26 @@ export function AuditDecisionScreen() {
   )
 }
 
+/**
+ * One decision, and the one thing this screen is allowed to say when it does not
+ * get one.
+ *
+ * This used to key its refusal on a 403. The read surface no longer has one:
+ * `403 not_readable` and `404 not_found` were the same existence oracle the
+ * approval surface had, so they became one 404 with one body (#38). This is the
+ * *other* door to R40's rule — a targeted approver reads their own decision here
+ * rather than on the PEP surface — so a difference here would have been a
+ * difference anyone with a console credential could reach by asking twice.
+ *
+ * The consequence for this screen is that "not yours" and "does not exist" are
+ * one state, and the copy says both rather than picking one. The audit *list*
+ * keeps its 403 and its own refusal screen: standing to read a collection says
+ * nothing about any single decision (R22).
+ */
 function useDecision(api: ApiClient, id: string) {
   const [detail, setDetail] = useState<AuditDecisionDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [refused, setRefused] = useState(false)
+  const [unavailable, setUnavailable] = useState(false)
 
   useEffect(() => {
     let live = true
@@ -196,12 +218,12 @@ function useDecision(api: ApiClient, id: string) {
         if (!live) return
         setDetail(response)
         setError(null)
-        setRefused(false)
+        setUnavailable(false)
       } catch (cause) {
         if (cause instanceof ApiError && cause.isUnauthenticated) return
         if (!live) return
         setDetail(null)
-        setRefused(cause instanceof ApiError && cause.isForbidden)
+        setUnavailable(cause instanceof ApiError && cause.isNotFound)
         setError(cause instanceof Error ? cause.message : String(cause))
       }
     })()
@@ -210,5 +232,5 @@ function useDecision(api: ApiClient, id: string) {
     }
   }, [api, id])
 
-  return { detail, error, refused }
+  return { detail, error, unavailable }
 }

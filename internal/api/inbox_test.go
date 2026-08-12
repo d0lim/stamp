@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -153,6 +154,38 @@ func TestInboxCarriesTheServerClock(t *testing.T) {
 	}
 	if len(body.Items) != 1 || body.Items[0].Need != 2 {
 		t.Errorf("the list is %+v", body.Items)
+	}
+}
+
+// The inbox is the fourth caller of the approval surface's error table, and
+// #38's collapse of "not you" into "no such thing" reaches it too. It is worth
+// pinning rather than assuming, because the table was written for a surface that
+// names one decision and this one names none.
+//
+// In practice the collapse is inert here: a caller who is not a target of
+// anything gets an empty list, not a refusal — being absent from a list leaks
+// nothing, which is why the filter is a filter rather than an error. The one
+// path that can produce the sentinel is a credential the lister will not read as
+// an approver at all, and that is already refused at the console door. What this
+// test holds is that if it ever is reached, it is answered and not narrated.
+func TestInboxRefusalsGoThroughTheSameTable(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		err  error
+		want int
+	}{
+		"a credential the lister will not read as an approver": {challenge.ErrNotTarget, http.StatusNotFound},
+		"a database that fell over":                            {errors.New("connection refused"), http.StatusInternalServerError},
+	} {
+		f := newInboxFixture(t)
+		f.lister.err = tc.err
+		rec := f.get(t, api.SurfaceConsole, "/decisions/inbox", f.idp.token(t, "bob", "console"))
+		if rec.Code != tc.want {
+			t.Errorf("%s: answered %d, want %d: %s", name, rec.Code, tc.want, rec.Body)
+		}
+		if strings.Contains(rec.Body.String(), "connection refused") {
+			t.Errorf("%s: the refusal narrated the failure: %s", name, rec.Body)
+		}
 	}
 }
 

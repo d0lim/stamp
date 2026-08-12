@@ -419,7 +419,16 @@ func (a *App) build(ctx context.Context) error {
 	// path with four doors, and the revision reconcile that has to follow the
 	// last approval has to follow all four for the same reason.
 	submitter := &reconciling{inner: plane, governance: governance, logger: a.logger}
-	approvals, err := api.NewApprovals(api.ApprovalsConfig{Decisions: submitter, Reviews: quorum})
+	approvals, err := api.NewApprovals(api.ApprovalsConfig{
+		Decisions: submitter,
+		Reviews:   quorum,
+		Rate:      cfg.ApprovalSubmitRate,
+		// The same buffer the decide surface writes its rate refusals through. A
+		// submission shed under the budget never reaches the lifecycle — that is
+		// what makes it cheap — so this surface is the only place it can be
+		// recorded.
+		Audit: buffer,
+	})
 	if err != nil {
 		return err
 	}
@@ -720,7 +729,19 @@ func (a *App) build(ctx context.Context) error {
 	}
 	a.registry = registry
 
-	server, err := api.New(api.Config{Identity: middleware, Addresses: cfg.Addresses})
+	// Readiness is answered by the schema gate on every tier, including the one
+	// that migrates: the migrating tier has already applied everything by the
+	// time it gets here, so the gate opens on its first probe, and a tier
+	// configured not to migrate is exactly the one that has to wait. Which
+	// tiers those are is deployment configuration, so the gate is not
+	// conditional on it.
+	readiness, gerr := newSchemaVersionGate(a.store, a.logger)
+	if gerr != nil {
+		return gerr
+	}
+	server, err := api.New(api.Config{
+		Identity: middleware, Addresses: cfg.Addresses, Ready: readiness.ready,
+	})
 	if err != nil {
 		return err
 	}
@@ -1014,6 +1035,11 @@ func (a *App) challengeHandlers(quorum *challenge.Quorum, gate *fact.Gate,
 		Gate:            gate,
 		Targets:         cfg.ExternalTargets,
 		CallbackBaseURL: cfg.CallbackBaseURL,
+		// R43's dispatch budget. It is the same operator setting the step-up
+		// handler reads, because "how much may one subject cause" is one thought;
+		// what the two handlers do with an unset value differs, and that is the
+		// handlers' own business.
+		SubjectRate: cfg.ChallengeIssueRate,
 	})
 	if err != nil {
 		return nil, err
@@ -1124,9 +1150,20 @@ func (a *App) delegatedMFA() (*mfa.Delegated, error) {
 		Initiator:        initiator,
 		AllowedACRValues: cfg.MFA.AllowedACRValues,
 		RequiredAMR:      cfg.MFA.RequiredAMR,
-		Issuer:           issuer,
-		ClientID:         clientID,
-		Audience:         audience,
+		// R43's two issue budgets. They are above the re-issue interval and not
+		// instead of it: that interval is keyed on the decision content and so
+		// cannot see a caller opening a different decision every time.
+		//
+		// The first is charged on (caller, subject) and the second on the
+		// subject across every caller. One bucket cannot be both — a
+		// subject-only bucket small enough to protect a person is a bucket any
+		// caller can hold empty against that person, which is what this was
+		// until #40's follow-up.
+		CallerSubjectIssueRate: cfg.ChallengeIssueRate,
+		SubjectIssueCeiling:    cfg.ChallengeIssueSubjectCeiling,
+		Issuer:                 issuer,
+		ClientID:               clientID,
+		Audience:               audience,
 		CallbackURL: func(in challenge.Instance) string {
 			if base == "" {
 				return ""

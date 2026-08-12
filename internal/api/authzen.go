@@ -46,6 +46,29 @@ const (
 // the surface allocate.
 const DefaultMaxRequestBytes = 1 << 20
 
+// MaxEntityIDBytes bounds the subject and resource identifiers.
+//
+// The body cap above is not a bound on these. A caller could spend the whole
+// megabyte on one identifier, and the subject identifier is the key of the
+// decide surface's per-subject rate limiter — a Go map key holds its own bytes
+// for as long as the entry lives, so the 8192-entry cap that is supposed to make
+// that table safe would bound the number of entries while the caller chose their
+// size. The same value is concatenated into the audit event written for every
+// refusal.
+//
+// 255 is the bound [MaxIdempotencyKeyBytes] already states for the other
+// caller-chosen string this API takes, and the one migration 8's CHECK enforces
+// on that string in the column it lands in. Nothing real is near it: an
+// identifier is an account number, a uuid or a `sub` claim. A deployment that
+// genuinely needs longer identifiers is a deployment that should be sending a
+// stable key and carrying the long form as a property, because the identifier is
+// also what an operator reads in an audit row.
+//
+// It is stated here rather than at each surface because [EvaluationRequest.validate]
+// is what both surfaces run, and a bound that lives on one of them is a bound
+// the other does not have.
+const MaxEntityIDBytes = 255
+
 // Entity is an AuthZEN subject or resource.
 type Entity struct {
 	// Type is the entity type.
@@ -82,6 +105,12 @@ type EvaluationRequest struct {
 // validate is the shape check every surface that takes this body runs. It is
 // stated once so that check and decide cannot come to disagree about what a
 // well-formed access request is.
+//
+// The length bounds are part of that shape rather than a separate concern of the
+// decide surface, even though it is the decide surface that has the memory to
+// lose (see [MaxEntityIDBytes]). Both endpoints take this body, a PEP is told it
+// may send one value to either of them, and an identifier one of them accepts
+// and the other refuses is the disagreement this function exists to prevent.
 func (req EvaluationRequest) validate() error {
 	switch {
 	case req.Subject.Type == "" || req.Subject.ID == "":
@@ -90,6 +119,10 @@ func (req EvaluationRequest) validate() error {
 		return errors.New("action needs a name")
 	case req.Resource.Type == "" || req.Resource.ID == "":
 		return errors.New("resource needs a type and an id")
+	case len(req.Subject.ID) > MaxEntityIDBytes:
+		return fmt.Errorf("the subject id is longer than %d bytes", MaxEntityIDBytes)
+	case len(req.Resource.ID) > MaxEntityIDBytes:
+		return fmt.Errorf("the resource id is longer than %d bytes", MaxEntityIDBytes)
 	}
 	return nil
 }

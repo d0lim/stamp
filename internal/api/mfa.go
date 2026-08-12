@@ -515,7 +515,14 @@ func mfaError(err error) (status int, code, message string) {
 		return http.StatusForbidden, "redemption_refused", "this redirect was not accepted"
 	case errors.Is(err, challenge.ErrNotRedeemable):
 		return http.StatusNotFound, "not_redeemable", "this challenge is not completed by a redirect"
-	case errors.Is(err, challenge.ErrNotTarget):
+	case errors.Is(err, challenge.ErrNotTarget), errors.Is(err, decision.ErrNotAuthorized):
+		// Two sentinels, one answer, because the same refusal is now raised in
+		// two places. The lifecycle settles whether a submitter has any standing
+		// on the decision before it judges the decision's state (#38), so a
+		// completion presented by somebody other than the subject the challenge
+		// named is refused there rather than inside the handler — and the party
+		// reading this page must not be able to tell which of the two turned
+		// them away, having been told the same sentence either way since U2.
 		return http.StatusForbidden, "not_the_subject", "this challenge is not waiting on you"
 	case errors.Is(err, decision.ErrNoSuchChallenge), errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound, "not_found", "no such decision or challenge"

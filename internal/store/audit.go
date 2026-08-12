@@ -791,6 +791,18 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// isUniqueViolationOn is isUniqueViolation for one named constraint.
+//
+// A table can carry more than one uniqueness rule, and they mean different
+// things to the code above: a repeated decision identifier is a generator that
+// collided, a repeated idempotency key is a caller retrying. One SQLSTATE covers
+// both, so the constraint name is the only thing that separates them — which
+// makes the name in the migration part of the interface, not decoration.
+func isUniqueViolationOn(err error, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
+}
+
 // ---------------------------------------------------------------------------
 // verification
 // ---------------------------------------------------------------------------

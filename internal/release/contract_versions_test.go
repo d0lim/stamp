@@ -36,6 +36,11 @@ func TestTheThreeContractsAreDocumentedAndVersioned(t *testing.T) {
 			t.Errorf("the gate reported nothing for %s:\n%s", name, out)
 		}
 	}
+	// The endpoint table is the input routes_test.go compares against the
+	// mounted routes, and the release workflow runs this script on its own.
+	if !strings.Contains(out, "endpoint rows") {
+		t.Errorf("the gate did not report the decision API's endpoint table:\n%s", out)
+	}
 }
 
 // A gate that has only ever passed is not known to be a gate. Each fixture is a
@@ -59,6 +64,12 @@ func TestTheContractVersionGateFails(t *testing.T) {
 		"the documents are missing entirely": {
 			dir:  "testdata/contracts-missing",
 			want: "does not exist",
+		},
+		"the decision API document has no endpoint table": {
+			dir: "testdata/contracts-no-endpoint-table",
+			// The structural check next door has nothing to compare without
+			// it, and this gate runs alone in the release workflow.
+			want: "states no endpoint table",
 		},
 	}
 	for name, tc := range cases {
