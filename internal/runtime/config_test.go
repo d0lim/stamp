@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/d0lim/stamp/internal/api"
+	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/policy/revision"
 	"github.com/d0lim/stamp/internal/stream"
@@ -36,6 +38,7 @@ func clearEnv(t *testing.T) {
 		EnvChallengeIssueRate, EnvChallengeIssueBurst,
 		EnvChallengeIssueCeilingRate, EnvChallengeIssueCeilingBurst,
 		EnvApprovalRate, EnvApprovalBurst,
+		EnvCancellationRate, EnvCancellationBurst,
 		EnvFloorMinApprovers, EnvFloorProposerMayApprove,
 		EnvRevisionTTL, EnvReconcileInterval, EnvBootstrapWarnInterval,
 		EnvAuthoringMode, EnvCapabilityClaim,
@@ -198,13 +201,13 @@ func TestAuditAlertThresholdIsValidatedOnAConfigBuiltInCode(t *testing.T) {
 			Audience: "stamp",
 		},
 	}
-	if err := base.withDefaults().validate(); err != nil {
+	if err := base.withDefaults().validate(everyRole()); err != nil {
 		t.Fatalf("the baseline configuration is already invalid, so this test proves nothing: %v", err)
 	}
 
 	negative := base
 	negative.AuditAlertThreshold = -1
-	err := negative.withDefaults().validate()
+	err := negative.withDefaults().validate(everyRole())
 	if err == nil {
 		t.Fatal("a negative alert threshold validated, want a startup failure")
 	}
@@ -402,14 +405,14 @@ func TestExternalTargetsRejectAnUnknownField(t *testing.T) {
 // the delegated handler has, so asking for the handler without one fails the
 // boot instead of producing a handler whose one real check does not run.
 func TestDelegatedMFANeedsAnACRAllowlist(t *testing.T) {
-	cfg := baseConfig()
+	cfg := stepUpBaseConfig()
 	cfg.MFA = MFAConfig{
 		AuthorizationEndpoint: "https://idp.example/authorize",
 		TokenEndpoint:         "https://idp.example/token",
 		ClientID:              "stamp-console",
 		RedirectURI:           "https://stamp.example/callback",
 	}
-	err := cfg.validate()
+	err := cfg.validate(everyRole())
 	if err == nil {
 		t.Fatal("a delegated mfa handler with no acr allowlist was accepted")
 	}
@@ -423,7 +426,7 @@ func TestDelegatedMFANeedsAnACRAllowlist(t *testing.T) {
 // handler ever sees the completion — which looks like a credential failure and
 // not like a challenge failure.
 func TestStepUpClassesMustBeAdmittedByTheProcessWideAllowlist(t *testing.T) {
-	cfg := baseConfig()
+	cfg := stepUpBaseConfig()
 	cfg.OIDC.AllowedACRValues = []string{"aal1"}
 	cfg.MFA = MFAConfig{
 		AllowedACRValues:      []string{"aal2"},
@@ -432,7 +435,7 @@ func TestStepUpClassesMustBeAdmittedByTheProcessWideAllowlist(t *testing.T) {
 		ClientID:              "stamp-console",
 		RedirectURI:           "https://stamp.example/callback",
 	}
-	err := cfg.validate()
+	err := cfg.validate(everyRole())
 	if err == nil {
 		t.Fatal("a step-up class outside the process-wide allowlist was accepted")
 	}
@@ -443,11 +446,11 @@ func TestStepUpClassesMustBeAdmittedByTheProcessWideAllowlist(t *testing.T) {
 	// The superset is fine, and so is the empty process-wide allowlist, which
 	// means "no bound" rather than "no classes".
 	cfg.OIDC.AllowedACRValues = []string{"aal1", "aal2"}
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(everyRole()); err != nil {
 		t.Fatalf("a superset allowlist was refused: %v", err)
 	}
 	cfg.OIDC.AllowedACRValues = nil
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(everyRole()); err != nil {
 		t.Fatalf("an unbounded process-wide allowlist was refused: %v", err)
 	}
 }
@@ -457,14 +460,14 @@ func TestStepUpClassesMustBeAdmittedByTheProcessWideAllowlist(t *testing.T) {
 // rather than the moment somebody has finished authenticating and is waiting for
 // a page.
 func TestDelegatedMFANeedsSomewhereToRedeemTheCode(t *testing.T) {
-	cfg := baseConfig()
+	cfg := stepUpBaseConfig()
 	cfg.MFA = MFAConfig{
 		AllowedACRValues:      []string{"aal2"},
 		AuthorizationEndpoint: "https://idp.example/authorize",
 		ClientID:              "stamp-console",
 		RedirectURI:           "https://stamp.example/callback",
 	}
-	err := cfg.validate()
+	err := cfg.validate(everyRole())
 	if err == nil {
 		t.Fatal("a step-up with no token endpoint was accepted")
 	}
@@ -472,7 +475,7 @@ func TestDelegatedMFANeedsSomewhereToRedeemTheCode(t *testing.T) {
 		t.Errorf("the error does not name %s:\n%v", EnvMFATokenEndpoint, err)
 	}
 	cfg.MFA.TokenEndpoint = "https://idp.example/token"
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(everyRole()); err != nil {
 		t.Fatalf("a complete step-up configuration was refused: %v", err)
 	}
 	// R42: the secret is a path, never a value. A public client — which is what
@@ -485,7 +488,7 @@ func TestDelegatedMFANeedsSomewhereToRedeemTheCode(t *testing.T) {
 // A deployment that configures no step-up at all is valid: the mfa kind simply
 // has no handler, which is fail-closed rather than permissive.
 func TestNoMFAConfigurationIsValid(t *testing.T) {
-	if err := baseConfig().validate(); err != nil {
+	if err := baseConfig().validate(everyRole()); err != nil {
 		t.Fatalf("a deployment with no delegated mfa was refused: %v", err)
 	}
 	if baseConfig().MFA.Configured() {
@@ -503,6 +506,429 @@ func baseConfig() Config {
 			Audience: "stamp",
 		},
 	}
+}
+
+// stepUpBaseConfig is baseConfig with the callback surface bound.
+//
+// The three step-up tests above ask whether the delegated MFA settings are
+// coherent among themselves. Since [Config.surfaceRequirements] a step-up also
+// needs the listener its completion comes back on, so leaving it unbound would
+// make each of those configurations invalid for a second reason and let a test
+// pass on the wrong error. Binding it keeps every one of them on its own
+// question; the unbound case has its own tests below.
+func stepUpBaseConfig() Config {
+	cfg := baseConfig()
+	cfg.Addresses[api.SurfaceCallback] = ":8082"
+	return cfg
+}
+
+// everyRole is what --roles=all resolves to. Validation is per role only on the
+// surface axis, so a test that is not about roles takes the widest set — the
+// one that mounts every route and can therefore strand any of them.
+func everyRole() Set {
+	set := Set{}
+	for _, r := range knownRoles() {
+		set[r] = struct{}{}
+	}
+	return set
+}
+
+// ---------------------------------------------------------------------------
+// the callback surface cross-check
+//
+// Until this section existed the chart was the only guard: `helm template`
+// refused a release that configured what completes on the callback surface and
+// bound no listener, and `stamp --roles=all` with the same settings started and
+// reported itself healthy. The demo runs on docker-compose and a developer runs
+// the binary, so the one guard covered neither.
+// ---------------------------------------------------------------------------
+
+// roleSet is ParseRoles for a test, which has a literal spec and no reason to
+// carry its error.
+func roleSet(t *testing.T, spec string) Set {
+	t.Helper()
+	set, err := ParseRoles(spec)
+	if err != nil {
+		t.Fatalf("parse roles %q: %v", spec, err)
+	}
+	return set
+}
+
+// withStepUpSettings, withExternalTarget and withIngestGrant are the three
+// settings the guard triggers on, each applied on its own so that a refusal can
+// be attributed to one of them.
+func withStepUpSettings(cfg *Config) {
+	cfg.CallbackBaseURL = "https://stamp.example/callback"
+	cfg.MFA = MFAConfig{
+		AllowedACRValues:      []string{"aal2"},
+		AuthorizationEndpoint: "https://idp.example/authorize",
+		ClientID:              "stamp-stepup",
+		RedirectURI:           "https://stamp.example/callback/mfa",
+		TokenEndpoint:         "https://idp.example/token",
+	}
+}
+
+func withExternalTarget(cfg *Config) {
+	cfg.ExternalTargets = []challenge.ExternalTarget{{
+		Name: "risk", URL: "https://risk.example/hook", Secret: strings.Repeat("k", 32),
+	}}
+}
+
+func withIngestGrant(cfg *Config) {
+	cfg.IngestCredentials = []stream.IngestCredential{{CallerID: "workload:https://idp.example#svc-payments"}}
+}
+
+// TestAFeatureThatCompletesOnTheCallbackSurfaceNeedsItBound is the check itself,
+// one feature at a time.
+//
+// Each of the three completes on the callback surface and on no other, so each
+// of them alone is enough to make an unbound listener a deployment that cannot
+// finish what it starts. The paired "bound" case is what keeps this from being
+// a check that refuses everything.
+func TestAFeatureThatCompletesOnTheCallbackSurfaceNeedsItBound(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*Config)
+		// env is the variable the refusal has to name, because it is the one an
+		// operator would go and look at.
+		env string
+		// route is the path that becomes unreachable, which is the part that
+		// says what is actually lost.
+		route string
+	}{
+		{
+			name: "delegated step-up mfa", configure: withStepUpSettings,
+			env: EnvMFAAuthzEndpoint, route: "/decisions/{id}/challenges/{ordinal}/mfa",
+		},
+		{
+			name: "external challenge targets", configure: withExternalTarget,
+			env: EnvExternalTargets, route: "/external/{id}/{ordinal}",
+		},
+		{
+			name: "http velocity ingest", configure: withIngestGrant,
+			env: EnvIngestCredentials, route: "/ingest/v1/events",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig()
+			tc.configure(&cfg)
+
+			err := cfg.validate(everyRole())
+			if err == nil {
+				t.Fatalf("%s with no callback listener was accepted: the route it completes on is "+
+					"mounted on a surface nothing binds", tc.name)
+			}
+			for _, want := range []string{EnvCallbackAddr, tc.env, tc.route, EnvCallbackBaseURL} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not name %q:\n%v", want, err)
+				}
+			}
+
+			// The same configuration with the listener bound is the deployment
+			// an operator meant, and it validates.
+			cfg.Addresses[api.SurfaceCallback] = ":8082"
+			if err := cfg.validate(everyRole()); err != nil {
+				t.Fatalf("%s with the callback listener bound was refused: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// A refusal names every stranded setting rather than the first one it found: an
+// operator who cleared one and restarted would otherwise learn about the second
+// on the next boot and the third on the one after.
+func TestTheRefusalNamesEveryStrandedSetting(t *testing.T) {
+	cfg := baseConfig()
+	withStepUpSettings(&cfg)
+	withExternalTarget(&cfg)
+	withIngestGrant(&cfg)
+
+	err := cfg.validate(everyRole())
+	if err == nil {
+		t.Fatal("a deployment that stranded all three was accepted")
+	}
+	for _, want := range []string{EnvMFAAuthzEndpoint, EnvExternalTargets, EnvIngestCredentials} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal stops before naming %s:\n%v", want, err)
+		}
+	}
+
+	cfg.Addresses[api.SurfaceCallback] = ":8082"
+	if err := cfg.validate(everyRole()); err != nil {
+		t.Fatalf("all three with the listener bound was refused: %v", err)
+	}
+}
+
+// The default install binds no callback listener and configures none of the
+// three, and it has to keep starting. The unbound default is R39's decision —
+// the callback surface is the one a deployment may have to publish past its own
+// perimeter, so it is opted into — and a check that made "unbound" itself an
+// error would have reversed that decision rather than enforced it.
+func TestNothingOnTheCallbackSurfaceNeedsNoCallbackListener(t *testing.T) {
+	if err := baseConfig().validate(everyRole()); err != nil {
+		t.Fatalf("the default deployment was refused: %v", err)
+	}
+	if _, bound := baseConfig().Addresses[api.SurfaceCallback]; bound {
+		t.Error("the base configuration binds a callback listener, so this test proves nothing")
+	}
+}
+
+// TestARoleThatMountsNoCallbackRouteIsNotRefused is the gate that keeps this
+// check from breaking legitimate deployments.
+//
+// A process that runs neither decide nor consumer mounts no callback route, so
+// none of the three settings is stranded *in it* even when they are all
+// configured — and they are legitimately configured there: an api tier holds
+// the external targets because applying a revision re-issues challenges
+// (issuesChallenges), and one deployment's environment is usually one document
+// handed to every tier. Refusing those tiers would refuse the split topology
+// the chart renders.
+func TestARoleThatMountsNoCallbackRouteIsNotRefused(t *testing.T) {
+	strand := func() Config {
+		cfg := baseConfig()
+		withStepUpSettings(&cfg)
+		withExternalTarget(&cfg)
+		withIngestGrant(&cfg)
+		return cfg
+	}
+
+	for _, spec := range []string{"check", "api", "console", "check,api,console"} {
+		t.Run(spec, func(t *testing.T) {
+			if err := strand().validate(roleSet(t, spec)); err != nil {
+				t.Fatalf("--roles=%s mounts no callback route and was refused anyway: %v", spec, err)
+			}
+		})
+	}
+
+	// And the two that do mount one are refused, each for what it mounts and
+	// not for what the other does. A consumer tier is not refused for a step-up
+	// it does not serve the return of, and a decide tier is not refused for an
+	// ingest route it does not mount — otherwise the gate would be decoration.
+	t.Run("decide", func(t *testing.T) {
+		err := strand().validate(roleSet(t, "decide"))
+		if err == nil {
+			t.Fatal("the decide role mounts the mfa and external returns and was not refused")
+		}
+		if strings.Contains(err.Error(), EnvIngestCredentials) {
+			t.Errorf("the decide role was refused for the ingest route, which only the consumer "+
+				"role mounts:\n%v", err)
+		}
+	})
+	t.Run("consumer", func(t *testing.T) {
+		err := strand().validate(roleSet(t, "consumer"))
+		if err == nil {
+			t.Fatal("the consumer role mounts the ingest route and was not refused")
+		}
+		for _, unwanted := range []string{EnvMFAAuthzEndpoint, EnvExternalTargets} {
+			if strings.Contains(err.Error(), unwanted) {
+				t.Errorf("the consumer role was refused for %s, whose route only the decide role "+
+					"mounts:\n%v", unwanted, err)
+			}
+		}
+	})
+}
+
+// CIBA is backchannel and needs no browser redirect, so it is not a trigger.
+//
+// It reaches the guard anyway, and this test is the reason the comment on
+// surfaceRequirements can say so: [MFAConfig.validate] requires the four
+// step-up variables whenever any MFA is configured, and Configured is true of a
+// CIBA-only deployment. So a CIBA-only configuration cannot reach a passing
+// validate without an authorization endpoint, and once it has one it is refused
+// here like any other step-up. Both halves are asserted, because the claim is
+// only true while the first one holds.
+func TestACIBAOnlyDeploymentReachesTheGuardThroughTheStepUpQuartet(t *testing.T) {
+	cfg := baseConfig()
+	cfg.MFA = MFAConfig{CIBA: CIBAConfig{
+		BackchannelEndpoint: "https://idp.example/ciba",
+		TokenEndpoint:       "https://idp.example/token",
+		ClientID:            "stamp-ciba",
+		ClientSecret:        "ciba-secret",
+	}}
+	if !cfg.MFA.Configured() {
+		t.Fatal("a CIBA client alone does not report the MFA configuration as configured")
+	}
+
+	err := cfg.validate(everyRole())
+	if err == nil {
+		t.Fatal("a CIBA-only deployment validated, so the step-up quartet is no longer required")
+	}
+	if !strings.Contains(err.Error(), EnvMFAAuthzEndpoint) {
+		t.Fatalf("a CIBA-only deployment is not asked for the step-up quartet, which is what carries "+
+			"it into the surface check:\n%v", err)
+	}
+	// The refusal above is MFAConfig.validate's, not this one's: with no
+	// authorization endpoint there is nothing for the surface check to strand.
+	if strings.Contains(err.Error(), EnvCallbackAddr) {
+		t.Errorf("the surface check fired on a CIBA-only configuration; it is not a trigger:\n%v", err)
+	}
+
+	// With the quartet filled in — which is the only way this deployment boots
+	// at all — the guard applies, and it is right to: nothing polls an
+	// auth_req_id, so a CIBA verdict comes back on the POST of the same route.
+	withStepUpSettings(&cfg)
+	cfg.MFA.CIBA = CIBAConfig{
+		BackchannelEndpoint: "https://idp.example/ciba",
+		TokenEndpoint:       "https://idp.example/token",
+		ClientID:            "stamp-ciba",
+		ClientSecret:        "ciba-secret",
+	}
+	err = cfg.validate(everyRole())
+	if err == nil {
+		t.Fatal("a CIBA deployment with the step-up quartet and no callback listener was accepted")
+	}
+	if !strings.Contains(err.Error(), EnvCallbackAddr) {
+		t.Errorf("the refusal is not the surface one:\n%v", err)
+	}
+}
+
+// TestTheBinaryAndTheChartRefuseTheSameStrandedRelease holds the two guards
+// together.
+//
+// Two guards that disagree are worse than one: a configuration the chart
+// rejects and the binary accepts teaches an operator that the chart is fussy,
+// and one the chart accepts and the binary refuses is a rollout that fails
+// after the manifests were reviewed. The chart's refusal is pinned in a
+// snapshot (deploy/helm/render.sh renders a values file the chart must refuse),
+// so both messages exist as text and can be compared.
+func TestTheBinaryAndTheChartRefuseTheSameStrandedRelease(t *testing.T) {
+	chart, err := os.ReadFile(filepath.Clean(chartCallbackRefusalFile))
+	if err != nil {
+		t.Fatalf("read %s: %v (run deploy/helm/render.sh)", chartCallbackRefusalFile, err)
+	}
+	chartMsg := string(chart)
+
+	cfg := baseConfig()
+	withStepUpSettings(&cfg)
+	withExternalTarget(&cfg)
+	withIngestGrant(&cfg)
+	binaryErr := cfg.validate(everyRole())
+	if binaryErr == nil {
+		t.Fatal("the binary accepted the release the chart refuses")
+	}
+	binaryMsg := binaryErr.Error()
+
+	// The three triggers, each in the language of its own guard. A trigger
+	// added to one side and not the other fails here.
+	for _, trigger := range []struct{ values, env string }{
+		{"mfa.authorizationEndpoint", EnvMFAAuthzEndpoint},
+		{"documents.externalTargets", EnvExternalTargets},
+		{"documents.ingestCredentials", EnvIngestCredentials},
+	} {
+		if !strings.Contains(chartMsg, trigger.values) {
+			t.Errorf("the chart's refusal no longer names %s, so the two guards trigger on "+
+				"different sets:\n  %s", trigger.values, chartMsg)
+		}
+		if !strings.Contains(binaryMsg, trigger.env) {
+			t.Errorf("the binary's refusal does not name %s:\n%v", trigger.env, binaryMsg)
+		}
+	}
+
+	// Derived rather than listed, exactly as internal/release derives it for the
+	// chart: every path mounted on the callback surface is named by the binary's
+	// refusal too. A route added there later is one more thing an unbound
+	// listener swallows, and this stays red until both messages account for it.
+	for _, path := range callbackSurfacePaths(t) {
+		if !strings.Contains(binaryMsg, path) {
+			t.Errorf("the binary's refusal does not name %s, which is mounted on the callback "+
+				"surface and is therefore one of the things this process would have lost:\n%v",
+				path, binaryMsg)
+		}
+		if !strings.Contains(chartMsg, path) {
+			t.Errorf("the chart's refusal does not name %s:\n  %s", path, chartMsg)
+		}
+	}
+
+	// Both ways out, on both sides. The second one is the legitimate deployment:
+	// running none of the three is what the unbound default is for.
+	for _, want := range []string{EnvCallbackAddr, EnvCallbackBaseURL, "clear the settings named above"} {
+		if !strings.Contains(binaryMsg, want) {
+			t.Errorf("the binary's refusal does not offer %q:\n%v", want, binaryMsg)
+		}
+	}
+
+	// And the role gate is the same judgment on both sides. The chart refuses
+	// only when a tier runs decide or consumer; this reads that condition out of
+	// the template rather than trusting the comment above it.
+	guard := chartCallbackGuard(t)
+	for _, role := range []string{"decide", "consumer"} {
+		if !strings.Contains(guard, `"role" "`+role+`"`) {
+			t.Errorf("the chart's callback guard no longer gates on the %s role, so its refusal and "+
+				"the binary's are gated differently:\n%s", role, guard)
+		}
+	}
+	for _, role := range []string{"check", "api", "console"} {
+		if strings.Contains(guard, `"role" "`+role+`"`) {
+			t.Errorf("the chart's callback guard gates on the %s role, which mounts no callback "+
+				"route; the binary does not refuse it and the two now disagree:\n%s", role, guard)
+		}
+	}
+}
+
+// chartCallbackRefusalFile is the chart's own message, rendered by
+// deploy/helm/render.sh from a values file the chart must refuse and committed
+// so that a Go test can read it without helm.
+const chartCallbackRefusalFile = "../../deploy/helm/snapshots/no-callback.err.txt"
+
+// chartHelpersFile is the template both refusals' conditions live in — the
+// chart's in the template itself, the binary's named by the comment on
+// surfaceRequirements.
+const chartHelpersFile = "../../deploy/helm/stamp/templates/_helpers.tpl"
+
+// chartCallbackGuard returns the body of the chart's stamp.callbackSurfaceValidated
+// define. It is scoped rather than read whole because other helpers in the same
+// file legitimately name the decide and api roles, and a substring search over
+// the whole template would pass on theirs.
+func chartCallbackGuard(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Clean(chartHelpersFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", chartHelpersFile, err)
+	}
+	const marker = `{{- define "stamp.callbackSurfaceValidated" -}}`
+	_, body, found := strings.Cut(string(raw), marker)
+	if !found {
+		t.Fatalf("%s no longer defines stamp.callbackSurfaceValidated: the chart's half of this "+
+			"refusal is gone, and the binary's is now the only guard again", chartHelpersFile)
+	}
+	return body
+}
+
+// callbackSurfacePaths reads the paths mounted on the callback surface out of
+// the tracked mount table, without the method prefix a pattern carries.
+func callbackSurfacePaths(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Clean(mountTableFile))
+	if err != nil {
+		t.Fatalf("read %s: %v (run `go test ./internal/runtime/ -run TestTheMountTableFileIsUpToDate`, "+
+			"which needs a Docker daemon)", mountTableFile, err)
+	}
+	var table mountTableDocument
+	if err := json.Unmarshal(raw, &table); err != nil {
+		t.Fatalf("decode %s: %v", mountTableFile, err)
+	}
+	seen := map[string]bool{}
+	paths := []string{}
+	for _, r := range table.Routes {
+		if r.Surface != string(api.SurfaceCallback) {
+			continue
+		}
+		path := r.Pattern
+		if _, rest, found := strings.Cut(path, " "); found {
+			path = rest
+		}
+		// /healthz is mounted by api.Server on every surface rather than by a
+		// role, so it belongs to no feature an operator could have configured.
+		if path == "/healthz" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		t.Fatalf("%s lists no callback routes, so this test would pass on an empty message", mountTableFile)
+	}
+	return paths
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +1073,7 @@ func TestIdPGroupSourcesRead(t *testing.T) {
 func TestABrokerWithNoGroupOrTopicsIsRefused(t *testing.T) {
 	cfg := baseConfig()
 	cfg.Kafka = KafkaConfig{Brokers: []string{"broker:9092"}}
-	err := cfg.validate()
+	err := cfg.validate(everyRole())
 	if err == nil {
 		t.Fatal("a broker with no consumer group and no topics was accepted")
 	}
@@ -693,7 +1119,7 @@ func TestApproverIssuerDesignation(t *testing.T) {
 	t.Run("an explicit designation is used", func(t *testing.T) {
 		cfg := two()
 		cfg.ApproverIssuer = "https://other.example"
-		if err := cfg.validate(); err != nil {
+		if err := cfg.validate(everyRole()); err != nil {
 			t.Fatalf("a designation naming a pinned issuer was refused: %v", err)
 		}
 		if got := approverIssuerFor(cfg); got != "https://other.example" {
@@ -704,7 +1130,7 @@ func TestApproverIssuerDesignation(t *testing.T) {
 	t.Run("designating the single pinned issuer is admitted", func(t *testing.T) {
 		cfg := baseConfig()
 		cfg.ApproverIssuer = "https://idp.example"
-		if err := cfg.validate(); err != nil {
+		if err := cfg.validate(everyRole()); err != nil {
 			t.Fatalf("designating the one pinned issuer was refused: %v", err)
 		}
 	})
@@ -712,7 +1138,7 @@ func TestApproverIssuerDesignation(t *testing.T) {
 	t.Run("an unpinned issuer is refused at startup", func(t *testing.T) {
 		cfg := two()
 		cfg.ApproverIssuer = "https://elsewhere.example"
-		err := cfg.validate()
+		err := cfg.validate(everyRole())
 		if err == nil {
 			t.Fatal("an approver issuer this deployment does not pin was accepted")
 		}
@@ -839,14 +1265,19 @@ func TestConfigFromEnvReadsTheDecideRateLimits(t *testing.T) {
 	})
 }
 
-// TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits is the other two axes
-// of R43 on the deployment surface.
+// TestConfigFromEnvReadsTheChallengeApprovalAndCancellationRateLimits is the
+// other three axes of R43 on the deployment surface.
 //
 // They are read the way the decide rates are, and validated by the same
 // function, because an operator who mistyped the approval burst is in exactly
 // the position the decide burst's check exists for: a limit validated on one
 // surface and not another is a limit somebody can be silently without.
-func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
+//
+// The cancellation pair is the newest and was the last write surface with no
+// budget at all. It is here rather than in a test of its own precisely because
+// what it has to be is *the same as the others* — same spelling, same zero
+// meaning, same refusal to boot on a bucket that cannot mean anything.
+func TestConfigFromEnvReadsTheChallengeApprovalAndCancellationRateLimits(t *testing.T) {
 	base := func(t *testing.T) {
 		t.Helper()
 		clearEnv(t)
@@ -866,13 +1297,15 @@ func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
 		// own default — which is a real number, not "unlimited". An operator who
 		// means no limit writes a negative rate.
 		if cfg.ChallengeIssueRate != (stream.RateLimit{}) || cfg.ApprovalSubmitRate != (stream.RateLimit{}) ||
-			cfg.ChallengeIssueSubjectCeiling != (stream.RateLimit{}) {
-			t.Errorf("rates = %+v / %+v / %+v, want zero so the handlers default them",
-				cfg.ChallengeIssueRate, cfg.ChallengeIssueSubjectCeiling, cfg.ApprovalSubmitRate)
+			cfg.ChallengeIssueSubjectCeiling != (stream.RateLimit{}) ||
+			cfg.CancellationRate != (stream.RateLimit{}) {
+			t.Errorf("rates = %+v / %+v / %+v / %+v, want zero so the handlers default them",
+				cfg.ChallengeIssueRate, cfg.ChallengeIssueSubjectCeiling, cfg.ApprovalSubmitRate,
+				cfg.CancellationRate)
 		}
 	})
 
-	t.Run("the six variables are read", func(t *testing.T) {
+	t.Run("the eight variables are read", func(t *testing.T) {
 		base(t)
 		t.Setenv(EnvChallengeIssueRate, "0.1")
 		t.Setenv(EnvChallengeIssueBurst, "4")
@@ -880,6 +1313,8 @@ func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
 		t.Setenv(EnvChallengeIssueCeilingBurst, "12")
 		t.Setenv(EnvApprovalRate, "3")
 		t.Setenv(EnvApprovalBurst, "30")
+		t.Setenv(EnvCancellationRate, "0.5")
+		t.Setenv(EnvCancellationBurst, "4")
 		cfg, err := ConfigFromEnv()
 		if err != nil {
 			t.Fatalf("ConfigFromEnv: %v", err)
@@ -897,6 +1332,14 @@ func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
 		if want := (stream.RateLimit{PerSecond: 3, Burst: 30}); cfg.ApprovalSubmitRate != want {
 			t.Errorf("approval rate = %+v, want %+v", cfg.ApprovalSubmitRate, want)
 		}
+		// Its own pair of variables again, and for the sharper version of the
+		// reason above: approval submission and delay cancellation reach the same
+		// lifecycle through the same seam, so one knob would look reasonable — and
+		// it would mean a flood of approvals could stop an authority halting a
+		// wait that is already running.
+		if want := (stream.RateLimit{PerSecond: 0.5, Burst: 4}); cfg.CancellationRate != want {
+			t.Errorf("cancellation rate = %+v, want %+v", cfg.CancellationRate, want)
+		}
 	})
 
 	for name, tc := range map[string]struct {
@@ -908,19 +1351,30 @@ func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
 		// The ceiling is validated by the same function as every other R43
 		// budget. A limit checked on five of six surfaces is a limit somebody
 		// can be silently without.
-		"an unparseable ceiling rate":  {key: EnvChallengeIssueCeilingRate, value: "slow", names: EnvChallengeIssueCeilingRate},
-		"a negative ceiling burst":     {key: EnvChallengeIssueCeilingBurst, value: "-1", names: EnvChallengeIssueCeilingBurst},
-		"an unparseable approval rate": {key: EnvApprovalRate, value: "fast", names: EnvApprovalRate},
-		"a negative approval burst":    {key: EnvApprovalBurst, value: "-2", names: EnvApprovalBurst},
+		"an unparseable ceiling rate":      {key: EnvChallengeIssueCeilingRate, value: "slow", names: EnvChallengeIssueCeilingRate},
+		"a negative ceiling burst":         {key: EnvChallengeIssueCeilingBurst, value: "-1", names: EnvChallengeIssueCeilingBurst},
+		"an unparseable approval rate":     {key: EnvApprovalRate, value: "fast", names: EnvApprovalRate},
+		"a negative approval burst":        {key: EnvApprovalBurst, value: "-2", names: EnvApprovalBurst},
+		"an unparseable cancellation rate": {key: EnvCancellationRate, value: "never", names: EnvCancellationRate},
+		"a negative cancellation burst":    {key: EnvCancellationBurst, value: "-3", names: EnvCancellationBurst},
 		"an approval burst with no rate": {
 			key: EnvApprovalBurst, value: "10", names: EnvApprovalBurst,
+		},
+		// The same shape on the newest budget: an operator who wrote down a
+		// bucket size next to a rate that turns the limit off got no limit, on
+		// the surface this round added one to.
+		"a cancellation burst with no rate": {
+			key: EnvCancellationBurst, value: "5", names: EnvCancellationBurst,
 		},
 	} {
 		t.Run(name+" is a startup failure", func(t *testing.T) {
 			base(t)
-			if name == "an approval burst with no rate" {
+			switch name {
+			case "an approval burst with no rate":
 				// The operator who wrote down a limit and would have got none.
 				t.Setenv(EnvApprovalRate, "-1")
+			case "a cancellation burst with no rate":
+				t.Setenv(EnvCancellationRate, "-1")
 			}
 			t.Setenv(tc.key, tc.value)
 			if _, err := ConfigFromEnv(); err == nil {
@@ -934,6 +1388,7 @@ func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
 	t.Run("a negative rate on its own removes the limit", func(t *testing.T) {
 		base(t)
 		t.Setenv(EnvChallengeIssueRate, "-1")
+		t.Setenv(EnvCancellationRate, "-1")
 		cfg, err := ConfigFromEnv()
 		if err != nil {
 			t.Fatalf("saying no limit out loud was refused: %v", err)
@@ -941,6 +1396,10 @@ func TestConfigFromEnvReadsTheChallengeAndApprovalRateLimits(t *testing.T) {
 		if cfg.ChallengeIssueRate.PerSecond != -1 {
 			t.Errorf("challenge issue rate = %v, want the operator's -1 carried through",
 				cfg.ChallengeIssueRate.PerSecond)
+		}
+		if cfg.CancellationRate.PerSecond != -1 {
+			t.Errorf("cancellation rate = %v, want the operator's -1 carried through",
+				cfg.CancellationRate.PerSecond)
 		}
 	})
 }

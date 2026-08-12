@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database"
@@ -217,6 +218,27 @@ func isUndefinedTable(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
 
+// How long a booting process waits for another process's migration before it
+// gives up, and how often it asks.
+//
+// The budget is generous on purpose. What it is waiting for is one peer's
+// migrations to finish, and a boot that waits a minute is a slower rollout,
+// while a boot that gives up early is a crashloop. The poll interval is short
+// because the common case is a peer that is already nearly done.
+const (
+	migrationLockWait = 90 * time.Second
+	migrationLockPoll = 100 * time.Millisecond
+)
+
+// migrationLockTimeout is golang-migrate's own ceiling on a Driver.Lock call. It
+// is set above migrationLockWait deliberately, and the ordering is load-bearing
+// rather than cosmetic: the library abandons a Lock that outruns this timeout
+// and lets the caller close the migrator, which releases the pooled connection
+// the abandoned call is still using. Keeping the driver's own deadline strictly
+// shorter means that never happens. The library's default is 15s, which is
+// under our wait and would have made this the normal path.
+const migrationLockTimeout = migrationLockWait + 30*time.Second
+
 func (s *Store) migrator(ctx context.Context) (*migrate.Migrate, error) {
 	src, err := iofs.New(migrationFS, "migrations")
 	if err != nil {
@@ -230,6 +252,7 @@ func (s *Store) migrator(ctx context.Context) (*migrate.Migrate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: build migrator: %w", err)
 	}
+	m.LockTimeout = migrationLockTimeout
 	return m, nil
 }
 
@@ -247,11 +270,52 @@ func closeMigrator(m *migrate.Migrate) {
 // there is no legitimate role name that needs quoting.
 var roleNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 
+// grantsLockKey serialises concurrent applies of the grants file. It is a
+// different key from the migration lock on purpose: the two are taken by the
+// same process one after the other, and sharing a key would make Migrate's own
+// call to ApplyGrants wait on a lock it had just released for no reason.
+var grantsLockKey = advisoryKey("stamp:grants")
+
 // ApplyGrants provisions the per-role database roles and their privileges.
 //
 // The roles are created without LOGIN and without a password: they are
 // privilege templates that a deployment grants to the login roles it already
 // manages. Credentials never ship in a file embedded in the binary.
+//
+// This is safe to run concurrently with an identical apply, which it has to be:
+// it runs at pod boot (see internal/runtime/wiring.go), Kubernetes rolls a
+// Deployment's replicas together, and `helm upgrade` rolls every tier at once
+// with nothing sequencing them. Two boots landing in the same millisecond is the
+// normal case on a rollout, not a pathological one. It is also run twice by one
+// process whenever both migrate and applyGrants are enabled, since Migrate ends
+// by calling it, so it has to be repeatable as well as concurrent.
+//
+// The apply is wrapped in a transaction holding a transaction-scoped advisory
+// lock. Three reasons for that shape:
+//
+// The file is not just role creation. It REVOKEs everything from the four roles
+// and re-GRANTs the current set, so two uncoordinated applies interleave
+// catalogue updates on the same pg_class rows — which Postgres answers with
+// `tuple concurrently updated` rather than by merging. Serialising the whole
+// file is the fix; serialising only the CREATE ROLE would leave that.
+//
+// The lock is transaction-scoped rather than session-scoped, unlike
+// pgxMigrationDriver.Lock. That driver has no choice: golang-migrate's interface
+// hands it Lock and Unlock as separate calls spanning many statements, so it has
+// to hold the lock across them and carry the risk that a pooled connection is
+// returned still holding it. Here the entire apply is one transaction, so
+// pg_advisory_xact_lock releases at commit or rollback with no bookkeeping and
+// no way to leak a held lock back into the pool.
+//
+// It is the blocking pg_advisory_xact_lock and not pg_try_advisory_xact_lock,
+// because the desired outcome is that both boots succeed. A try-lock would make
+// the loser choose between failing (the bug this fixes) and skipping the apply
+// (worse: a pod would proceed believing privileges it never confirmed). Waiting
+// costs one apply's duration and is bounded by the caller's context.
+//
+// What the lock cannot cover is role creation itself — advisory locks are
+// per-database and roles are cluster-global — so grants.sql tolerates the
+// duplicate-role error separately. See the comment there.
 func (s *Store) ApplyGrants(ctx context.Context) error {
 	roles := s.roles.withDefaults()
 	seen := map[string]struct{}{}
@@ -276,10 +340,19 @@ func (s *Store) ApplyGrants(ctx context.Context) error {
 	if err := tmpl.Execute(&sql, roles); err != nil {
 		return fmt.Errorf("store: render grants: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, sql.String()); err != nil {
-		return fmt.Errorf("store: apply grants: %w", err)
-	}
-	return nil
+	return s.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, grantsLockKey); err != nil {
+			return fmt.Errorf("store: lock grants: %w", err)
+		}
+		// One Exec for the whole file. pgx sends a statement without arguments
+		// over the simple protocol, which is what allows the multi-statement
+		// body at all — and the grants have to arrive together, or a REVOKE
+		// could commit without the GRANT that restores what it took away.
+		if _, err := tx.Exec(ctx, sql.String()); err != nil {
+			return fmt.Errorf("store: apply grants: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -316,15 +389,52 @@ func newPgxMigrationDriver(ctx context.Context, pool *pgxpool.Pool) (*pgxMigrati
 	return d, nil
 }
 
+// ensureVersionTable creates the version table if it is not there.
+//
+// This runs before the migration lock is taken and it has to: golang-migrate
+// calls Lock and then immediately Version, so the table has to exist before the
+// driver is handed to the library. That leaves the create itself unprotected,
+// and `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent identical
+// create — the IF NOT EXISTS check and the catalogue insert are separate steps.
+// Two processes booting together both find nothing, both insert, and the loser
+// blocks until the winner commits and then takes
+// `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`
+// (23505, on the table's implicit row type). Every replica migrates by default,
+// so that killed a booting pod on a normal rollout.
+//
+// The retry is what makes it safe, and it verifies rather than assumes: the
+// second attempt re-runs the same statement, which now finds the committed table
+// and does nothing. Tolerating the error without re-running would be trusting
+// that a duplicate could only ever have come from an identical create. One retry
+// is enough because the only way to lose this race is against a create that has
+// already committed — there is no third state to converge on.
 func (d *pgxMigrationDriver) ensureVersionTable() error {
 	const stmt = `CREATE TABLE IF NOT EXISTS ` + migrationsTableName + ` (
 		version bigint NOT NULL PRIMARY KEY,
 		dirty   boolean NOT NULL
 	)`
-	if _, err := d.conn.Exec(d.ctx, stmt); err != nil {
-		return fmt.Errorf("store: create %s: %w", migrationsTableName, err)
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err = d.conn.Exec(d.ctx, stmt); err == nil {
+			return nil
+		}
+		if !isDuplicateObject(err) {
+			break
+		}
 	}
-	return nil
+	return fmt.Errorf("store: create %s: %w", migrationsTableName, err)
+}
+
+// isDuplicateObject reports whether err is Postgres refusing to create something
+// that is already there. 42P07 is the ordinary answer; 23505 is what a caller
+// gets when it lost a race to a concurrent creator, because then it is the
+// catalogue's own unique index that notices rather than an up-front check.
+func isDuplicateObject(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "42P07" || pgErr.Code == "23505"
 }
 
 // Open is part of database.Driver but is only used by the URL-registered path.
@@ -345,19 +455,52 @@ func (d *pgxMigrationDriver) Close() error {
 // both run the same migration. The lock is session-scoped on a dedicated
 // connection, so a process that dies mid-migration releases it when Postgres
 // notices the connection is gone — a lock row in a table would not.
+//
+// It waits for the lock rather than failing on it. A bare pg_try_advisory_lock
+// serialises the two boots by killing one of them: golang-migrate calls
+// Driver.Lock exactly once and returns whatever it gets, so the loser's Up
+// failed with `can't acquire lock` and the process exited. That is the same
+// concurrent-boot defect as the grants race, only with a politer error message —
+// and it fires on any rollout that starts two replicas together, which is every
+// rollout.
+//
+// The wait is bounded and polled rather than a blocking pg_advisory_lock, for
+// one reason that is not stylistic: golang-migrate runs Driver.Lock in its own
+// goroutine and abandons it when its LockTimeout fires, while the caller goes on
+// to close the migrator and release this pooled connection. A blocked
+// pg_advisory_lock would still be holding that connection when it was released
+// underneath it. Polling with a deadline this driver owns — kept under the
+// library's ceiling by migrationLockTimeout — means Lock always returns before
+// anything can be pulled out from under it, and lets d.ctx cancel the wait so a
+// boot that is being shut down does not sit here.
 func (d *pgxMigrationDriver) Lock() error {
 	if d.isLocked {
 		return database.ErrLocked
 	}
-	var got bool
-	if err := d.conn.QueryRow(d.ctx, `SELECT pg_try_advisory_lock($1)`, d.lockKey).Scan(&got); err != nil {
-		return fmt.Errorf("store: migration lock: %w", err)
+	deadline := time.Now().Add(migrationLockWait)
+	for {
+		var got bool
+		if err := d.conn.QueryRow(d.ctx, `SELECT pg_try_advisory_lock($1)`, d.lockKey).Scan(&got); err != nil {
+			return fmt.Errorf("store: migration lock: %w", err)
+		}
+		if got {
+			d.isLocked = true
+			return nil
+		}
+		if time.Now().After(deadline) {
+			// Reported as ErrLocked and not as a timeout because that is what it
+			// is: something else has held the migration lock for longer than a
+			// migration should take, and this process cannot tell a slow peer
+			// from a stuck one. Failing the boot is right — proceeding would mean
+			// serving on a schema nobody confirmed.
+			return database.ErrLocked
+		}
+		select {
+		case <-d.ctx.Done():
+			return fmt.Errorf("store: migration lock: %w", d.ctx.Err())
+		case <-time.After(migrationLockPoll):
+		}
 	}
-	if !got {
-		return database.ErrLocked
-	}
-	d.isLocked = true
-	return nil
 }
 
 func (d *pgxMigrationDriver) Unlock() error {

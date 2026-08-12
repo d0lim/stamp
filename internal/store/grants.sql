@@ -11,20 +11,53 @@
 -- templates; a deployment grants them to whatever login roles it already
 -- manages, and credentials never live in a file that ships with the binary.
 
+-- Roles are created defensively because this file runs at pod boot and pods
+-- boot together. Postgres has no CREATE ROLE IF NOT EXISTS, and the obvious
+-- substitute — `IF NOT EXISTS (SELECT 1 FROM pg_roles ...) THEN CREATE ROLE` —
+-- is a check-then-act with a real window: two processes both read an empty
+-- pg_roles, both issue CREATE ROLE, and the loser gets
+-- `duplicate key value violates unique constraint "pg_authid_rolname_index"`
+-- (23505) rather than the friendlier 42710. That aborted the whole apply, and
+-- because ApplyGrants runs on the boot path, it aborted the process. It read as
+-- CI flakiness for weeks: it needs two boots inside the same few milliseconds,
+-- which a laptop reproduces roughly never and a CI job that starts two
+-- containers at one instant reproduces regularly.
+--
+-- ApplyGrants holds a per-database advisory lock around this file, which is
+-- what serialises the GRANT/REVOKE churn below. That lock cannot cover role
+-- creation: advisory locks are scoped to a database and roles are cluster-global,
+-- so two STAMP databases in one cluster with the same role names still collide
+-- and Postgres offers no cluster-wide lock to take instead. Tolerating the
+-- duplicate is therefore not belt-and-braces on top of the lock, it is the only
+-- mechanism that covers the scope the object actually lives in.
+--
+-- The pre-check is kept in front of the handler on purpose. Every boot after the
+-- first finds the roles already there, and the check lets that overwhelmingly
+-- common path skip the subtransaction an EXCEPTION block costs. The handler is
+-- for the first-boot window alone.
+--
+-- Nothing else is swallowed. Only "the role already exists" is caught, which is
+-- precisely the state this block was trying to reach; a permissions failure, a
+-- bad name, a full disk still aborts the apply and fails the boot loudly.
 DO $$
+DECLARE
+    role_name text;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Check}}') THEN
-        CREATE ROLE {{.Check}} NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Decide}}') THEN
-        CREATE ROLE {{.Decide}} NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Consumer}}') THEN
-        CREATE ROLE {{.Consumer}} NOLOGIN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{.Admin}}') THEN
-        CREATE ROLE {{.Admin}} NOLOGIN;
-    END IF;
+    FOREACH role_name IN ARRAY ARRAY['{{.Check}}', '{{.Decide}}', '{{.Consumer}}', '{{.Admin}}'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
+            CONTINUE;
+        END IF;
+        BEGIN
+            EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);
+        EXCEPTION
+            -- 42710 is the serial case, 23505 the concurrent one: the losing
+            -- CREATE ROLE gets the raw unique-index violation because the
+            -- catalog index is what detects the collision. Both mean the role
+            -- exists, which is the postcondition asked for.
+            WHEN duplicate_object OR unique_violation THEN
+                NULL;
+        END;
+    END LOOP;
 END
 $$;
 

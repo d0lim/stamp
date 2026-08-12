@@ -34,6 +34,7 @@ import (
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/policy/revision"
 	"github.com/d0lim/stamp/internal/store"
+	"github.com/d0lim/stamp/internal/stream"
 )
 
 // ---------------------------------------------------------------------------
@@ -536,6 +537,89 @@ func TestDelayCancellationReachesTheMountedConsoleRoute(t *testing.T) {
 	}
 	if got := h.decisionState(open.ID); got != store.DecisionDenied {
 		t.Fatalf("decision state = %q, want the cancellation to deny it", got)
+	}
+	h.verifyChain()
+}
+
+// TestCancellationRefusalsAreBoundedByABudget is what U1 exists for, measured
+// where the cost is actually paid: rows in the audit chain.
+//
+// A cancellation refused for want of standing is not free. decision.Service
+// settles standing before state — deliberately, because the other order is an
+// existence oracle (#38) — and the refusal writes an access-refused entry with a
+// synchronous chain append, inside the serialized write path. That is the cost.
+// It used to be reachable only while a decision was pending; once standing moved
+// ahead of state it became reachable on resolved and expired decisions too, so
+// the window is now the decision's whole life.
+//
+// Which means an authenticated console user holding nothing but a decision
+// identifier could drive one chain append per request, for as long as they
+// liked, on the one write path in this system that cannot be parallelised. The
+// four surfaces R43 names all have a budget; this one did not.
+//
+// The assertion is on the audit rows rather than on the status codes, because
+// the status codes are the same before and after — a stranger reads 404 either
+// way (#38) — and the thing that changed is how much work each of those 404s
+// cost. A test that only read the responses would have passed the whole time.
+func TestCancellationRefusalsAreBoundedByABudget(t *testing.T) {
+	// A budget whose bucket refills once every thousand seconds, so what this
+	// test observes is the burst and nothing else. A default-shaped rate would
+	// make the assertion a race between the loop below and the refill.
+	const budget = 3
+	h := newHarness(t, harnessOptions{
+		writerID: "cancel-budget",
+		mutate: func(c *Config) {
+			c.CancellationRate = stream.RateLimit{PerSecond: 0.001, Burst: budget}
+		},
+	})
+	h.seed(tenantSchema(), coolingOffPolicy("cooling-off", time.Hour, "carol"))
+
+	open, err := h.app.Decisions().Decide(context.Background(), decision.Request{
+		Caller: &identity.Subject{Kind: identity.SubjectWorkload, Issuer: h.idp.server.URL, ID: "svc-ops"},
+		Input: engine.Input{
+			Action:   "close",
+			Subject:  engine.Entity{Type: "account", ID: "acct-src", Attributes: map[string]any{"number": "1002"}},
+			Resource: engine.Entity{Type: "account", ID: "acct-dst", Attributes: map[string]any{"amount": int64(9000)}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("open a delayed decision: %v", err)
+	}
+	path := fmt.Sprintf("/decisions/%s/challenges/0/cancellation", open.ID)
+
+	// mallory is not the authority the policy named, and the decision exists —
+	// which is the whole point. Nothing about this loop requires knowing
+	// anything except an identifier the engine itself hands to whoever created
+	// the decision.
+	const attempts = 12
+	token := h.idp.user(t, "mallory")
+	var refused, shed int
+	for i := range attempts {
+		code, body := h.do(http.MethodPost, api.SurfaceConsole, path, token, "", nil)
+		switch code {
+		case http.StatusNotFound:
+			refused++
+		case http.StatusTooManyRequests:
+			shed++
+		default:
+			t.Fatalf("attempt %d answered %d, want 404 or 429: %s", i, code, body)
+		}
+	}
+
+	// One row per attempt that reached the lifecycle, and the budget is what
+	// decides how many of those there were.
+	rows := h.auditPayloadsFor(decision.AuditKindAccessRefused, open.ID)
+	if len(rows) > budget {
+		t.Fatalf("%d attempts wrote %d synchronous audit-chain appends, want at most %d: "+
+			"attempts past the budget are reaching the lifecycle, and each one is a "+
+			"console user spending the serialized write path with nothing but a "+
+			"decision identifier", attempts, len(rows), budget)
+	}
+	if shed != attempts-budget {
+		t.Errorf("%d attempts were shed, want %d: the budget admitted the wrong number", shed, attempts-budget)
+	}
+	if refused != budget {
+		t.Errorf("%d attempts reached the lifecycle, want %d", refused, budget)
 	}
 	h.verifyChain()
 }

@@ -82,6 +82,20 @@ what a first release would contain.
   still per subject; what a refusal there protects is somebody else's system,
   whose defence is that the total is bounded rather than each caller's share.
 
+- **Delay cancellation is rate limited, and it is the tightest budget here.**
+  `STAMP_CANCELLATION_RATE_PER_SECOND` / `_BURST` default to 1 a second bursting
+  to 5, and over them the console gets `429 rate_limited` with a `Retry-After`
+  (decision API 1.8.0). A person cancelling a wait does not reach that; a loop
+  does. The budget is not there for what a successful cancellation costs — that
+  one denies the decision and there is nothing left to cancel — but for what a
+  *refused* one costs: a caller with no standing on a decision that exists makes
+  the lifecycle write a synchronous audit-chain append on the serialized write
+  path, and since standing began being settled before state, that append is
+  reachable for the decision's whole life rather than only while it is pending.
+  It was the one write surface R43 names with no budget at all. Anything driving
+  cancellations programmatically — a test harness, an operator script — should
+  set the pair rather than discover it.
+
 - **A shed challenge issuance no longer creates a decision.** On the decide path
   it is now `200` with no `id`, `reason: challenge_rate_limited` and
   `Retry-After`, where it used to be `201` with a decision that immediately

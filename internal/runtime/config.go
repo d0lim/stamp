@@ -289,6 +289,23 @@ type Config struct {
 	ChallengeIssueSubjectCeiling stream.RateLimit
 	ApprovalSubmitRate           stream.RateLimit
 
+	// CancellationRate is R43's bound on delay cancellation, per authority. A
+	// zero field selects [api.DefaultCancellationRate] for that field; a
+	// negative rate removes the limit.
+	//
+	// It is the fifth write surface and the last one to get a budget. What it
+	// bounds is not the cost of a cancellation that works — that one denies the
+	// decision and there is nothing left to cancel — but the cost of one that is
+	// refused: a caller without standing on an existing decision makes the
+	// lifecycle write an access-refused entry through a synchronous chain
+	// append, on the serialized audit write path, and that is reachable for the
+	// whole life of the decision rather than only while it is pending. The
+	// default is tighter than ApprovalSubmitRate because the action is rarer;
+	// api.DefaultCancellationRate says how much rarer and why.
+	//
+	// **Per instance**, like every budget above.
+	CancellationRate stream.RateLimit
+
 	// GovernanceFloor is R33's operator lower bound on a revision quorum.
 	GovernanceFloor revision.Floor
 	// RevisionTTL bounds how long a revision may stay pending. Zero selects
@@ -744,6 +761,8 @@ const (
 	EnvChallengeIssueCeilingBurst = "STAMP_CHALLENGE_ISSUE_SUBJECT_CEILING_BURST"
 	EnvApprovalRate               = "STAMP_APPROVAL_RATE_PER_SECOND"
 	EnvApprovalBurst              = "STAMP_APPROVAL_RATE_BURST"
+	EnvCancellationRate           = "STAMP_CANCELLATION_RATE_PER_SECOND"
+	EnvCancellationBurst          = "STAMP_CANCELLATION_RATE_BURST"
 
 	EnvFloorMinApprovers       = "STAMP_GOVERNANCE_MIN_APPROVERS"
 	EnvFloorProposerMayApprove = "STAMP_GOVERNANCE_PROPOSER_MAY_APPROVE"
@@ -856,6 +875,10 @@ func ConfigFromEnv() (Config, error) {
 		ApprovalSubmitRate: stream.RateLimit{
 			PerSecond: envFloat(EnvApprovalRate, fail),
 			Burst:     envFloat(EnvApprovalBurst, fail),
+		},
+		CancellationRate: stream.RateLimit{
+			PerSecond: envFloat(EnvCancellationRate, fail),
+			Burst:     envFloat(EnvCancellationBurst, fail),
 		},
 		RevisionTTL:           envDuration(EnvRevisionTTL, 0, fail),
 		ReconcileInterval:     envDuration(EnvReconcileInterval, DefaultReconcileInterval, fail),
@@ -1017,13 +1040,14 @@ func ConfigFromEnv() (Config, error) {
 	//
 	// Every R43 budget is checked by the same function, because an operator who
 	// mistyped the approval burst is in exactly the position the decide burst's
-	// check exists for, and a limit that is only validated on one of four
-	// surfaces is a limit somebody can be silently without.
+	// check exists for, and a limit validated on four of R43's five write
+	// surfaces is a limit somebody can be silently without on the fifth.
 	checkRate(EnvDecideRate, EnvDecideBurst, cfg.DecideRate, fail)
 	checkRate(EnvDecideSubjectRate, EnvDecideSubjectRateBurst, cfg.DecideSubjectRate, fail)
 	checkRate(EnvChallengeIssueRate, EnvChallengeIssueBurst, cfg.ChallengeIssueRate, fail)
 	checkRate(EnvChallengeIssueCeilingRate, EnvChallengeIssueCeilingBurst, cfg.ChallengeIssueSubjectCeiling, fail)
 	checkRate(EnvApprovalRate, EnvApprovalBurst, cfg.ApprovalSubmitRate, fail)
+	checkRate(EnvCancellationRate, EnvCancellationBurst, cfg.CancellationRate, fail)
 
 	aliases, err := aliasesFrom(os.Getenv(EnvCheckPropertyAliases))
 	if err != nil {
@@ -1130,7 +1154,11 @@ func (c Config) withDefaults() Config {
 
 // validate refuses a configuration that could only fail later, and in a place
 // where the cause would be harder to read.
-func (c Config) validate() error {
+//
+// It takes the active roles because its last check is the only one that is not
+// a property of the configuration alone: which routes this process mounts
+// decides which settings can be stranded in it. See surfaceRequirements.
+func (c Config) validate(roles Set) error {
 	var errs []error
 	if strings.TrimSpace(c.DSN) == "" {
 		errs = append(errs, fmt.Errorf("a database connection string is required (%s)", EnvDSN))
@@ -1185,7 +1213,128 @@ func (c Config) validate() error {
 	errs = append(errs, c.Kafka.validate()...)
 	errs = append(errs, c.Checkpoint.validate()...)
 	errs = append(errs, c.MFA.validate(c.OIDC)...)
+	errs = append(errs, c.surfaceRequirements(roles)...)
 	return errors.Join(errs...)
+}
+
+// surfaceRequirements refuses a configuration whose features complete on a
+// surface this process does not listen on.
+//
+// It is a different axis from everything above it, and it lives here rather
+// than in the per-setting validators for exactly that reason. [MFAConfig] and
+// [KafkaConfig] and [CheckpointConfig] each check that their own settings are
+// internally coherent — the four step-up variables together, a broker with a
+// group and topics. This one asks a question none of them can answer alone:
+// the route that setting completes on is mounted on a surface, and a surface is
+// a listener some *other* setting binds. Scattering it into the four validators
+// would put four copies of the Addresses lookup in four places and leave the
+// fifth feature that needs a surface with no copy at all.
+//
+// The callback surface is unbound by default and deliberately so (R39): it is
+// the one surface a deployment may have to publish past its own perimeter, so
+// it is opted into rather than out of. Three things complete on it and on no
+// other surface, and every one of them is configured somewhere other than
+// STAMP_*_ADDR — which is how a deployment ends up asking for all three and
+// binding none:
+//
+//	delegated step-up MFA       the IdP returns the subject to
+//	                            GET /decisions/{id}/challenges/{ordinal}/mfa
+//	                            (internal/api/mfa.go, mounted under the decide
+//	                            role in wiring.go)
+//	external challenge targets  the target acknowledges the notification and
+//	                            answers later on POST /external/{id}/{ordinal}.
+//	                            The round trip is two legs on purpose
+//	                            (internal/challenge/external.go), so the verdict
+//	                            cannot come back on the outbound call instead
+//	HTTP velocity ingest        a producer's batches arrive on
+//	                            POST /ingest/v1/events under the consumer role
+//
+// Nothing else catches it. [api.New] mounts a route on a surface the process
+// does not serve rather than refusing to start, because a role a process does
+// not run is not an error — and the consequence is that "mounted" and
+// "reachable" come apart with nothing between them. The process is healthy,
+// /readyz is green, and the subject's browser arrives at a listener this
+// deployment never bound.
+//
+// This is the same refusal deploy/helm/stamp/templates/_helpers.tpl makes at
+// render time (stamp.callbackSurfaceValidated), on purpose and condition for
+// condition. Two guards that disagree are worse than either alone: a
+// configuration the chart rejects and the binary accepts teaches an operator
+// that the chart is being fussy, and one the chart accepts and the binary
+// refuses is a rollout that fails after the manifests were reviewed. The chart
+// is the guard for a Helm install and this one is the guard for everything else
+// — the demo runs on docker-compose, and `stamp --roles=all` on a laptop runs
+// on neither. The one place they differ is degenerate and known: the chart
+// triggers on a documents.* Secret being *named*, this triggers on the document
+// having parsed to at least one entry, so an empty list is refused by the chart
+// and admitted here. A document that declares no target strands nothing, so
+// this side is the one that is right about it, and the chart is stricter in the
+// direction that costs an operator a rendering error rather than a broken
+// deployment.
+//
+// CIBA is not one of the three, and that is a reading of the code rather than
+// an omission: it is a backchannel push, its Initiate returns no authorization
+// URL, and internal/challenge/mfa/ciba.go ignores the redirect URI the
+// delegated handler hands it. It still reaches this guard, through the step-up
+// settings — [MFAConfig.validate] requires the four step-up variables whenever
+// [MFAConfig.Configured] is true, and Configured is true of a CIBA-only
+// deployment — so a deployment that configures CIBA and nothing else cannot
+// reach a passing validate without an authorization endpoint, and with one it
+// is refused here. That turns out to be the right answer for a second reason:
+// nothing in the binary polls an auth_req_id, so a CIBA verdict is handed back
+// on the POST of the same route, on the same surface.
+//
+// The conditions are per role and not per setting alone, so that a process
+// running neither decide nor consumer — a `--roles=check` PEP tier, an
+// api-only authoring tier — is not refused for settings that reach no listener
+// in it. Those settings are not useless there: an api tier holds the external
+// targets because applying a revision re-issues challenges (see
+// issuesChallenges), and the target answers on the *decide* tier's callback
+// listener, which is a different process with its own address. Refusing the api
+// tier for a listener it was never going to bind would be refusing a legitimate
+// deployment shape.
+//
+// Rejected: booting and reporting this through /readyz instead. Unready is for
+// a dependency that is arriving — a schema mid-migration, a broker coming back
+// — and a listener nobody configured never arrives. Standing unready with
+// nothing to wait for is a way of holding an operator's configuration error
+// open indefinitely rather than answering it.
+func (c Config) surfaceRequirements(roles Set) []error {
+	if strings.TrimSpace(c.Addresses[api.SurfaceCallback]) != "" {
+		return nil
+	}
+	var stranded []string
+	if roles.Has(RoleDecide) {
+		if strings.TrimSpace(c.MFA.AuthorizationEndpoint) != "" {
+			stranded = append(stranded, fmt.Sprintf(
+				"delegated step-up MFA (%s) — the IdP returns the subject to "+
+					"GET /decisions/{id}/challenges/{ordinal}/mfa, so the browser lands on a listener "+
+					"nothing binds and the step-up can never be completed, and step-up is the path a "+
+					"decision takes by default (D26)", EnvMFAAuthzEndpoint))
+		}
+		if len(c.ExternalTargets) > 0 {
+			stranded = append(stranded, fmt.Sprintf(
+				"external challenge targets (%s) — a target acknowledges the notification and answers "+
+					"later on POST /external/{id}/{ordinal}, so no verdict can arrive and every external "+
+					"challenge times out into a deny", EnvExternalTargets))
+		}
+	}
+	if roles.Has(RoleConsumer) && len(c.IngestCredentials) > 0 {
+		stranded = append(stranded, fmt.Sprintf(
+			"HTTP velocity ingest (%s) — a producer's batches arrive on POST /ingest/v1/events, so those "+
+				"grants authenticate producers against a route this process does not serve and the "+
+				"velocity facts answer from buckets no event ever reached", EnvIngestCredentials))
+	}
+	if len(stranded) == 0 {
+		return nil
+	}
+	return []error{fmt.Errorf(
+		"%s binds no listener, and this process (--roles=%s) configures what completes on the callback "+
+			"surface and on no other: %s. nothing downstream catches this — a route is mounted on a "+
+			"surface the process does not serve rather than refusing to start, so this process would "+
+			"otherwise come up and report itself healthy. set %s and publish that address as %s, or "+
+			"clear the settings named above and run without what they ask for",
+		EnvCallbackAddr, roles.String(), strings.Join(stranded, "; "), EnvCallbackAddr, EnvCallbackBaseURL)}
 }
 
 // validate refuses a delegated MFA configuration that would produce a challenge
