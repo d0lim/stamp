@@ -24,6 +24,7 @@
  */
 import { useState } from 'react'
 import { ApiError, type ApiClient } from '../api/client'
+import { errorCodeOf, errorMessageOf } from '../api/error-codes'
 import { DocumentDiff } from '../diff/FieldDiff'
 import type { ApplicationMode, Delta, Preview, Proposal } from './api-types'
 import { hasNoDeclarations, type Draft } from './model'
@@ -263,10 +264,9 @@ function explain(error: unknown, onPendingRevision: () => void): string {
   if (!(error instanceof ApiError)) {
     return error instanceof Error ? error.message : String(error)
   }
-  const body = error.body as { error?: string; message?: string } | undefined
-  if (body?.error === 'revision_pending') {
+  if (errorCodeOf(error) === 'revision_pending') {
     onPendingRevision()
     return '이미 열려 있는 개정 제안이 있습니다. 위 배너에서 확인하십시오.'
   }
-  return body?.message !== undefined && body.message !== '' ? body.message : error.message
+  return errorMessageOf(error) ?? error.message
 }

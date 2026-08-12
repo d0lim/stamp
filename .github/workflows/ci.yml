@@ -99,6 +99,14 @@ jobs:
   # a BFF grows one convenient handler at a time. The Go step is the drift
   # guard: the exported contract has to be what internal/api actually declares,
   # or the Node check would be measuring against a stale copy.
+  #
+  # The same job carries the `error` code vocabulary, and the ordering is the
+  # whole point. The Go test regenerates contract/error-codes.json from
+  # internal/api's syntax tree; `git diff --exit-code` fails if a contributor
+  # added a code and did not commit the regenerated artifact; and only then does
+  # the Node check compare it against the codes the console branches on. Run the
+  # other way round, the Node check would agree with a stale file — which is
+  # precisely the state that let a dead `not_an_approver` branch survive #51.
   console-contract:
     name: console contract boundary
     runs-on: ubuntu-latest
@@ -115,12 +123,14 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - name: the exported contract matches the Go declaration
         run: go test ./internal/api/ -run TestConsoleContract -count=1
-      - name: the contract file is unmodified by the test
-        run: git diff --exit-code console/contract/public-endpoints.json
+      - name: the exported error codes match what the handlers can emit
+        run: go test ./internal/api/ -run TestErrorCode -count=1
+      - name: the contract files are unmodified by the tests
+        run: git diff --exit-code console/contract/
       - name: install console dependencies
         run: npm ci
         working-directory: console
-      - name: the console calls nothing outside the contract
+      - name: the console calls nothing outside the contract, and branches on no code the server cannot send
         run: npm run check:contract
         working-directory: console
 
