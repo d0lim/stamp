@@ -91,6 +91,20 @@ type Decision struct {
 	// the uniqueness that makes a retry safe is on (caller_id, this), and a
 	// column the code cannot see is a column the code cannot check.
 	IdempotencyKey string
+
+	// IdempotencyFingerprint is the digest of the request this decision froze,
+	// and it is what makes the key above safe to answer from.
+	//
+	// The key alone says which *attempt* a caller is asking after; it says
+	// nothing about what that attempt was for. A caller reusing one key for a
+	// different subject, resource or action was handed the first decision back —
+	// an allow for an authorization the engine never evaluated — and nothing on
+	// the answer let it notice. So the key is only honoured when this matches,
+	// and decision.requestFingerprint is the one thing that computes it.
+	//
+	// It is NULL exactly when IdempotencyKey is NULL, enforced by a CHECK in
+	// migration 000008 rather than by every writer remembering.
+	IdempotencyFingerprint string
 }
 
 // Expired reports whether the decision's own deadline has passed. It reads
@@ -135,6 +149,10 @@ type NewDecision struct {
 	// IdempotencyKey is the caller's name for the attempt that produced this
 	// decision, or empty for a decision nobody named.
 	IdempotencyKey string
+	// IdempotencyFingerprint is the digest of the request the attempt named.
+	// Required whenever IdempotencyKey is set and refused otherwise — a key
+	// without one is a key nothing can safely be answered from.
+	IdempotencyFingerprint string
 }
 
 // NewDecisionID returns a random UUIDv4 in string form.
@@ -163,6 +181,18 @@ func (w *AuditWriter) CreateDecision(ctx context.Context, in NewDecision) (Decis
 	}
 	if in.ExpiresAt.IsZero() {
 		return Decision{}, errors.New("store: a decision must have an expires_at")
+	}
+	// Refused here as well as by the CHECK, because the two refusals are read by
+	// different people. The constraint is what makes the invariant true of the
+	// table for every writer that will ever exist; this is what tells the one
+	// writing Go which field they left out, instead of a 23514 naming a
+	// constraint they have never heard of.
+	if (in.IdempotencyKey == "") != (in.IdempotencyFingerprint == "") {
+		return Decision{}, fmt.Errorf(
+			"store: a decision's idempotency key and fingerprint are set together or not at all "+
+				"(key %q, fingerprint %q): a key with no fingerprint names an attempt but not what it was for, "+
+				"which is what let one key answer for two different requests",
+			in.IdempotencyKey, in.IdempotencyFingerprint)
 	}
 	id := in.ID
 	if id == "" {
@@ -204,7 +234,9 @@ func (w *AuditWriter) CreateDecision(ctx context.Context, in NewDecision) (Decis
 		ExpiresAt:        expiresAt,
 		NextDeadline:     deadline,
 		NextDeadlineKind: kind,
-		IdempotencyKey:   in.IdempotencyKey,
+
+		IdempotencyKey:         in.IdempotencyKey,
+		IdempotencyFingerprint: in.IdempotencyFingerprint,
 	}
 
 	err = w.InTx(ctx, func(ctx context.Context, tx pgx.Tx, ap *Appender) error {
@@ -212,13 +244,13 @@ func (w *AuditWriter) CreateDecision(ctx context.Context, in NewDecision) (Decis
 			INSERT INTO decisions
 				(id, caller_id, policy_id, policy_version, subject_id, resource_id, action,
 				 request, fact_snapshot, obligations, state, expires_at, next_deadline, next_deadline_kind,
-				 idempotency_key)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+				 idempotency_key, idempotency_fingerprint)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 			RETURNING created_at, updated_at`,
 			out.ID, out.CallerID, out.PolicyID, out.PolicyVersion, out.SubjectID, out.ResourceID,
 			out.Action, []byte(out.Request), []byte(out.FactSnapshot), []byte(out.Obligations),
 			string(out.State), out.ExpiresAt, out.NextDeadline, nullableKind(out.NextDeadlineKind),
-			nullableText(out.IdempotencyKey),
+			nullableText(out.IdempotencyKey), nullableText(out.IdempotencyFingerprint),
 		).Scan(&out.CreatedAt, &out.UpdatedAt)
 		if insertErr != nil {
 			// Both conflicts are ErrConflict and they are told apart in the
@@ -331,7 +363,8 @@ func nullableText(s string) *string {
 
 const decisionColumns = `id, caller_id, policy_id, policy_version, subject_id, resource_id, action,
 	request::text, fact_snapshot::text, obligations::text, state, created_at, updated_at,
-	expires_at, next_deadline, next_deadline_kind, resolved_at, idempotency_key`
+	expires_at, next_deadline, next_deadline_kind, resolved_at, idempotency_key,
+	idempotency_fingerprint`
 
 // GetDecision reads a decision by identifier. It reports the row as stored and
 // makes no judgement about deadlines.
@@ -622,10 +655,11 @@ func scanDecision(row pgx.Row) (Decision, error) {
 		state       string
 		kind        *string
 		key         *string
+		fingerprint *string
 	)
 	err := row.Scan(&d.ID, &d.CallerID, &d.PolicyID, &d.PolicyVersion, &d.SubjectID, &d.ResourceID,
 		&d.Action, &request, &facts, &obligations, &state, &d.CreatedAt, &d.UpdatedAt,
-		&d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt, &key)
+		&d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt, &key, &fingerprint)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Decision{}, ErrNotFound
 	}
@@ -641,6 +675,9 @@ func scanDecision(row pgx.Row) (Decision, error) {
 	}
 	if key != nil {
 		d.IdempotencyKey = *key
+	}
+	if fingerprint != nil {
+		d.IdempotencyFingerprint = *fingerprint
 	}
 	d.CreatedAt = d.CreatedAt.UTC()
 	d.UpdatedAt = d.UpdatedAt.UTC()

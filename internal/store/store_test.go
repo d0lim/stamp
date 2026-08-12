@@ -234,6 +234,14 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if !columnExists(t, s, "decisions", "idempotency_key") {
 		t.Error("decisions.idempotency_key is missing after migrate")
 	}
+	// The fingerprint rides in the same migration as the key, because a key
+	// without one is the substitution the two columns together prevent: the
+	// decide path's lookup is fail-closed on a row that holds a key and no
+	// digest, so a schema with only the first column is a schema where every
+	// keyed retry is refused.
+	if !columnExists(t, s, "decisions", "idempotency_fingerprint") {
+		t.Error("decisions.idempotency_fingerprint is missing after migrate")
+	}
 	if !indexExists(t, s, "decisions_unique_idempotency_key") {
 		t.Error("index \"decisions_unique_idempotency_key\" is missing after migrate")
 	}
@@ -292,6 +300,9 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	if !columnExists(t, s, "decisions", "idempotency_key") {
 		t.Error("decisions.idempotency_key was dropped by a rollback that only owns the index")
 	}
+	if !columnExists(t, s, "decisions", "idempotency_fingerprint") {
+		t.Error("decisions.idempotency_fingerprint was dropped by a rollback that only owns the index")
+	}
 
 	if err := s.MigrateDown(ctx, 1); err != nil {
 		t.Fatalf("migrate down 1: %v", err)
@@ -311,6 +322,9 @@ func TestMigrateUpFromEmptyAndRollbackOneStep(t *testing.T) {
 	// would be a rollback nobody could run on a live deployment.
 	if columnExists(t, s, "decisions", "idempotency_key") {
 		t.Error("decisions.idempotency_key survived the rollback of its own migration")
+	}
+	if columnExists(t, s, "decisions", "idempotency_fingerprint") {
+		t.Error("decisions.idempotency_fingerprint survived the rollback of its own migration")
 	}
 	if !tableExists(t, s, "decisions") {
 		t.Error("decisions was dropped by a rollback that only added a column to it")

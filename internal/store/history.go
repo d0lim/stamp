@@ -275,6 +275,7 @@ func OpenQuorumChallenges(ctx context.Context, q Querier, member string, now tim
 			state       string
 			kind        *string
 			key         *string
+			fingerprint *string
 			cpKind      string
 			cpState     string
 			detail      string
@@ -282,7 +283,7 @@ func OpenQuorumChallenges(ctx context.Context, q Querier, member string, now tim
 		d := &item.Decision
 		if err := rows.Scan(&d.ID, &d.CallerID, &d.PolicyID, &d.PolicyVersion, &d.SubjectID,
 			&d.ResourceID, &d.Action, &request, &facts, &obligations, &state, &d.CreatedAt,
-			&d.UpdatedAt, &d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt, &key,
+			&d.UpdatedAt, &d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt, &key, &fingerprint,
 			&item.Challenge.DecisionID, &item.Challenge.Ordinal, &cpKind, &cpState,
 			&item.Challenge.Deadline, &item.Challenge.SatisfiedAt, &detail,
 			&item.Approvals, &item.Submitted); err != nil {
@@ -297,6 +298,9 @@ func OpenQuorumChallenges(ctx context.Context, q Querier, member string, now tim
 		}
 		if key != nil {
 			d.IdempotencyKey = *key
+		}
+		if fingerprint != nil {
+			d.IdempotencyFingerprint = *fingerprint
 		}
 		d.CreatedAt = d.CreatedAt.UTC()
 		d.UpdatedAt = d.UpdatedAt.UTC()

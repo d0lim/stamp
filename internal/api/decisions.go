@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/d0lim/stamp/internal/challenge"
@@ -106,6 +107,21 @@ const IdempotencyKeyHeader = "Idempotency-Key"
 // migration 000008 — a bound that lives only at the surface is a bound that the
 // next write path does not have.
 const MaxIdempotencyKeyBytes = 255
+
+// CodeIdempotencyKeyReused is the `error` code for a key the caller has already
+// used for a different request.
+//
+// It is its own word rather than a reuse of `invalid_request`, because the two
+// call for opposite responses from a client: `invalid_request` means fix the
+// request and send it again, and this one means the request is fine and the name
+// is spent — send it under a new key. A client that read them as one word would
+// retry the same key forever.
+//
+// It is deliberately not `expired` or `not_collecting`, the console's two 409s.
+// Those are about a decision's state and are only shown to a caller with
+// standing on it; this one is about the caller's own key namespace and says
+// nothing about any decision.
+const CodeIdempotencyKeyReused = "idempotency_key_reused"
 
 // DecisionCreator creates decisions.
 //
@@ -359,6 +375,16 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		// to — and the service has already recorded it in the audit chain. The
 		// response says exactly that: a denied state, its ground, and no
 		// identifier to follow, because there is nothing to follow.
+		//
+		// A deny the lifecycle shed carries the wait it asked for, rendered by
+		// the same function the surface's own budget uses so that one client
+		// reads one number in one unit. Every other deny leaves the header off:
+		// a policy deny and the outstanding cap do not clear on a timer, and
+		// inviting a retry against either is inviting a caller to be refused
+		// identically at a cadence this deployment chose.
+		if result.RetryAfter > 0 {
+			w.Header().Set(RetryAfterHeader, strconv.Itoa(retryAfterSecondsFor(result.RetryAfter)))
+		}
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
@@ -457,15 +483,42 @@ func decodeDecisionRequest(w http.ResponseWriter, r *http.Request, maxBytes int6
 // identifier and learn whether it names anything. This description used to say
 // the console's table differed here — that it answered 403 to a named person who
 // has to tell "not yours" from "gone" — and that stopped being true when #38
-// collapsed the two there as well. What the console keeps that this surface has
-// no use for is the 409s, and they are kept for callers who already have
-// standing rather than for everyone.
+// collapsed the two there as well.
+//
+// Where the two tables now differ is their 409s, and they differ in both
+// directions. The console's — `expired`, `not_collecting`, `material_changed` —
+// are the signals an approver waiting on a decision needs, and this surface has
+// no use for any of them: a PEP's decide either produced a decision or did not.
+// The one below goes the other way and the console has no use for it, because it
+// is about the caller's own idempotency keys rather than about anybody's
+// standing on a decision, and the console does not send keys.
 func decisionError(err error) (status int, code, message string) {
 	switch {
 	case errors.Is(err, decision.ErrUnauthenticated):
 		return http.StatusUnauthorized, "unauthenticated", "this endpoint requires a workload credential"
 	case errors.Is(err, decision.ErrNotAuthorized), errors.Is(err, store.ErrNotFound):
 		return noSuchDecision()
+	case errors.Is(err, decision.ErrIdempotencyKeyReused):
+		// A key the caller has already spent on a different request. It is a
+		// 409 and not a 400 because nothing about *this* request is malformed —
+		// the request is fine and the name it arrived under is taken — and the
+		// distinction is what tells a client to mint a new key rather than to
+		// fix its body.
+		//
+		// It opens no oracle, and that is worth stating on a surface where
+		// every other refusal has been collapsed to one answer (#38). The
+		// lookup behind it is scoped to the caller's own keys, so a caller can
+		// only ever learn that a key **it** has used is taken. It learns
+		// nothing about another workload's keys, nothing about any decision
+		// identifier, and nothing it could not learn by retrying the request
+		// the key does name.
+		//
+		// The message says what to do and names nothing. The decision the key
+		// already holds is the caller's own and it may read it — but by asking
+		// with the request that key names, not by being handed an identifier in
+		// an error string that every log between here and the caller will keep.
+		return http.StatusConflict, CodeIdempotencyKeyReused,
+			"this Idempotency-Key was already used for a different request; use a new key"
 	case errors.Is(err, challenge.ErrNoHandler), errors.Is(err, challenge.ErrUnsupportedSpec),
 		errors.Is(err, challenge.ErrGroupSourceUnsupported):
 		// The policy demands a challenge kind this build cannot issue. It is not

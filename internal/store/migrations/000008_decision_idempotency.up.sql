@@ -21,12 +21,40 @@
 -- configured anywhere, so a scan held under that lock is an outage measured in
 -- however long the scan takes.
 --
--- Both statements below take ACCESS EXCLUSIVE and neither scans the heap:
+-- Every statement below takes ACCESS EXCLUSIVE and none of them scans the heap:
 -- ADD COLUMN of a nullable column with no default is a catalog write since
 -- Postgres 11, and a CHECK added NOT VALID is a catalog write by definition. The
 -- unique index — the one thing here that must read every row — moved out to
--- 000009, where it can be built CONCURRENTLY.
+-- 000009, where it can be built CONCURRENTLY. Anything added to this file later
+-- has to hold that line: it is the property that lets this migration run at pod
+-- boot against a live cluster at all.
 ALTER TABLE decisions ADD COLUMN idempotency_key text;
+
+-- The digest of the request the key names, so that the key can only answer for
+-- the request it was given for.
+--
+-- **A key on its own was a substitution oracle.** The decide path looked the key
+-- up by `(caller_id, idempotency_key)` and compared nothing else, so a caller
+-- that reused `job-91` for a different subject, resource or action was handed
+-- the first decision back — `201`, `state: allowed` — and the PEP enforced an
+-- allow for an authorization this engine had never evaluated. The decision
+-- object a caller receives carries no subject, no resource and no action, so
+-- there was nothing in the answer for the PEP to check either. A key generated
+-- per attempt makes that a bug inside one client; a key derived from something
+-- the business already numbers — an order id, a job id — makes it reachable by
+-- anyone who can get two different requests to name themselves the same way.
+--
+-- It lives in 000008 rather than in a migration of its own because it is free
+-- here: this file is already taking ACCESS EXCLUSIVE on `decisions` for the
+-- column above, ADD COLUMN of a nullable column with no default is a catalog
+-- write, and neither this migration nor 000009 has been released — so nothing
+-- exists that a third migration would have been protecting. It does **not** go
+-- in 000009, which must stay a single CREATE INDEX CONCURRENTLY statement for
+-- the reason that file spells out at length.
+--
+-- No index on it. It is never a search key: every read of it is a comparison
+-- against a row the `(caller_id, idempotency_key)` lookup already found.
+ALTER TABLE decisions ADD COLUMN idempotency_fingerprint text;
 
 -- A bound on what a caller can make the engine store and index. The surface
 -- refuses an over-long key before it reaches here; this is the same rule stated
@@ -52,3 +80,29 @@ ALTER TABLE decisions ADD COLUMN idempotency_key text;
 -- in this repository does, so it is not run here.
 ALTER TABLE decisions ADD CONSTRAINT decisions_idempotency_key_length
     CHECK (idempotency_key IS NULL OR octet_length(idempotency_key) BETWEEN 1 AND 255) NOT VALID;
+
+-- The two columns are NULL together or set together, and the digest is the
+-- width a sha-256 in hex actually is.
+--
+-- The first half is the one that matters, and it is a security property rather
+-- than tidiness. internal/decision's lookup is fail-closed on a row that holds a
+-- key and no fingerprint — it cannot prove such a row names the request in
+-- hand, and "cannot prove" has to answer the same way as "proved different" or
+-- the substitution above survives in exactly the rows nobody checked. That
+-- fail-closed branch would refuse a legitimate retry if a row like it could
+-- exist, so this constraint is what makes it unreachable: no writer can produce
+-- one, including a writer that is not this repository's Go code.
+--
+-- The width is the second half and it is a bound, not a format check. It is not
+-- a regex on the hex alphabet, because the column is never parsed — it is only
+-- ever compared for equality against a digest this deployment computed — and a
+-- schema that pinned the encoding would have to be migrated the day the digest
+-- changes, for a check that catches nothing a length does not.
+--
+-- NOT VALID for the reason above it: both columns were created by this same
+-- migration, so every pre-existing row holds NULL in both and satisfies this
+-- predicate by construction. It is enforced in full against every INSERT and
+-- UPDATE from the moment it exists.
+ALTER TABLE decisions ADD CONSTRAINT decisions_idempotency_fingerprint_pairing
+    CHECK ((idempotency_key IS NULL) = (idempotency_fingerprint IS NULL)
+           AND (idempotency_fingerprint IS NULL OR octet_length(idempotency_fingerprint) = 64)) NOT VALID;

@@ -710,15 +710,29 @@ type refusedDetail struct {
 
 func (*refusingStepUpHandler) Kind() policy.ChallengeType { return policy.ChallengeMFA }
 
+// refusedIssueRetryAfter is the wait a shed issuance reports. It is a round
+// number rather than a real budget's interval so that a test reading the header
+// is reading this handler's answer and not arithmetic.
+const refusedIssueRetryAfter = 90 * time.Second
+
 func (r *refusingStepUpHandler) Issue(_ context.Context, _ challenge.IssueRequest) (challenge.IssueResult, error) {
 	failure := "transport"
 	if r.shed {
 		failure = "issue_rate_limited"
 	}
-	return challenge.IssueResult{
+	out := challenge.IssueResult{
 		State:  challenge.StateFailed,
 		Detail: refusedDetail{Failure: failure, Shed: r.shed},
-	}, nil
+	}
+	// The contract's bit at issue as well as at Status, which is what lets the
+	// lifecycle refuse before it writes a row rather than resolving a decision
+	// onto the subject's history afterwards. A double that set it only on Status
+	// would be a double that could not exercise the path.
+	if r.shed {
+		out.Shed = true
+		out.RetryAfter = refusedIssueRetryAfter
+	}
+	return out, nil
 }
 
 func (*refusingStepUpHandler) Submit(_ context.Context, _ challenge.SubmitRequest) (challenge.SubmitResult, error) {
