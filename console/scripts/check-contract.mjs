@@ -447,7 +447,7 @@ export function loadServedErrorCodes(root = CONSOLE_ROOT) {
   return served
 }
 
-/** The exemption list, flattened to code → reason. */
+/** The exemption list, flattened to code → reason and endpoint → reason. */
 export function loadErrorCodeExemptions(root = CONSOLE_ROOT) {
   const raw = readFileSync(join(root, 'contract', 'error-code-exemptions.json'), 'utf8')
   return parseErrorCodeExemptions(JSON.parse(raw))
@@ -493,11 +493,33 @@ export function parseErrorCodeExemptions(document) {
       exempt.set(code, reason)
     }
   }
-  return { exempt, problems }
+
+  const unimplemented = new Map()
+  for (const entry of document.endpoints ?? []) {
+    const reason = typeof entry.reason === 'string' ? entry.reason.trim() : ''
+    if (typeof entry.name !== 'string' || entry.name === '') {
+      problems.push(violation('이름 없는 미구현 엔드포인트 항목이 있습니다.'))
+      continue
+    }
+    if (reason === '') {
+      problems.push(violation(`"${entry.name}"이(가) 이유 없이 미구현으로 적혀 있습니다.`))
+    }
+    if (unimplemented.has(entry.name)) {
+      problems.push(violation(`"${entry.name}"이(가) 두 번 적혀 있습니다.`))
+      continue
+    }
+    unimplemented.set(entry.name, reason)
+  }
+
+  return { exempt, unimplemented, problems }
 }
 
-function violation(message, at = '-') {
-  return { rule: 'vocabulary', file: 'contract/error-code-exemptions.json', at, message }
+function violation(message, at = '-', rule = 'vocabulary') {
+  return { rule, file: 'contract/error-code-exemptions.json', at, message }
+}
+
+function coverage(message, at = '-') {
+  return violation(message, at, 'coverage')
 }
 
 /**
@@ -544,6 +566,90 @@ export function loadConsumedErrorCodes(root = CONSOLE_ROOT, modulePath = ERROR_C
     codes.push(element.text)
   }
   return new Set(codes)
+}
+
+/**
+ * The contract endpoints some screen actually calls.
+ *
+ * The `contract` rule already refuses a request target that is not a string
+ * literal, so this walk is exhaustive by construction: every call names its
+ * endpoint in the source or the check has already failed.
+ */
+export function calledEndpoints({ root = CONSOLE_ROOT, scanDir = 'src' } = {}) {
+  const called = new Set()
+  for (const path of sourceFiles(join(root, scanDir))) {
+    const text = readFileSync(path, 'utf8')
+    const file = ts.createSourceFile(path, text, ts.ScriptTarget.ES2022, true, scriptKindOf(path))
+    const visit = (node) => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === REQUEST_CALL.method &&
+        calleeMentions(node.expression, REQUEST_CALL.object)
+      ) {
+        const argument = node.arguments[REQUEST_CALL.endpointArgument]
+        if (argument && (ts.isStringLiteral(argument) || ts.isNoSubstitutionTemplateLiteral(argument))) {
+          called.add(argument.text)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    ts.forEachChild(file, visit)
+  }
+  return called
+}
+
+/**
+ * Compares the declared API surface against the one the console actually calls.
+ *
+ * The list of endpoints with no console caller is written down, in the same
+ * file as the code exemptions and for the same reason: an unimplemented surface
+ * that nobody wrote down is one nobody knows about, and `delay-cancel` was
+ * exactly that — the server grew a per-authority budget, a 429 and a
+ * `Retry-After` for it, and there is no screen to render any of them.
+ *
+ * Checked in both directions, because a one-directional check is the
+ * hand-written list this round exists to avoid. A declared endpoint no screen
+ * calls and no entry names is a gap nobody decided on; an entry naming an
+ * endpoint some screen does call is a claim that stopped being true.
+ */
+export function checkEndpointCoverage({
+  root = CONSOLE_ROOT,
+  scanDir = 'src',
+  contract = undefined,
+  unimplemented = undefined,
+  called = undefined,
+} = {}) {
+  const declared = contract ?? loadContract(root)
+  const listed = unimplemented ?? loadErrorCodeExemptions(root).unimplemented
+  const reached = called ?? calledEndpoints({ root, scanDir })
+  const violations = []
+
+  for (const name of declared.names) {
+    if (reached.has(name) || listed.has(name)) continue
+    violations.push(
+      coverage(
+        `"${name}"은(는) 공개 계약에 있는데 콘솔의 어떤 화면도 부르지 않고, ` +
+          '미구현 목록에도 없습니다. 화면을 만들거나, 이유와 함께 적으십시오 — ' +
+          '적히지 않은 미구현 표면은 아무도 모르는 미구현 표면입니다.',
+        name,
+      ),
+    )
+  }
+  for (const [name] of listed) {
+    if (!declared.names.has(name)) {
+      violations.push(
+        coverage(`"${name}"은(는) 공개 계약의 API 엔드포인트가 아닌데 미구현 목록에 있습니다.`, name),
+      )
+      continue
+    }
+    if (reached.has(name)) {
+      violations.push(
+        coverage(`"${name}"은(는) 콘솔이 실제로 부르는데 미구현 목록에 남아 있습니다.`, name),
+      )
+    }
+  }
+  return violations
 }
 
 /**
@@ -632,17 +738,22 @@ const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLTo
 if (isMain) {
   // Both halves run before either reports, so one pull request is told
   // everything that is wrong rather than one thing at a time.
-  const violations = [...checkConsole(), ...checkErrorVocabulary()]
+  const violations = [...checkConsole(), ...checkErrorVocabulary(), ...checkEndpointCoverage()]
   if (violations.length === 0) {
     const contract = loadContract()
     const served = loadServedErrorCodes()
     const consumed = loadConsumedErrorCodes()
+    const { unimplemented } = loadErrorCodeExemptions()
     console.log(
       `콘솔 계약 경계: 위반 없음 (공개 계약 엔드포인트 ${contract.names.size}개, 문서 버전 ${contract.version}).`,
     )
     console.log(
       `error 코드 어휘: 양방향 일치 (서버 ${served.size}개, 콘솔이 분기하는 것 ${consumed.size}개, ` +
         `면제 ${served.size - consumed.size}개).`,
+    )
+    console.log(
+      `표면 구현: 계약 엔드포인트 ${contract.names.size}개 중 ${contract.names.size - unimplemented.size}개를 ` +
+        `콘솔이 부르고, ${unimplemented.size}개가 이유와 함께 미구현으로 적혀 있다.`,
     )
     process.exit(0)
   }

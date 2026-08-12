@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "The `error` codes the server can emit that the console does not branch on, and why. contract/error-codes.json is the server's half, rendered from internal/api's syntax tree; src/api/error-codes.ts is the console's. scripts/check-contract.mjs requires every served code to be in one set or the other, so this file is the only place a code may go unhandled — and it costs a name and a reason to put one here. A code that stops being served, or that the console starts handling, makes its exemption stale and fails the check: this list cannot rot quietly.",
+  "note": "What the console does not implement, and why. `codes` holds the `error` codes the server can emit that no screen branches on; `endpoints` holds the public-contract endpoints no screen calls. contract/error-codes.json is the server's half of the first, rendered from internal/api's syntax tree; src/api/error-codes.ts is the console's. scripts/check-contract.mjs requires every served code and every declared endpoint to be handled or listed here, so this file is the only place either may go unimplemented — and it costs a name and a reason to put one here. An entry that stops being true — a code the server no longer emits, an endpoint a screen started calling — fails the check: this list cannot rot quietly.",
   "codes": [
     {
       "reason": "Emitted only on listeners the console never calls. The console speaks to the console listener alone (D19, and the mount table proves it) — the PEP surface belongs to workloads holding client credentials, and the callback surface to the IdP's redirect and to external systems pushing events. A code that cannot arrive is not a code to word, and wording one would be writing copy for a screen that can never render it.",
@@ -57,6 +57,28 @@
     {
       "reason": "Recognised by its payload rather than by its code. The dry run answers a policy that will not decode with a `diagnostics` array of pointer/code/message triples, and the builder's job is to hang each one on the field that caused it — so what it keys off is the array, in src/builder/diagnostics.ts, and the code beside it adds nothing a screen would do differently. Worth writing down rather than leaving implicit: it is the one refusal on this API the console identifies by shape, and that is why the code looks unhandled when it is not.",
       "codes": ["invalid_policy"]
+    }
+  ],
+  "endpoints": [
+    {
+      "name": "delay-cancel",
+      "reason": "R2's delegated cancellation of a delay. The server side is finished — the endpoint, the per-authority budget, the 429 with Retry-After and the cancellation_rate_limited audit reason (decision-api 1.8.0) — and no console screen calls it, so none of that renders anywhere. Building the screen is a new feature; deleting the endpoint is a wire change on a surface other clients can already reach. Documented under `## 콘솔이 부르지 않는 표면` in docs/contracts/decision-api.md, which internal/release compares against this list."
+    },
+    {
+      "name": "governance-lock",
+      "reason": "Turning quorum governance on is a one-time bootstrap act, and its refusal code says why the console stays out of it: `403 bootstrap_token_required`. That token is held by whoever runs the deployment, not by a console session, and carrying it into a browser to save one click would put the credential that installs governance into the place with the largest attack surface."
+    },
+    {
+      "name": "policy-apply",
+      "reason": "The file-authoring path (U19): a policy set applied from files, which is the git-and-CI workflow's door. The console's builder changes policy through revision proposals instead — `revision-preview`, `revision-submit`, `revision-withdraw` — because a proposal is what a quorum can approve and a file apply is not."
+    },
+    {
+      "name": "policy-export",
+      "reason": "The other half of the file-authoring path: the policy set rendered back out as files. Its caller is the CLI or CI job that keeps a repository in step with a deployment, not a screen."
+    },
+    {
+      "name": "schema-read",
+      "reason": "The schema in force. The builder starts every draft from an empty schema and authors declarations into it, so it never reads the one already installed — which also means it cannot show an author what is in force before they replace it. That is a gap rather than a decision, and naming it here is how it stops being invisible."
     }
   ]
 }

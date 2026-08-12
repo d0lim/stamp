@@ -8,7 +8,9 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+  calledEndpoints,
   checkConsole,
+  checkEndpointCoverage,
   checkErrorVocabulary,
   loadConsumedErrorCodes,
   loadContract,
@@ -219,5 +221,83 @@ describe('error 코드 어휘 대조', () => {
     expect(problems).toEqual([])
     expect(exempt.size).toBeGreaterThan(0)
     for (const [, reason] of exempt) expect(reason.length).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * The declared surface against the one the console actually calls.
+ *
+ * `delay-cancel` is why this exists: it is in the public contract, the server
+ * grew a budget, a 429 and a Retry-After for it, and no screen calls it — a
+ * fact nobody had written down, so nobody knew it. The comparison is
+ * bidirectional because a one-way check would let the written list be wrong in
+ * the same direction as the thing it describes.
+ */
+describe('콘솔이 부르지 않는 표면', () => {
+  const declared = { names: new Set(['policy-list', 'delay-cancel', 'schema-read']) }
+  const compare = (called, entries) =>
+    checkEndpointCoverage({
+      contract: declared,
+      called: new Set(called),
+      unimplemented: new Map(entries),
+    })
+
+  it('현행 트리에서 계약과 화면이 일치한다', () => {
+    const violations = checkEndpointCoverage()
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([])
+  })
+
+  it('부르는 것과 적힌 것이 계약을 덮으면 통과한다', () => {
+    expect(
+      compare(['policy-list'], [
+        ['delay-cancel', '화면이 없다.'],
+        ['schema-read', '빌더는 빈 스키마에서 시작한다.'],
+      ]),
+    ).toEqual([])
+  })
+
+  it('아무도 부르지 않고 적히지도 않은 엔드포인트는 실패한다', () => {
+    const violations = compare(['policy-list'], [['delay-cancel', '화면이 없다.']])
+    expect(violations).toHaveLength(1)
+    expect(violations[0].rule).toBe('coverage')
+    expect(violations[0].message).toContain('schema-read')
+  })
+
+  it('콘솔이 실제로 부르는데 미구현으로 적힌 엔드포인트는 실패한다', () => {
+    const violations = compare(['policy-list', 'schema-read'], [
+      ['delay-cancel', '화면이 없다.'],
+      ['schema-read', '빌더는 빈 스키마에서 시작한다.'],
+    ])
+    expect(violations).toHaveLength(1)
+    expect(violations[0].message).toContain('실제로 부르는데')
+  })
+
+  it('계약에 없는 이름이 미구현 목록에 있으면 실패한다', () => {
+    const violations = compare(['policy-list'], [
+      ['delay-cancel', '화면이 없다.'],
+      ['schema-read', '빌더는 빈 스키마에서 시작한다.'],
+      ['console-config', '이것은 서빙 문서이지 API 엔드포인트가 아니다.'],
+    ])
+    expect(violations).toHaveLength(1)
+    expect(violations[0].message).toContain('console-config')
+  })
+
+  it('이유 없는 미구현 항목은 실패한다', () => {
+    const { problems } = parseErrorCodeExemptions({
+      version: 1,
+      codes: [],
+      endpoints: [{ name: 'delay-cancel', reason: '  ' }],
+    })
+    expect(problems.some((p) => p.message.includes('이유 없이'))).toBe(true)
+  })
+
+  it('실제로 부르는 엔드포인트는 소스에서 정적으로 읽힌다', () => {
+    const called = calledEndpoints()
+    expect(called.has('policy-list')).toBe(true)
+    expect(called.has('approval-submit')).toBe(true)
+    // The endpoint whose absence this whole block is about. It appears in
+    // src/api/client.test.ts, which is not a call site — and the walk skips
+    // tests, which is why it is not counted as one.
+    expect(called.has('delay-cancel')).toBe(false)
   })
 })

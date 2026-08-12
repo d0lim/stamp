@@ -130,7 +130,7 @@ jobs:
       - name: install console dependencies
         run: npm ci
         working-directory: console
-      - name: the console calls nothing outside the contract, and branches on no code the server cannot send
+      - name: the console calls nothing outside the contract, branches on no code the server cannot send, and leaves no surface unimplemented without saying so
         run: npm run check:contract
         working-directory: console
 
