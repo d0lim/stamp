@@ -59,6 +59,8 @@ The three surfaces are three listeners, not three path prefixes on one. A route 
 | console | `:8081` | operators and approvers holding end-user tokens |
 | callback | unbound | external systems completing a challenge |
 
+The callback surface is unbound by default because it is the one listener a deployment may have to publish past its own perimeter, so it is opted into rather than out of. Three things complete on it and on no other: the delegated step-up return (`GET /decisions/{id}/challenges/{ordinal}/mfa`), an external target's verdict (`POST /external/{id}/{ordinal}`) and HTTP velocity ingest (`POST /ingest/v1/events`). **Configuring any of them on a process that runs the role which mounts them and leaving `STAMP_CALLBACK_ADDR` empty fails the boot**, naming the settings that asked for the listener. It has to be the boot, because nothing later catches it: a route is mounted on a surface the process does not serve rather than refusing to start, so such a process would come up, report itself healthy, and send the subject's browser to a listener nobody bound. A process whose roles mount none of those routes — `--roles=check`, `--roles=api` — is not refused: in a split deployment the completion arrives on the decide tier's listener, which is a different process with its own address. The Helm chart refuses the same release at render time, on the same conditions.
+
 Everything else comes from the environment, and nothing that would be a credential or a trust decision has a default — a missing DSN, issuer or audience fails startup with a message naming the variable.
 
 ```sh
@@ -75,7 +77,7 @@ stamp --roles=all
 | `STAMP_DSN` | PostgreSQL connection string. Required. |
 | `STAMP_OIDC_ISSUER`, `STAMP_OIDC_JWKS_URL`, `STAMP_OIDC_AUDIENCE` | The token verification trust boundary. Required. |
 | `STAMP_OIDC_WORKLOAD_CLIENTS` | Client identifiers whose tokens are workload credentials rather than end-user ones. |
-| `STAMP_PEP_ADDR`, `STAMP_CONSOLE_ADDR`, `STAMP_CALLBACK_ADDR` | Listen addresses. Set one to the empty string to leave that surface unbound. |
+| `STAMP_PEP_ADDR`, `STAMP_CONSOLE_ADDR`, `STAMP_CALLBACK_ADDR` | Listen addresses. Set one to the empty string to leave that surface unbound. `STAMP_CALLBACK_ADDR` is unbound unless set, and the boot fails if this process runs the decide role with `STAMP_MFA_AUTHORIZATION_ENDPOINT` or `STAMP_EXTERNAL_TARGETS` set, or the consumer role with `STAMP_INGEST_CREDENTIALS` set — each of those completes on the callback surface and on no other. |
 | `STAMP_AUDIT_WRITER_ID` | The audit chain segment this process owns. Exactly one live process may hold it; a collision fails the boot. Defaults to the hostname. |
 | `STAMP_FACT_SOURCES` | Fact source transports, as a JSON document or a path to one. |
 | `STAMP_EGRESS_ALLOW` | Origins a fact call may reach, comma-separated. Nothing else is dialled. |
