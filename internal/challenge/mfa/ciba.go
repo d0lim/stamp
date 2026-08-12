@@ -17,6 +17,24 @@ package mfa
 // basic plaintext. [ValidateBindingMessage] is checked before the request goes
 // out, so a deployment that customizes the reference code learns at issue
 // rather than when somebody is waiting for a prompt.
+//
+// # Where the verdict comes back
+//
+// Not here. This client only *starts* an authentication: it makes the
+// backchannel request and returns the `auth_req_id` the OP minted. The verdict
+// arrives on the callback surface, as `POST
+// /decisions/{id}/challenges/{ordinal}/mfa` carrying the ID token, and is judged
+// by [Delegated.Submit] — the same conjunction of checks a step-up redirect ends
+// in, because there is one judgement of what satisfies a challenge and the
+// transport does not get a second one.
+//
+// There used to be a `Poll` here that exchanged the `auth_req_id` at the token
+// endpoint. Nothing ever called it. It was removed rather than wired, because
+// wiring it is a feature and not a fix: a polling loop brings its own interval,
+// its own backoff and its own `auth_req_id` lifetime, and D26 left this path
+// verified against a mock OP precisely because no self-hostable IdP ships the
+// authentication device server a real round trip needs. Aligning what the code
+// promises with what the binary does was cheaper done by promising less.
 
 import (
 	"context"
@@ -30,19 +48,25 @@ import (
 	"time"
 )
 
-// CIBA polling outcomes, from RFC-shaped token endpoint errors.
-var (
-	// ErrAuthorizationPending reports a CIBA request the human has not
-	// answered yet. It is the normal answer to a poll.
-	ErrAuthorizationPending = errors.New("mfa: the subject has not answered the authentication request yet")
-	// ErrSlowDown reports a poll interval the OP considers too fast.
-	ErrSlowDown = errors.New("mfa: the op asked the client to poll more slowly")
-	// ErrAuthorizationDeclined reports a human who said no, or an OP that
-	// expired the request.
-	ErrAuthorizationDeclined = errors.New("mfa: the authentication request was declined or expired")
-)
+// ErrAuthorizationDeclined reports an OP that refused the backchannel request
+// outright — `access_denied` or `expired_token` in its error document.
+//
+// It is the one outcome sentinel that survived the removal of the polling
+// client. `authorization_pending` and `slow_down` had sentinels too, and both
+// are answers only a token endpoint gives; with nothing polling one, they were
+// names for states this binary cannot observe. Two exported errors that no code
+// path can produce read as evidence of a polling loop, which is the confusion
+// this package is trying not to leave behind.
+var ErrAuthorizationDeclined = errors.New("mfa: the authentication request was declined or expired")
 
-// DefaultCIBAPollInterval is the interval an OP that names none is polled at.
+// DefaultCIBAPollInterval is the interval [CIBAAuthentication] reports when the
+// OP names none.
+//
+// It describes the OP's answer and nothing this binary does — see the package
+// doc: the verdict arrives on the callback POST, and no loop here spends this
+// interval. It is kept because [CIBA.Authenticate] reports what the OP said
+// faithfully, and an OP that named no interval said "five seconds" by RFC
+// default rather than "zero".
 const DefaultCIBAPollInterval = 5 * time.Second
 
 // DefaultCIBATimeout bounds one backchannel or token call.
@@ -53,8 +77,11 @@ type CIBAConfig struct {
 	// BackchannelEndpoint is the OP's backchannel authentication endpoint.
 	// Required.
 	BackchannelEndpoint string
-	// TokenEndpoint is where a completed request is exchanged for tokens.
-	// Required to poll; a client without one can still initiate.
+	// TokenEndpoint is the OP's token endpoint. Optional, and this client never
+	// calls it: the verdict comes back on the callback POST (see the package
+	// doc). It is still accepted and still transport-checked, because a
+	// deployment configures its OP's endpoints as a set and a plaintext one is
+	// worth refusing at construction whether or not this client dials it.
 	TokenEndpoint string
 	// ClientID and ClientSecret authenticate the client. CIBA has no public
 	// clients, so both are required.
@@ -75,7 +102,6 @@ type CIBAConfig struct {
 // CIBA is an OIDC CIBA client.
 type CIBA struct {
 	backchannel string
-	token       string
 	clientID    string
 	secret      string
 	scope       string
@@ -103,7 +129,6 @@ func NewCIBA(cfg CIBAConfig) (*CIBA, error) {
 	}
 	c := &CIBA{
 		backchannel: cfg.BackchannelEndpoint,
-		token:       cfg.TokenEndpoint,
 		clientID:    cfg.ClientID,
 		secret:      cfg.ClientSecret,
 		scope:       cfg.Scope,
@@ -180,37 +205,14 @@ func (c *CIBA) Authenticate(ctx context.Context, req InitiateRequest) (CIBAAuthe
 	}, nil
 }
 
-// Poll exchanges an auth_req_id for the ID token the authentication produced.
-//
-// It returns the raw token rather than a caller: verifying it is the identity
-// package's job, and the completion it feeds is the same [Delegated.Submit]
-// path a step-up redirect ends in. There is one judgement of what satisfies a
-// challenge, and the transport does not get a second one.
-func (c *CIBA) Poll(ctx context.Context, authReqID string) (string, error) {
-	if c.token == "" {
-		return "", errors.New("mfa: this ciba client has no token endpoint to poll")
-	}
-	if authReqID == "" {
-		return "", errors.New("mfa: polling needs an auth_req_id")
-	}
-	form := url.Values{}
-	form.Set("grant_type", "urn:openid:params:grant-type:ciba")
-	form.Set("auth_req_id", authReqID)
-
-	var out struct {
-		IDToken string `json:"id_token"`
-	}
-	if err := c.post(ctx, c.token, form, &out); err != nil {
-		return "", err
-	}
-	if out.IDToken == "" {
-		return "", errors.New("mfa: the op returned no id_token")
-	}
-	return out.IDToken, nil
-}
-
 // post makes one form-encoded call and decodes the answer, turning the OP's
 // error document into this package's sentinels.
+//
+// One caller, [CIBA.Authenticate], since the polling client was removed. It
+// stays a function of its own because the shape it holds — form body,
+// credentials in a header, error document classified rather than pasted through
+// — is the thing [identity.StepUp.Exchange] was written to match, and inlining
+// it would leave that correspondence with nothing to point at.
 func (c *CIBA) post(ctx context.Context, endpoint string, form url.Values, into any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -267,10 +269,6 @@ func cibaError(status int, body []byte) error {
 	}
 
 	switch doc.Error {
-	case "authorization_pending":
-		return fmt.Errorf("%w: %s", ErrAuthorizationPending, detail)
-	case "slow_down":
-		return fmt.Errorf("%w: %s", ErrSlowDown, detail)
 	case "access_denied", "expired_token":
 		return fmt.Errorf("%w: %s", ErrAuthorizationDeclined, detail)
 	case "invalid_binding_message":

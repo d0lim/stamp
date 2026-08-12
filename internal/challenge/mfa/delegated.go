@@ -718,8 +718,9 @@ func (d *Delegated) Status(_ context.Context, req challenge.StatusRequest) (chal
 // One field crosses. The correlator is a binding value the completion has to
 // carry, the nonce ties a token to this request, and neither is a caller's to
 // hold — so this is a copy of a named field and never a copy of the detail. A
-// CIBA challenge publishes nothing at all: its `auth_req_id` addresses the token
-// exchange, not the subject, and there is nowhere to send anybody.
+// CIBA challenge publishes nothing at all: its `auth_req_id` names the OP's
+// record of the request, not a destination for the subject, and the OP has
+// already pushed the prompt to a device. There is nowhere to send anybody.
 func (d *Delegated) View(_ context.Context, req challenge.ViewRequest) (challenge.View, error) {
 	detail, err := DecodeDetail(req.Detail)
 	if err != nil {
@@ -734,8 +735,9 @@ func (d *Delegated) View(_ context.Context, req challenge.ViewRequest) (challeng
 //
 // It judges none of the authentication. The token goes back to the surface to
 // be verified by [identity.Verifier], and then arrives at [Delegated.Submit] as
-// a caller — the same path a CIBA poll and the mock-OP tests take, so there is
-// one conjunction of checks and the transport does not get a second one. In
+// a caller — the same path a CIBA completion takes when it is posted to the
+// challenge's callback, so there is one conjunction of checks and the transport
+// does not get a second one. In
 // particular the `acr` check, which U0 proved is the only thing standing between
 // a silent downgrade and a satisfied step-up, runs there and only there.
 //
