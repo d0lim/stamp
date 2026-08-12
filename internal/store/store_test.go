@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -912,6 +913,104 @@ func TestGrantsRejectUnsafeRoleNames(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not a plain lowercase SQL identifier") {
 		t.Fatalf("error = %v, want a rejection of the role name", err)
+	}
+}
+
+// TestReachabilityDistinguishesAnUnreachableServerFromAnAngryOne pins the one
+// judgment [store.Reachability] makes.
+//
+// The readiness gate in internal/runtime takes a pod out of its Service on the
+// strength of these reports, so the classification is load-bearing in the
+// direction that matters most: a server that answers with an error has
+// answered, and a deployment whose pods left their Service every time a query
+// hit a constraint or a missing column would be a worse failure than the
+// fail-open this signal was introduced to close.
+func TestReachabilityDistinguishesAnUnreachableServerFromAnAngryOne(t *testing.T) {
+	ctx := context.Background()
+
+	type observation struct {
+		reached bool
+		err     error
+	}
+	var mu sync.Mutex
+	var seen []observation
+	record := func(o store.Reachability) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, observation{reached: o.Reached, err: o.Err})
+	}
+	drain := func() []observation {
+		mu.Lock()
+		defer mu.Unlock()
+		out := seen
+		seen = nil
+		return out
+	}
+
+	s, err := store.Open(ctx, store.Config{
+		DSN: freshDB(t), MaxConns: testMaxConns, OnReachability: record,
+	})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	// A statement that works.
+	var one int
+	if err := s.Pool().QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		t.Fatalf("select 1: %v", err)
+	}
+	for _, o := range drain() {
+		if !o.reached {
+			t.Errorf("a successful statement was reported unreachable: %v", o.err)
+		}
+	}
+
+	// A statement the server refuses. 42P01 is the shape a tier running ahead
+	// of its schema produces, and it is exactly the case that must not read as
+	// an outage.
+	if err := s.Pool().QueryRow(ctx, `SELECT * FROM a_table_that_is_not_there`).Scan(&one); err == nil {
+		t.Fatal("selecting from a missing table succeeded")
+	}
+	angry := drain()
+	if len(angry) == 0 {
+		t.Fatal("a refused statement produced no observation at all")
+	}
+	for _, o := range angry {
+		if !o.reached {
+			t.Errorf("a server error was reported as an unreachable database: %v", o.err)
+		}
+	}
+
+	// A server that is not there. The port is closed, so this never gets past
+	// the dial — which is the only condition this type reports as unreachable.
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := closed.Addr().String()
+	if err := closed.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	drain()
+	_, err = store.Open(ctx, store.Config{
+		DSN:            "postgres://stamp:stamp@" + addr + "/stamp?sslmode=disable",
+		OnReachability: record,
+	})
+	if err == nil {
+		t.Fatal("opening a store against a closed port succeeded")
+	}
+	unreachable := drain()
+	if len(unreachable) == 0 {
+		t.Fatal("a connection to a closed port produced no observation at all")
+	}
+	for _, o := range unreachable {
+		if o.reached {
+			t.Error("a dial to a closed port was reported as a reachable database")
+		}
+		if o.err == nil {
+			t.Error("an unreachable report carried no error to show an operator")
+		}
 	}
 }
 
