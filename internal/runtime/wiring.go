@@ -88,7 +88,7 @@ type App struct {
 // for. It does not bind a listener; see [App.Listen].
 func Assemble(ctx context.Context, cfg Config, roles Set, logger *slog.Logger) (*App, error) {
 	cfg = cfg.withDefaults()
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(roles); err != nil {
 		return nil, err
 	}
 	if logger == nil {

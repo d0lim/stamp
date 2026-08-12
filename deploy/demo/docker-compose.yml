@@ -136,6 +136,13 @@ services:
       # The callback surface carries the delegated-MFA completion and the HTTP
       # ingest route, so the demo binds it. A deployment that runs neither
       # leaves it unbound, which is the default.
+      #
+      # Commenting this line out no longer produces a bundle that comes up and
+      # strands the step-up: Config.validate refuses a process that runs the
+      # decide or consumer role with the settings below and no callback
+      # listener, the same refusal the Helm chart makes at render time. This
+      # demo is the reason the binary needed its own guard — it runs on
+      # docker-compose, where the chart is not a gate at all.
       STAMP_CALLBACK_ADDR: ":8082"
       STAMP_CALLBACK_BASE_URL: http://localhost:${DEMO_CALLBACK_PORT:-18783}
 
