@@ -21,6 +21,14 @@
 //     another listener, and a hand-written expectation was wrong alongside the
 //     chart the day a split deployment stopped serving decisions at all.
 //
+//   - The `error` code vocabulary the API can put on the wire is asserted to be
+//     a document the other side of the wire can compare against. It reads
+//     console/contract/error-codes.json, which internal/api renders from its own
+//     syntax tree, and the console's boundary check compares the same file
+//     against the codes the console branches on. The endpoint set has been
+//     machine-checked since #44; the code vocabulary had not been, and that is
+//     the layer the console's dead `not_an_approver` branch survived in.
+//
 // The package has no non-test code on purpose: nothing in the product imports
 // it, and it exists so that `go test ./...` covers the packaging.
 package release

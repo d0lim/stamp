@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { ApiError, type ApiClient } from '../api/client'
+import { errorCodeOf, errorMessageOf, type ConsumedErrorCode } from '../api/error-codes'
 import { Disclosure } from '../a11y/Disclosure'
 import { RouteAnnouncer } from '../a11y/RouteAnnouncer'
 import { useAuth } from '../auth/AuthProvider'
@@ -77,13 +78,14 @@ const NOT_FOUND = {
 } as const
 
 /**
- * The error code the approval budget refuses under (R43), as `internal/api/
- * approvals.go` spells it.
+ * The error code the approval budget refuses under (R43).
  *
  * It is not in FAILURES because its next step carries a number the table cannot
- * hold — see [rateLimited].
+ * hold — see [rateLimited]. Its spelling comes from the declared vocabulary
+ * rather than from a literal here, so that a code the server stopped emitting
+ * cannot survive as a branch nobody reaches.
  */
-const RATE_LIMITED = 'rate_limited'
+const RATE_LIMITED: ConsumedErrorCode = 'rate_limited'
 
 /**
  * An approval refused by the per-approver budget, worded as the wait it is.
@@ -117,8 +119,18 @@ function rateLimited(seconds: number | undefined): { text: string; next: string 
   }
 }
 
-/** R21's submission failures, each with its own words and its own next step. */
-const FAILURES: Readonly<Record<string, { readonly text: string; readonly next: string }>> = {
+/**
+ * R21's submission failures, each with its own words and its own next step.
+ *
+ * The keys are typed against the declared vocabulary, which is what makes the
+ * table's contents checkable rather than merely consistent: a key the server
+ * cannot emit is caught by scripts/check-contract.mjs, and a key that is not a
+ * code at all does not compile. This table is where `not_an_approver` lived
+ * until #51 deleted it from the server and left the row behind.
+ */
+const FAILURES: Readonly<
+  Partial<Record<ConsumedErrorCode, { readonly text: string; readonly next: string }>>
+> = {
   expired: {
     text: '이 결정은 만료되었습니다. 승인은 기록되지 않았습니다.',
     next: '승인함으로 돌아가십시오. 필요하다면 요청자가 결정을 다시 만들어야 합니다.',
@@ -583,20 +595,20 @@ function SubmitPanel({
  */
 export function failureOf(cause: unknown): { text: string; next: string } {
   if (cause instanceof ApiError) {
-    const body = cause.body as { error?: string; message?: string } | undefined
+    const code = errorCodeOf(cause)
     // Before the table, because the words depend on a value the table cannot
     // hold: how long to wait. Matched on the status as well as on the code for
     // the reason the 404 below is — a 429 from anything between the console and
     // the engine is still a limit, and telling an approver to escalate one is
     // the worst answer available.
-    if (cause.isRateLimited || body?.error === RATE_LIMITED) {
+    if (cause.isRateLimited || code === RATE_LIMITED) {
       return rateLimited(cause.retryAfterSeconds)
     }
-    const known = body?.error === undefined ? undefined : FAILURES[body.error]
+    const known = code === undefined ? undefined : FAILURES[code]
     if (known) return known
     if (cause.isNotFound) return NOT_FOUND
     return {
-      text: body?.message !== undefined && body.message !== '' ? body.message : cause.message,
+      text: errorMessageOf(cause) ?? cause.message,
       next: '문제가 계속되면 운영자에게 이 화면의 결정 식별자를 전달하십시오.',
     }
   }
