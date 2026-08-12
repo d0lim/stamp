@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -658,6 +659,236 @@ func TestConsumerRoleCannotWriteOutsideBuckets(t *testing.T) {
 		}
 		if !isInsufficientPrivilege(err) {
 			t.Errorf("consumer write to %s failed with %v, want insufficient_privilege", tc.what, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// concurrent grant application
+// ---------------------------------------------------------------------------
+
+// uniqueRoleNames returns a role name set no other test has provisioned.
+//
+// Roles are cluster-global and every test in this package shares one container,
+// so a fixed name set would make the concurrency tests below depend on whether
+// some earlier test had already created the roles. "The roles do not exist yet"
+// is exactly the state the race needs, and it is the state a real cluster is in
+// the first time a release rolls.
+func uniqueRoleNames(t *testing.T) store.RoleNames {
+	t.Helper()
+	prefix := fmt.Sprintf("r%d_%d", time.Now().UnixNano()%1e9, dbSerial.Add(1))
+	return store.RoleNames{
+		Check:    prefix + "_check",
+		Decide:   prefix + "_decide",
+		Consumer: prefix + "_consumer",
+		Admin:    prefix + "_admin",
+	}
+}
+
+// openStoreWithRoles opens a store on an existing database with a chosen role
+// name set, standing in for one pod's boot.
+func openStoreWithRoles(t *testing.T, dsn string, roles store.RoleNames) *store.Store {
+	t.Helper()
+	s, err := store.Open(context.Background(), store.Config{DSN: dsn, MaxConns: testMaxConns, Roles: roles})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(s.Close)
+	return s
+}
+
+// applyGrantsConcurrently runs ApplyGrants on every store at once and fails the
+// test for any boot that did not survive.
+//
+// The start channel matters: without it the goroutines are staggered by their
+// own scheduling and the first one is usually finished before the second looks
+// at pg_roles, which is why this race reproduced on CI and not on a laptop.
+func applyGrantsConcurrently(t *testing.T, stores []*store.Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	errs := make([]error, len(stores))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, s := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = s.ApplyGrants(ctx)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("boot %d: apply grants: %v", i, err)
+		}
+	}
+}
+
+// concurrentBoots is how many processes race. Kubernetes rolls a Deployment's
+// replicas together and `helm upgrade` rolls every tier at once, so more than
+// two is the normal case rather than the pathological one; four keeps the window
+// wide enough that a regression fails on the first run instead of the tenth.
+const concurrentBoots = 4
+
+// TestApplyGrantsSurvivesConcurrentBoot is the defect CI found: two containers
+// started against one database at the same instant and the api tier died at boot
+// with 23505 on pg_authid_rolname_index. Grants are applied at pod boot, so a
+// process that cannot survive a peer doing the same thing at the same moment is
+// a process that crashloops on a normal rollout.
+func TestApplyGrantsSurvivesConcurrentBoot(t *testing.T) {
+	base, dsn := migratedStore(t)
+	roles := uniqueRoleNames(t)
+
+	stores := make([]*store.Store, concurrentBoots)
+	for i := range stores {
+		stores[i] = openStoreWithRoles(t, dsn, roles)
+	}
+	applyGrantsConcurrently(t, stores)
+
+	// Surviving the race is only half of it. An apply that became idempotent by
+	// becoming permissive would pass the assertion above and hand a compromised
+	// tier privileges R42 says it must never have, so the privilege matrix is
+	// checked on the roles the concurrent applies actually produced.
+	assertGrantsAreRestrictive(t, base, roles)
+}
+
+// TestApplyGrantsSurvivesConcurrentBootAcrossDatabases covers the scope the
+// roles actually live in. Roles are cluster-global while tables are per-database,
+// so two STAMP deployments sharing a cluster race on role creation even though
+// they share nothing else — and no per-database lock can serialise them, because
+// Postgres has no cluster-wide advisory lock.
+func TestApplyGrantsSurvivesConcurrentBootAcrossDatabases(t *testing.T) {
+	roles := uniqueRoleNames(t)
+
+	stores := make([]*store.Store, concurrentBoots)
+	bases := make([]*store.Store, concurrentBoots)
+	for i := range stores {
+		base, dsn := migratedStore(t)
+		bases[i] = base
+		stores[i] = openStoreWithRoles(t, dsn, roles)
+	}
+	applyGrantsConcurrently(t, stores)
+
+	for _, base := range bases {
+		assertGrantsAreRestrictive(t, base, roles)
+	}
+}
+
+// TestMigrateSurvivesConcurrentBoot is the same question one line earlier on the
+// boot path. STAMP_DB_MIGRATE defaults to true, so every replica that boots also
+// migrates, and Migrate ends by calling ApplyGrants — a Migrate that cannot
+// survive a peer leaves the process dying on exactly the rollout the grants fix
+// was meant to make survivable.
+func TestMigrateSurvivesConcurrentBoot(t *testing.T) {
+	ctx := context.Background()
+	dsn := freshDB(t)
+
+	stores := make([]*store.Store, concurrentBoots)
+	for i := range stores {
+		stores[i] = openStore(t, dsn)
+	}
+
+	errs := make([]error, len(stores))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, s := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = s.Migrate(ctx)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("boot %d: migrate: %v", i, err)
+		}
+	}
+
+	// Every boot must also agree the schema arrived. A migrate that returned nil
+	// without the schema being at the latest version would be the quiet failure
+	// this is guarding against, and readiness reads exactly this number.
+	want, err := store.LatestSchemaVersion()
+	if err != nil {
+		t.Fatalf("latest schema version: %v", err)
+	}
+	for i, s := range stores {
+		version, dirty, ok, err := s.AppliedSchemaVersion(ctx)
+		if err != nil {
+			t.Fatalf("boot %d: applied schema version: %v", i, err)
+		}
+		if !ok || dirty || version != want {
+			t.Errorf("boot %d: applied version = %d (dirty=%v, ok=%v), want %d clean", i, version, dirty, ok, want)
+		}
+	}
+}
+
+// assertGrantsAreRestrictive checks a sample of the privilege matrix R39 and R42
+// pin down: every role can read what it has to read, and none of them gained a
+// write the grants file does not hand out.
+func assertGrantsAreRestrictive(t *testing.T, s *store.Store, roles store.RoleNames) {
+	t.Helper()
+	cases := []struct {
+		role  string
+		table string
+		priv  string
+		want  bool
+	}{
+		// Every role reads the applied schema version for its readiness probe,
+		// and none of them may claim one.
+		{roles.Check, "schema_migrations", "SELECT", true},
+		{roles.Decide, "schema_migrations", "SELECT", true},
+		{roles.Consumer, "schema_migrations", "SELECT", true},
+		{roles.Admin, "schema_migrations", "SELECT", true},
+		{roles.Check, "schema_migrations", "UPDATE", false},
+		{roles.Consumer, "schema_migrations", "INSERT", false},
+
+		// check reads policies and appends audit rows; it never authors a rule.
+		{roles.Check, "policies", "SELECT", true},
+		{roles.Check, "policies", "INSERT", false},
+		{roles.Check, "policies", "UPDATE", false},
+		{roles.Check, "audit_log", "INSERT", true},
+		{roles.Check, "audit_log", "UPDATE", false},
+		{roles.Check, "audit_log", "DELETE", false},
+
+		// decide owns the decision lifecycle and stays read-only on policies.
+		{roles.Decide, "decisions", "UPDATE", true},
+		{roles.Decide, "policies", "UPDATE", false},
+		{roles.Decide, "approvals", "DELETE", false},
+		{roles.Decide, "policy_revisions", "SELECT", true},
+		{roles.Decide, "policy_revisions", "INSERT", false},
+
+		// consumer is the least trusted writer: buckets and the dedup index only.
+		{roles.Consumer, "velocity_buckets", "UPDATE", true},
+		{roles.Consumer, "processed_events", "DELETE", true},
+		{roles.Consumer, "audit_log", "INSERT", false},
+		{roles.Consumer, "policies", "SELECT", false},
+		{roles.Consumer, "decisions", "SELECT", false},
+
+		// admin authors policy and governs, and still cannot rewrite the log.
+		{roles.Admin, "policies", "UPDATE", true},
+		{roles.Admin, "approvals", "DELETE", true},
+		{roles.Admin, "audit_log", "INSERT", true},
+		{roles.Admin, "audit_log", "UPDATE", false},
+		{roles.Admin, "audit_log", "DELETE", false},
+		{roles.Admin, "audit_checkpoints", "UPDATE", false},
+	}
+	for _, tc := range cases {
+		var got bool
+		err := s.Pool().QueryRow(context.Background(),
+			`SELECT has_table_privilege($1, $2, $3)`, tc.role, tc.table, tc.priv).Scan(&got)
+		if err != nil {
+			t.Fatalf("has_table_privilege(%s, %s, %s): %v", tc.role, tc.table, tc.priv, err)
+		}
+		if got != tc.want {
+			t.Errorf("has_table_privilege(%s, %s, %s) = %v, want %v", tc.role, tc.table, tc.priv, got, tc.want)
 		}
 	}
 }

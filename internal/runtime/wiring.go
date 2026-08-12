@@ -88,7 +88,7 @@ type App struct {
 // for. It does not bind a listener; see [App.Listen].
 func Assemble(ctx context.Context, cfg Config, roles Set, logger *slog.Logger) (*App, error) {
 	cfg = cfg.withDefaults()
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(roles); err != nil {
 		return nil, err
 	}
 	if logger == nil {
@@ -432,7 +432,16 @@ func (a *App) build(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cancellations, err := api.NewCancellations(api.CancellationsConfig{Decisions: submitter})
+	cancellations, err := api.NewCancellations(api.CancellationsConfig{
+		Decisions: submitter,
+		Rate:      cfg.CancellationRate,
+		// The same buffer again, and here it is load-bearing rather than
+		// consistent. The refusal this surface records is the one that used to
+		// reach the lifecycle and write a chain append per attempt; recording it
+		// with a second synchronous append would leave the append count where it
+		// was and call the difference a rate limit.
+		Audit: buffer,
+	})
 	if err != nil {
 		return err
 	}

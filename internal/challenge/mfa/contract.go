@@ -341,8 +341,9 @@ type RedeemRequest struct {
 // carries.
 //
 // Only the redirect transport implements it: there is nothing to redeem in a
-// CIBA push, whose token comes from polling with an `auth_req_id` the handler
-// already holds. [Delegated] asks its initiator for this and answers
+// CIBA push, which sends nobody anywhere and so gets nothing back to redeem. Its
+// verdict arrives on the callback POST like any other completion, carrying the
+// ID token the OP issued. [Delegated] asks its initiator for this and answers
 // [challenge.ErrNotRedeemable] when the initiator cannot.
 type Redeemer interface {
 	Redeem(ctx context.Context, req RedeemRequest) (string, error)

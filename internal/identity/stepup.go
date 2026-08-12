@@ -413,10 +413,13 @@ type CodeExchange struct {
 // conjunction of checks; a second opinion formed here would be a second place
 // the trust boundary could be got wrong.
 //
-// The shape follows [mfa.CIBA.Poll], which is this repository's only other
-// token-endpoint client: form-encoded body, credentials in the Authorization
-// header rather than the body when there are any, and the OP's error document
-// classified rather than pasted through.
+// The shape was taken from the CIBA client's form-POST helper — form-encoded
+// body, credentials in the Authorization header rather than the body when there
+// are any, and the OP's error document classified rather than pasted through.
+// That client used to redeem an `auth_req_id` at a token endpoint too; it was
+// deleted as dead code, because a CIBA verdict comes back on the callback POST
+// and nothing ever polled. So this is now the repository's *only* token-endpoint
+// client, and the shape has no second implementation to stay in step with.
 func (s *StepUp) Exchange(ctx context.Context, req CodeExchange) (string, error) {
 	if s.tokenEndpoint == "" {
 		return "", fmt.Errorf("%w: no token endpoint is configured", ErrStepUpExchange)

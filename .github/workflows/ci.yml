@@ -263,18 +263,74 @@ jobs:
             -e STAMP_OIDC_JWKS_URL='https://idp.ci.invalid/jwks' \
             -e STAMP_OIDC_AUDIENCE='stamp' \
             stamp:ci --roles=api
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:19081/healthz >/dev/null 2>&1 \
-               && curl -fsS http://localhost:19082/healthz >/dev/null 2>&1; then break; fi
+          # Two tiers run here and either one can be the one that failed, so
+          # everything below names which. The dump is both containers because the
+          # handler used to print only the console's — and the run that actually
+          # went red was the API tier, whose logs nobody ever saw.
+          dump() {
+            for container in stamp-ci-console stamp-ci-apionly; do
+              echo "----- docker logs $container -----" >&2
+              docker logs "$container" >&2 \
+                || echo "(no logs: $container was never created, or is already gone)" >&2
+            done
+          }
+          # Anything that fails outside expect() — a grep over the policy header,
+          # a curl in a pipeline — gets the same treatment. Those lines used to
+          # end the step with a bare status and nothing to read.
+          trap 'echo "the step failed; both container logs follow" >&2; dump' ERR
+
+          ready() { curl -fsS "http://localhost:$1/healthz" >/dev/null 2>&1; }
+          # A tier that never answers is this step's business to report, not
+          # something to walk past. The loop used to spend its budget and then
+          # continue into the assertions regardless, so a container that never
+          # started was reported — if at all — as a wrong status code somewhere
+          # further down, which is a description of a symptom and not of a cause.
+          # One name for the budget, because it is quoted in the failure message
+          # and a message that reports a number the loop no longer waits is worse
+          # than no number at all.
+          budget=30
+          console_up=0
+          api_up=0
+          for i in $(seq 1 "$budget"); do
+            if [ "$console_up" != 1 ] && ready 19081; then console_up=1; fi
+            if [ "$api_up" != 1 ] && ready 19082; then api_up=1; fi
+            if [ "$console_up" = 1 ] && [ "$api_up" = 1 ]; then
+              echo "both tiers answered healthz after ${i}s"
+              break
+            fi
             sleep 1
           done
+          if [ "$console_up" != 1 ] || [ "$api_up" != 1 ]; then
+            if [ "$console_up" != 1 ]; then
+              echo "the console tier (stamp-ci-console, :19081) never answered /healthz within ${budget}s" >&2
+            fi
+            if [ "$api_up" != 1 ]; then
+              echo "the api tier (stamp-ci-apionly, :19082) never answered /healthz within ${budget}s" >&2
+            fi
+            dump
+            exit 1
+          fi
 
           status() { curl -s -o /dev/null -w '%{http_code}' "$1"; }
+          # "could not connect" and "answered, but with the wrong code" are two
+          # different failures and only one of them used to be reported. The other
+          # was not reported at all: `got=$(status "$2")` under `bash -e` takes
+          # curl's own exit — 7 for a refused connection — and kills the step
+          # there, with no message, no logs, and no line saying which URL. That is
+          # exactly how this step went red once and green on re-run, leaving
+          # nothing behind to diagnose. So curl's status is captured rather than
+          # inherited, and the two cases get two messages.
           expect() {
-            got=$(status "$2")
+            rc=0
+            got=$(status "$2") || rc=$?
+            if [ "$rc" != 0 ]; then
+              echo "could not reach $2: curl exited $rc — the tier is not listening (refused, reset, or the container died after healthz); wanted $1" >&2
+              dump
+              exit 1
+            fi
             if [ "$got" != "$1" ]; then
               echo "$2 answered $got, want $1" >&2
-              docker logs stamp-ci-console >&2 || true
+              dump
               exit 1
             fi
           }
