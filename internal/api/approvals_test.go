@@ -576,6 +576,32 @@ func TestSubmissionsAreRefusedOverTheApproverBudget(t *testing.T) {
 	if got.Limit == "" || got.Scope == "" {
 		t.Errorf("audited scope/limit = %q/%q, want both: a reader cannot tell which budget bound", got.Scope, got.Limit)
 	}
+
+	// The handler claims more than the count above pins: charged "before the
+	// path is parsed and before the body is read". The submission count stays
+	// right if the charge is moved all the way down to the line before
+	// decisions.Submit, and the mutation audit found that survivor
+	// (docs/testing/mutation-matrix.md). These two requests are the ones that
+	// tell the orderings apart, because each one has a refusal of its own
+	// waiting further down the handler.
+	//
+	// An approver over its budget must not be able to buy a different answer by
+	// spelling the ordinal badly (400 from challengeRef) or by sending a body
+	// past the cap (413 from readApprovalBody). Both would mean the surface did
+	// work — parsing, and reading up to MaxRequestBytes off the wire — for a
+	// caller it had already decided to refuse.
+	if code := f.do(t, api.SurfaceConsole, http.MethodPost,
+		"/decisions/"+testDecisionID+"/challenges/not-a-number/approvals",
+		f.userToken(t, "bob"), "").Code; code != http.StatusTooManyRequests {
+		t.Errorf("an unparseable path from an approver over its budget answered %d, want 429: "+
+			"the budget is charged before the path is parsed", code)
+	}
+	oversized := strings.Repeat("x", int(api.DefaultMaxApprovalBytes)+1)
+	if code := f.approve(t, "bob", oversized).Code; code != http.StatusTooManyRequests {
+		t.Errorf("an oversized body from an approver over its budget answered %d, want 429: "+
+			"the budget is charged before the body is read, so the surface never reads %d bytes "+
+			"for a caller it has already refused", code, len(oversized))
+	}
 }
 
 // TestTheApprovalBudgetIsPerApproverAndRefills guards the key and the recovery.

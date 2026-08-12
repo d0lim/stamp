@@ -542,6 +542,33 @@ describe('제출 실패', () => {
     expect(failure).not.toHaveTextContent('운영자에게 이 화면의 결정 식별자를 전달')
   })
 
+  it('코드를 읽을 수 없는 429도 기다림으로 읽힌다 — 중간자가 흘린 경우', async () => {
+    // The two cases above both carry `rate_limited` in the body, so either half
+    // of `cause.isRateLimited || body?.error === RATE_LIMITED` alone keeps them
+    // green — the mutation audit removed each half in turn and neither showed
+    // up (docs/testing/mutation-matrix.md). The half that matters is the status,
+    // and this is the request that needs it: a 429 raised between the console
+    // and the engine — an ingress limiter, a mesh sidecar, a CDN — answers with
+    // a body of its own, and nothing in it is this API's error vocabulary.
+    //
+    // It is still a limit and it still clears on a timer, so the advice is the
+    // same. Falling through to the generic branch would send the approver to an
+    // operator who has nothing to do, which is the one answer that makes the
+    // situation worse.
+    const user = userEvent.setup()
+    renderApproval({
+      submit: { status: 429, body: '<html><body>429 Too Many Requests</body></html>' },
+    })
+    await entryList(17)
+    await user.click(screen.getByTestId('expand-all'))
+    await user.click(screen.getByTestId('approve'))
+
+    const failure = await screen.findByTestId('submit-failure')
+    expect(failure).toHaveTextContent('기록되지 않았습니다')
+    expect(failure).toHaveTextContent('다시 누르십시오')
+    expect(failure).not.toHaveTextContent('운영자에게 이 화면의 결정 식별자를 전달')
+  })
+
   it('읽기가 실패하면 직전에 성공한 검토 화면은 남지 않는다', async () => {
     // This screen re-reads while it is open, so a read that stops working has a
     // previous one to leave behind. Left behind, the "cannot be opened" notice

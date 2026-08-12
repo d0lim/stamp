@@ -356,6 +356,22 @@ func TestACancellationOverTheBudgetNeverReachesTheLifecycle(t *testing.T) {
 			"budget is a synchronous audit-chain append a console user got for free",
 			got, attempts, burst)
 	}
+
+	// And "before the path is even parsed" is asserted rather than described.
+	// The count above stays right if the charge is moved down as far as the line
+	// before the lifecycle call, so on its own it pins half of what the handler
+	// claims; the mutation audit found exactly that (docs/testing/
+	// mutation-matrix.md). A path this handler cannot parse is the one request
+	// that tells the two apart: charged first it is a 429, charged after
+	// challengeRef it is a 400, and the answer an authority over its budget gets
+	// must not depend on how well it spelled the ordinal.
+	if code := f.post(t, api.SurfaceConsole,
+		"/decisions/"+testDecisionID+"/challenges/not-a-number/cancellation",
+		f.idp.token(t, "mallory", "console"), "").Code; code != http.StatusTooManyRequests {
+		t.Errorf("an unparseable path from an authority over its budget answered %d, want 429: "+
+			"the budget is charged before the path is parsed, so nothing about the request can "+
+			"buy a different answer", code)
+	}
 }
 
 // TestTheCancellationBudgetIsPerAuthorityAndRefills guards the key and the
