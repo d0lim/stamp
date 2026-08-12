@@ -23,6 +23,7 @@
  */
 import { useState } from 'react'
 import { ApiError, type ApiClient } from '../api/client'
+import { errorMessageOf } from '../api/error-codes'
 import type { DryRunResponse, NodeTrace } from './api-types'
 import { diagnosticsOf, type Diagnostic } from './diagnostics'
 import {
@@ -342,10 +343,5 @@ export function DryRunPanel({
 }
 
 function messageOf(error: ApiError): string {
-  const body = error.body
-  if (typeof body === 'object' && body !== null) {
-    const message = (body as { message?: unknown }).message
-    if (typeof message === 'string' && message !== '') return message
-  }
-  return error.message
+  return errorMessageOf(error) ?? error.message
 }

@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "note": "What the console does not implement, and why. `codes` holds the `error` codes the server can emit that no screen branches on; `endpoints` holds the public-contract endpoints no screen calls. contract/error-codes.json is the server's half of the first, rendered from internal/api's syntax tree; src/api/error-codes.ts is the console's. scripts/check-contract.mjs requires every served code and every declared endpoint to be handled or listed here, so this file is the only place either may go unimplemented — and it costs a name and a reason to put one here. An entry that stops being true — a code the server no longer emits, an endpoint a screen started calling — fails the check: this list cannot rot quietly.",
+  "codes": [
+    {
+      "reason": "Emitted only on listeners the console never calls. The console speaks to the console listener alone (D19, and the mount table proves it) — the PEP surface belongs to workloads holding client credentials, and the callback surface to the IdP's redirect and to external systems pushing events. A code that cannot arrive is not a code to word, and wording one would be writing copy for a screen that can never render it.",
+      "codes": [
+        "acr_not_allowed",
+        "acr_unsatisfied",
+        "amr_mismatch",
+        "correlator_consumed",
+        "correlator_mismatch",
+        "credential_mismatch",
+        "idempotency_key_reused",
+        "invalid_event",
+        "invalid_property",
+        "invalid_token",
+        "nonce_mismatch",
+        "not_permitted",
+        "not_redeemable",
+        "not_the_subject",
+        "redemption_refused",
+        "rejected",
+        "stale_authentication",
+        "too_large"
+      ]
+    },
+    {
+      "reason": "Answered by the status rather than by the code. src/api/client.ts turns 401 into a re-login the shell offers, and reports the rest as the failure they are; none of the three says anything a screen would word differently from what the status already means — the session is gone, the engine is failing, the subsystem is not installed in this deployment.",
+      "codes": ["internal_error", "not_installed", "unauthenticated"]
+    },
+    {
+      "reason": "The server's own sentence is the most accurate one available, and the console shows it. These refusals arrive on surfaces the console does call, and each carries a specific message written where the rule lives — which quorum is unsatisfiable, which floor a revision breaks, which capability is missing. A console-side rewording would be a second copy of that text, maintained apart from the rule it describes, and it would drift. The generic branch renders `message` verbatim, so nothing is lost by not naming these.",
+      "codes": [
+        "authoring_locked",
+        "bootstrap_token_required",
+        "capability_required",
+        "evaluation_failed",
+        "floor_violated",
+        "governance_locked",
+        "invalid_input",
+        "invalid_payload",
+        "invalid_request",
+        "invalid_revision",
+        "invalid_submission",
+        "not_an_auditor",
+        "not_configured",
+        "not_pending",
+        "not_the_proposer",
+        "origin_conflict",
+        "payload_too_large",
+        "unsatisfiable_quorum",
+        "unsupported_challenge",
+        "unsupported_verdict"
+      ]
+    },
+    {
+      "reason": "Recognised by its payload rather than by its code. The dry run answers a policy that will not decode with a `diagnostics` array of pointer/code/message triples, and the builder's job is to hang each one on the field that caused it — so what it keys off is the array, in src/builder/diagnostics.ts, and the code beside it adds nothing a screen would do differently. Worth writing down rather than leaving implicit: it is the one refusal on this API the console identifies by shape, and that is why the code looks unhandled when it is not.",
+      "codes": ["invalid_policy"]
+    }
+  ],
+  "endpoints": [
+    {
+      "name": "delay-cancel",
+      "reason": "R2's delegated cancellation of a delay. The server side is finished — the endpoint, the per-authority budget, the 429 with Retry-After and the cancellation_rate_limited audit reason (decision-api 1.8.0) — and no console screen calls it, so none of that renders anywhere. Building the screen is a new feature; deleting the endpoint is a wire change on a surface other clients can already reach. Documented under `## 콘솔이 부르지 않는 표면` in docs/contracts/decision-api.md, which internal/release compares against this list."
+    },
+    {
+      "name": "governance-lock",
+      "reason": "Turning quorum governance on is a one-time bootstrap act, and its refusal code says why the console stays out of it: `403 bootstrap_token_required`. That token is held by whoever runs the deployment, not by a console session, and carrying it into a browser to save one click would put the credential that installs governance into the place with the largest attack surface."
+    },
+    {
+      "name": "policy-apply",
+      "reason": "The file-authoring path (U19): a policy set applied from files, which is the git-and-CI workflow's door. The console's builder changes policy through revision proposals instead — `revision-preview`, `revision-submit`, `revision-withdraw` — because a proposal is what a quorum can approve and a file apply is not."
+    },
+    {
+      "name": "policy-export",
+      "reason": "The other half of the file-authoring path: the policy set rendered back out as files. Its caller is the CLI or CI job that keeps a repository in step with a deployment, not a screen."
+    },
+    {
+      "name": "schema-read",
+      "reason": "The schema in force. The builder starts every draft from an empty schema and authors declarations into it, so it never reads the one already installed — which also means it cannot show an author what is in force before they replace it. That is a gap rather than a decision, and naming it here is how it stops being invisible."
+    }
+  ]
+}
