@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -690,4 +693,184 @@ func TestAPolicyDenyCarriesNoRetryAfter(t *testing.T) {
 	if got := rec.Header().Get("Retry-After"); got != "" {
 		t.Errorf("a policy deny carries Retry-After %q; retrying it is not a thing to invite", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the two budgets under concurrent load
+// ---------------------------------------------------------------------------
+//
+// Every test above drives the surface one request at a time, which is not how
+// the surface is used and is the gap the previous round's mutation audit wrote
+// down: the two limiter tables had no dedicated concurrency test and `-race`
+// had only brushed them incidentally.
+//
+// What a sequential test cannot see is a budget that leaks under contention.
+// The refusal a PEP gets is identical either way — one deny looks like another
+// — so the only observable difference is the *count*: with a burst of B and N
+// requests in flight, exactly B are admitted. B+1 is a limit that reports more
+// than it does, and R43's bound then holds in the response body and nowhere
+// else. The limiter's own arithmetic is pinned in internal/stream; this is the
+// same claim made through the assembled surface, where the caller table and the
+// subject table are charged on the way through one request and a test can be
+// sure it is the real pairing rather than two limiters a test wired up.
+
+// decideStorm fires n concurrent creates through the decide surface, released
+// together, and reports how many were created, how many were refused as denied
+// decisions, and the highest number of requests that were inside the handler at
+// once.
+//
+// Every token is minted before the barrier. Minting inside a goroutine would
+// put a t.Fatalf on the wrong stack, and it would also mean the requests were
+// not really simultaneous — they would be staggered by RSA signing.
+func decideStorm(t *testing.T, f *decideFixture, n int, request func(i int) (token, body string),
+) (created, refused, peak int) {
+	t.Helper()
+	tokens := make([]string, n)
+	bodies := make([]string, n)
+	for i := range n {
+		tokens[i], bodies[i] = request(i)
+	}
+
+	var (
+		arrived sync.WaitGroup
+		done    sync.WaitGroup
+		release = make(chan struct{})
+
+		ok      atomic.Int64
+		denies  atomic.Int64
+		inside  atomic.Int64
+		highest atomic.Int64
+	)
+	arrived.Add(n)
+	done.Add(n)
+	for i := range n {
+		go func() {
+			defer done.Done()
+			arrived.Done()
+			<-release
+
+			depth := inside.Add(1)
+			for {
+				high := highest.Load()
+				if depth <= high || highest.CompareAndSwap(high, depth) {
+					break
+				}
+			}
+			rec := f.do(api.SurfacePEP, http.MethodPost, api.DecisionsPath, tokens[i], bodies[i])
+			inside.Add(-1)
+
+			switch {
+			case rec.Code == http.StatusCreated:
+				ok.Add(1)
+			case rec.Code == http.StatusOK && strings.Contains(rec.Body.String(),
+				`"`+string(decision.ReasonRateLimited)+`"`):
+				denies.Add(1)
+			default:
+				// Neither a creation nor a rate refusal: counted in neither, so
+				// the arithmetic below fails loudly rather than balancing.
+				t.Errorf("request %d = %d %s, want either a creation or a rate-limit deny",
+					i, rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	arrived.Wait()
+	close(release)
+	done.Wait()
+
+	t.Logf("%d concurrent decides, %d of them inside the surface at once", n, int(highest.Load()))
+	if runtime.GOMAXPROCS(0) >= 2 && highest.Load() < 2 {
+		// A concurrency test that ran sequentially asserts nothing about
+		// concurrency, and would keep passing against a limiter with no lock at
+		// all. Skipped on a single-P runtime, where the scheduler cannot produce
+		// simultaneity and the check would be a lie rather than a control.
+		t.Errorf("no two of the %d requests were ever inside the surface at the same time", n)
+	}
+	return int(ok.Load()), int(denies.Load()), int(highest.Load())
+}
+
+// TestDecideBudgetsAreExactUnderConcurrentLoad is the mutation audit's gap
+// closed where R43 is enforced.
+//
+// Both tables are charged in both halves — one caller against many subjects,
+// then many callers against one subject — so the budget that binds is filling
+// its table at the same instant the other one is filling its own. The clock
+// does not move for the length of the storm, so a refill cannot explain an
+// admission: every request over the burst that got through would be a token
+// spent twice.
+func TestDecideBudgetsAreExactUnderConcurrentLoad(t *testing.T) {
+	const (
+		burst    = 8
+		inFlight = 128
+	)
+
+	t.Run("the caller budget", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{
+			rate:        stream.RateLimit{PerSecond: 1000, Burst: burst},
+			subjectRate: generous,
+		})
+		// One caller, and a distinct subject per request: the subject table is
+		// being filled by every goroutine while the caller's bucket is the one
+		// being spent.
+		token := f.workload(t, "svc-flood")
+		created, refused, _ := decideStorm(t, f, inFlight, func(i int) (string, string) {
+			return token, decideBodyFor(fmt.Sprintf("acct-%d", i))
+		})
+
+		if created != burst {
+			t.Errorf("%d of %d concurrent requests were created against a caller burst of %d, "+
+				"want exactly %d. more is a budget that leaks under contention — the surface "+
+				"answers that it limited and the work it was shedding went through; fewer is a "+
+				"limiter charging requests it refused", created, inFlight, burst, burst)
+		}
+		if created+refused != inFlight {
+			t.Errorf("%d created + %d refused != %d requests: something answered neither way",
+				created, refused, inFlight)
+		}
+		// R43 asks the refusal to be audited, and a storm is where a dropped
+		// audit record would hide. Every refusal has one, attributed to the
+		// budget that actually ran out.
+		events := f.audit.snapshot()
+		if len(events) != refused {
+			t.Errorf("%d refusals produced %d audit records, want one each", refused, len(events))
+		}
+		for _, e := range events {
+			if e.Scope != "caller" {
+				t.Errorf("a refusal was attributed to the %q budget, want the caller's: %+v", e.Scope, e)
+				break
+			}
+		}
+	})
+
+	t.Run("the subject budget", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{
+			rate:        generous,
+			subjectRate: stream.RateLimit{PerSecond: 1000, Burst: burst},
+		})
+		// The mirror image: one subject, a distinct caller per request. This is
+		// also the concurrent form of the property that one subject's budget is
+		// one budget however many callers spend it.
+		created, refused, _ := decideStorm(t, f, inFlight, func(i int) (string, string) {
+			return f.workload(t, fmt.Sprintf("svc-%d", i)), decideBodyFor("acct-shared")
+		})
+
+		if created != burst {
+			t.Errorf("%d of %d concurrent requests were created against a subject burst of %d, "+
+				"want exactly %d: the budget that the outstanding cap depends on for its cushion "+
+				"has to hold when the requests arrive together, which is the only way they arrive",
+				created, inFlight, burst, burst)
+		}
+		if created+refused != inFlight {
+			t.Errorf("%d created + %d refused != %d requests", created, refused, inFlight)
+		}
+		events := f.audit.snapshot()
+		if len(events) != refused {
+			t.Errorf("%d refusals produced %d audit records, want one each", refused, len(events))
+		}
+		for _, e := range events {
+			if e.Scope != "subject" {
+				t.Errorf("a refusal was attributed to the %q budget, want the subject's: %+v", e.Scope, e)
+				break
+			}
+		}
+	})
 }
