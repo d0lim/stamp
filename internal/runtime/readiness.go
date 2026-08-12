@@ -82,6 +82,18 @@ func newSchemaVersionGate(s *store.Store, logger *slog.Logger) (*schemaVersionGa
 // A database that cannot be reached is reported unready rather than ready. It is
 // the same answer for the same reason: a request routed to this pod would fail,
 // and that is the only thing readiness means.
+//
+// That last paragraph holds exactly once — before the gate has opened — and it
+// is worth being blunt about, because it reads like a general statement and is
+// not one. The latch above means an unreachable database is reported unready
+// only by a process that has never yet been found ready. The chart probes
+// readiness every five seconds from two seconds after start, so a deployed pod
+// has an open gate within seconds of boot and answers 200 for the rest of its
+// life, including with no database at all. Both answers are measured in
+// TestTheSurfacesAnswerWhenTheDatabaseIsGone's readiness subtest, and the
+// operational consequence — do not use /readyz as a database health signal — is
+// written down in docs/operations/failure-modes.md. Nothing about the behaviour
+// changed when that was found; what changed is that it is now stated.
 func (g *schemaVersionGate) ready(ctx context.Context) error {
 	if g.open.Load() {
 		return nil
