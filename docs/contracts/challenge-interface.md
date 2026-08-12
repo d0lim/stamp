@@ -1,6 +1,6 @@
 ---
 contract: challenge-interface
-version: 1.2.0
+version: 1.4.0
 source: internal/challenge
 ---
 
@@ -66,6 +66,26 @@ type Redeemer interface {
 
 `pending`, `satisfied`, `failed`, `cancelled`. 뒤의 셋이 종결 상태다.
 
+### `Status.Shed`: 답을 받지 못한 실패와 열리지도 않은 실패
+
+**1.3.0에서 더해졌다**(결과 구조체에 필드 추가 = minor). `failed`는 두 가지를 한 단어로 덮는다: 물었는데 아니라는 답이 온 challenge와, **애초에 열리지 않은** challenge다. 뒤쪽은 주체별 challenge 발급 한도가 셰딩한 경우이며(R43) — IdP에도 대상 시스템에도 아무것도 가지 않았고 사람은 아무것도 받지 못했다.
+
+`Shed`는 그 구분을 **한 비트**로 나른다. 핸들러의 실패 단어(`issue_rate_limited`, `rate_limited`)가 아니라 비트인 이유는, 결정 수명주기가 어떤 kind의 어휘도 알아서는 안 되기 때문이다 — 두 문자열을 아는 결정 레이어는 kind가 늘 때마다 고쳐야 한다.
+
+`Status`에 실리는 이유는 결정의 근거가 **읽을 때마다 다시 계산되기** 때문이다. 수명주기는 challenge를 저장한 뒤 `Status`를 묻고, 재검증(R31)이 이미 존재하는 결정에 셰딩된 발급을 쓸 수도 있다 — 발급 반환값에만 있는 비트는 그 뒤로 아무도 읽지 못한다.
+
+`State`가 `failed`가 아닐 때 이 값은 의미가 없다. 구현하지 않은 핸들러는 `false`이고, 그것이 셰딩 한도를 갖지 않는 kind가 원하는 답이다.
+
+### `IssueResult.Shed`와 `IssueResult.RetryAfter`: 너무 늦게 오는 비트
+
+**1.4.0에서 더해졌다**(결과 구조체에 필드 추가 = minor). 같은 비트를 발급 시점에도 싣는다. 1.3.0은 이것을 `Status`에만 두었고 — 위 문단이 그 이유를 적어 두었다 — **그 선택의 대가가 사람에게 갔다.** `Status`로만 오는 비트는 수명주기가 이미 challenge 행을 쓴 **뒤에** 도착하므로, 셰딩된 발급은 `failed` 행이 되고 결정은 그 행을 최종 deny로 해소했다. 그래서 아무도 아무것도 묻지 않은 사람의 이력에 "거부됨"이 쌓였다.
+
+발급 시점에 읽으면 decide는 **행을 쓰기 전에** 물러날 수 있다. 결정 API 계약이 1.7.0에서 기술하는 답이 그것이다 — `id` 없는 deny, 저장된 행 없음, `Retry-After` 있음.
+
+`RetryAfter`는 그 `Retry-After`의 재료다. 어느 예산이 거절했는지는 핸들러만 알고, 초로 바꿔 헤더에 쓰는 것은 표면의 일이다. 비율이 아니라 기간인 이유는 표면이 적어야 하는 것이 초 하나이고, 비율은 그 초에서 산술 한 걸음 떨어져 있기 때문이다.
+
+**두 곳 모두 설정하는 것이 구현자의 의무다.** 발급에서 `Shed`를 세우는 핸들러는 같은 challenge에 대해 `Status`에서도 세워야 한다. 재검증이 쓴 행은 읽을 때마다 근거를 다시 계산하고, 그때 비트가 없으면 그 결정은 사람이 거절한 것과 같은 단어를 달게 된다.
+
 ## 핸들러는 자기 detail을 저장한다, 선언이 아니라
 
 `Issue`는 정책의 선언을 받아 `Detail`을 돌려주고, 수명주기는 그것을 challenge 행에 저장해 `Submit`과 `Status`에 그대로 되돌린다. 나중에 필요한 임계값이나 승인자 집합은 핸들러가 `Detail`에 넣는다. 그래야 challenge가 열린 조건이 fact 스냅샷·정책 버전과 함께 동결되고, 이 패키지가 정책 AST를 직렬화할 이유가 사라진다.
@@ -81,11 +101,11 @@ type Redeemer interface {
 | `Instance` | `DecisionID`, `Ordinal`, `Kind` |
 | `DecisionContext` | 동결된 결정 내용 |
 | `IssueRequest` | `Instance`, `Spec`, `Decision`, `Now` |
-| `IssueResult` | `State`, `Detail`, `Deadline` |
+| `IssueResult` | `State`, `Detail`, `Deadline`, `Shed`, `RetryAfter` |
 | `SubmitRequest` | `Instance`, `Decision`, `Detail`, `Submitter`, `Payload`, `Now` |
 | `SubmitResult` | `State`, `Have`, `Need`, `Detail` |
 | `StatusRequest` | `Instance`, `Decision`, `Detail`, `Stored`, `Deadline`, `Now` |
-| `Status` | `State`, `Have`, `Need`, `Deadline`, `Detail` |
+| `Status` | `State`, `Have`, `Need`, `Deadline`, `Detail`, `Shed` |
 | `ViewRequest` | `Instance`, `Decision`, `Detail`, `Now` |
 | `View` | `AuthorizationURL` |
 

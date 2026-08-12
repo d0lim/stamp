@@ -149,6 +149,10 @@ type Config struct {
 	// surface with no entry is not listened on at all — which is how a
 	// deployment runs a PEP tier with no console reachable anywhere.
 	Addresses map[Surface]string
+	// Ready answers GET /readyz. Nil means every listener reports ready as
+	// soon as it is bound, which is the pre-existing behaviour and the right
+	// one for a process with nothing to wait for.
+	Ready ReadyFunc
 	// ReadHeaderTimeout bounds how long a client may take to send headers.
 	// Zero selects DefaultReadHeaderTimeout.
 	ReadHeaderTimeout time.Duration
@@ -204,8 +208,12 @@ func New(cfg Config) (*Server, error) {
 	for _, surface := range Surfaces() {
 		mux := http.NewServeMux()
 		mux.Handle("GET /healthz", healthHandler(surface))
+		mux.Handle("GET /readyz", readyHandler(surface, cfg.Ready))
 		s.muxes[surface] = mux
-		s.seen[surface] = map[string]string{"GET /healthz": "healthz"}
+		s.seen[surface] = map[string]string{
+			"GET /healthz": "healthz",
+			"GET /readyz":  "readyz",
+		}
 	}
 	return s, nil
 }
@@ -405,6 +413,58 @@ func healthHandler(surface Surface) http.Handler {
 		w.Header().Set("X-Stamp-Surface", string(surface))
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok\n")
+	})
+}
+
+// ReadyFunc answers "may this process take traffic?". A nil error means yes; the
+// error's text is what the operator reading the probe's logs will see, so it
+// should name what is being waited for.
+//
+// It is called per probe rather than once at boot because the thing it waits for
+// arrives after boot: the schema a non-migrating tier needs is applied by a
+// different pod, and a check evaluated once at startup would either block the
+// process from ever binding or answer a question that had not been decided yet.
+type ReadyFunc func(context.Context) error
+
+// readyHandler answers GET /readyz: 200 when the process may take traffic and
+// 503 when it may not.
+//
+// It is a second endpoint rather than a condition added to /healthz, and that
+// split is the point. Both probes in the chart pointed at /healthz, so making
+// /healthz depend on the database would have made a lagging schema kill the pod
+// on its liveness probe instead of holding it out of its Service — a restart
+// loop in place of a wait, and one that would have restarted every pod in the
+// fleet the moment the database was briefly unreachable. Liveness asks "is this
+// process wedged?", to which the answer is still yes-it-is-fine; readiness asks
+// "would a request sent here work?", which is a different question with a
+// different remedy.
+//
+// A nil ReadyFunc answers 200 unconditionally. A process nobody handed a
+// readiness question to has none to answer, and inventing one — refusing traffic
+// until something proves itself — would make an embedding that only wants a
+// router fail to serve.
+func readyHandler(surface Surface, ready ReadyFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Stamp-Surface", string(surface))
+		if ready == nil {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ready\n")
+			return
+		}
+		if err := ready(r.Context()); err != nil {
+			// The reason goes in the body because that is where kubectl
+			// describe and a curl both show it. It is the process's own
+			// description of its own state — a schema version and what it
+			// wanted — and carries nothing a caller supplied, so there is
+			// nothing here for an unauthenticated reader to learn that the
+			// image tag does not already tell them.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "not ready: "+err.Error()+"\n")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ready\n")
 	})
 }
 

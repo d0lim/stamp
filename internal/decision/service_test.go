@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -398,8 +399,16 @@ func TestUnauthenticatedDecideIsRefusedBeforeEvaluation(t *testing.T) {
 	}
 }
 
-// A submission from someone the challenge does not target is refused by the
-// handler and audited by the lifecycle.
+// A submission from someone the challenge does not target is refused and
+// audited.
+//
+// The refusal is the lifecycle's rather than the handler's, and the sentinel
+// moved with it: standing is settled before the decision's state is judged, so a
+// non-target is turned away with ErrNotAuthorized before the handler is asked
+// anything (#38). Both sentinels answer 404 at every surface that maps them, and
+// which one arrives is not observable from outside — what is observable, and
+// what internal/runtime/oracle_test.go asserts, is that the answer no longer
+// changes when the decision resolves.
 func TestSubmissionFromNonTargetIsRefusedAndAudited(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, harnessOptions{
@@ -411,14 +420,149 @@ func TestSubmissionFromNonTargetIsRefusedAndAudited(t *testing.T) {
 	}
 
 	_, err = h.svc.Submit(ctx, decision.Submission{Caller: user("mallory"), DecisionID: res.ID, Ordinal: 0})
-	if !errors.Is(err, challenge.ErrNotTarget) {
-		t.Fatalf("submission from a non-target returned %v, want ErrNotTarget", err)
+	if !errors.Is(err, decision.ErrNotAuthorized) {
+		t.Fatalf("submission from a non-target returned %v, want ErrNotAuthorized", err)
 	}
 	if n := h.approvalCount(res.ID, 0); n != 0 {
 		t.Errorf("a refused submission recorded %d approvals", n)
 	}
 	if rows := h.auditPayloads(decision.AuditKindAccessRefused, res.ID); len(rows) != 1 {
 		t.Errorf("audited submission refusals = %d, want 1", len(rows))
+	}
+}
+
+// TestStandingIsSettledBeforeStateOnTheSubmitPath is #38's second half at the
+// lifecycle, where the ordering lives.
+//
+// The end-to-end assertion is internal/runtime/oracle_test.go, which compares
+// response bytes. This one is here because the ordering is a property of this
+// function and a future edit that moves the state check back in front of the
+// standing check would be a two-line diff nothing else in this package notices.
+func TestStandingIsSettledBeforeStateOnTheSubmitPath(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		policies: []*policy.Policy{gatedPolicy("wire-transfer", 1, "alice")},
+	})
+
+	// Three decisions, one per state a stranger must not be able to tell apart.
+	pending, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	resolved, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("alice"), DecisionID: resolved.ID, Ordinal: 0,
+	}); err != nil {
+		t.Fatalf("alice's approval: %v", err)
+	}
+	expired, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+
+	stranger := func(name, id string) {
+		t.Helper()
+		_, err := h.svc.Submit(ctx, decision.Submission{
+			Caller: user("mallory"), DecisionID: id, Ordinal: 0,
+		})
+		if !errors.Is(err, decision.ErrNotAuthorized) {
+			t.Errorf("a stranger submitting to %s returned %v, want ErrNotAuthorized: "+
+				"a state sentinel here is a 409 at the surface, and a 409 where a stranger "+
+				"would otherwise read 404 is how they learn the decision is real", name, err)
+		}
+	}
+	stranger("a pending decision", pending.ID)
+	stranger("a resolved decision", resolved.ID)
+
+	// The approver the challenge names is told what a stranger is not: the
+	// decision she is submitting to has already resolved.
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("alice"), DecisionID: resolved.ID, Ordinal: 0,
+	}); !errors.Is(err, decision.ErrNotPending) {
+		t.Errorf("alice submitting to a resolved decision returned %v, want ErrNotPending", err)
+	}
+
+	// Past every deadline. The third decision is now over, and the expiry test
+	// is the first state check either caller meets — which is why alice's answer
+	// below is the expiry rather than the state the sweeper has yet to write.
+	h.clock.Advance(2 * decision.DefaultTTL)
+
+	stranger("an expired decision", expired.ID)
+
+	// The fourth case is the one the other three have to be indistinguishable
+	// from. Its sentinel is the store's rather than this package's, and the two
+	// are one answer at every surface that maps them — which is the property
+	// internal/runtime/oracle_test.go asserts in bytes.
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("mallory"), DecisionID: "00000000-0000-4000-8000-000000000000", Ordinal: 0,
+	}); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("a stranger submitting to a decision that does not exist returned %v, want ErrNotFound", err)
+	}
+
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller: user("alice"), DecisionID: expired.ID, Ordinal: 0,
+	}); !errors.Is(err, store.ErrDecisionExpired) {
+		t.Errorf("alice submitting to an expired decision returned %v, want ErrDecisionExpired", err)
+	}
+}
+
+// TestACounterpartyOfAChallengeThatNamesNobodyIsStillAdmitted is the other side
+// of the standing check, and the one that would break a challenge kind if it
+// were written the obvious way.
+//
+// An external challenge has no approver set: the party that completes it is a
+// system, arriving on the unauthenticated callback listener as a workload
+// principal that is neither the decision's creator nor anybody's target. A
+// standing rule that only asked "is this caller a target" would refuse every
+// callback before the handler could check the credential that authenticates it,
+// and the challenge kind would simply stop working.
+func TestACounterpartyOfAChallengeThatNamesNobodyIsStillAdmitted(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		policies:        []*policy.Policy{externallyGatedPolicy("screened-transfer")},
+		externalHandler: &externalHandler{},
+	})
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if !res.Pending() {
+		t.Fatalf("the decision is %s, want it pending on its external challenge", res.State)
+	}
+
+	// The callback principal the callback surface submits as: a workload, named
+	// by nothing on this decision.
+	out, err := h.svc.Submit(ctx, decision.Submission{
+		Caller:     workload("external-callback"),
+		DecisionID: res.ID,
+		Ordinal:    0,
+		Payload:    json.RawMessage(`{"nonce": "nonce-external-0f0f"}`),
+	})
+	if err != nil {
+		t.Fatalf("the callback was refused before its handler saw it: %v", err)
+	}
+	if out.State != store.DecisionAllowed {
+		t.Errorf("the decision is %s after its challenge was satisfied, want allowed", out.State)
+	}
+
+	// A console credential is not that counterparty. It is refused here rather
+	// than left to the handler, because the handler's refusal would arrive after
+	// the state checks and hand a person the 409s an external challenge has no
+	// reason to show anyone.
+	second, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if _, err := h.svc.Submit(ctx, decision.Submission{
+		Caller:     user("mallory"),
+		DecisionID: second.ID,
+		Ordinal:    0,
+		Payload:    json.RawMessage(`{"nonce": "nonce-external-0f0f"}`),
+	}); !errors.Is(err, decision.ErrNotAuthorized) {
+		t.Errorf("a person completing an external challenge returned %v, want ErrNotAuthorized", err)
 	}
 }
 
@@ -717,6 +861,550 @@ func TestAHandlerThatPublishesNothingDoesNotBreakTheView(t *testing.T) {
 	if got := byKind[policy.ChallengeQuorum]; got.Need != 1 {
 		t.Errorf("the quorum challenge lost its progress counts: %+v", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the ground a shed challenge denies on (#40, the half U4 could not reach)
+// ---------------------------------------------------------------------------
+
+// U4 gave the challenge-issuance limit a word of its own — `issue_rate_limited`
+// — but that word lives on the challenge row, and the decision it denied still
+// reported `challenge_failed`: the same word a step-up the subject rejected
+// produces. An operator watching denies could not tell "the person refused" from
+// "we never asked", and those call for opposite responses.
+//
+// So the assertion is a separation, not an equality. The ground of a decision
+// denied by a shed issuance has to differ from all four of the other ways a
+// decide can come back denied.
+func TestAShedChallengeDeniesOnItsOwnGround(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:        time.Hour,
+		policies:   []*policy.Policy{mfaPolicy("step-up")},
+		mfaHandler: &refusingStepUpHandler{shed: true},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if res.State != store.DecisionDenied {
+		t.Fatalf("a decision whose only challenge was shed is %q, want denied", res.State)
+	}
+	if res.Reason != decision.ReasonChallengeRateLimited {
+		t.Fatalf("reason = %q, want %q", res.Reason, decision.ReasonChallengeRateLimited)
+	}
+	for name, other := range map[string]engine.Reason{
+		"a challenge that was answered and not met": decision.ReasonChallengeFailed,
+		"the outstanding-decision cap":              decision.ReasonOutstandingCap,
+		"the decide surface's own rate limit":       decision.ReasonRateLimited,
+		"a policy that matched nothing":             engine.ReasonNoMatchingPolicy,
+		"a policy whose condition was not met":      engine.ReasonConditionNotMet,
+	} {
+		if res.Reason == other {
+			t.Errorf("a shed issuance is reported as %s (%q)", name, other)
+		}
+	}
+}
+
+// TestAShedIssuanceIsARetryableRefusalAndNotARecordedDeny is the half of #40's
+// follow-up that removes the harm.
+//
+// The ground was already right; where it was written was not. A shed issuance
+// used to be stored as a failed challenge, which the lifecycle resolved into a
+// denied decision — so a person whose step-up budget somebody else was holding
+// empty accumulated `denied / challenge_rate_limited` decisions on their own
+// history, one for every legitimate authorization they tried to get. A limit
+// that sheds load was writing judgements about people.
+//
+// So the answer takes the shape the surface's own shed answer takes: a deny with
+// no decision object, a ground that names the limit, a wait, and nothing on the
+// subject's record beyond the refusal audit every refusal already leaves.
+func TestAShedIssuanceIsARetryableRefusalAndNotARecordedDeny(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:        time.Hour,
+		policies:   []*policy.Policy{mfaPolicy("step-up")},
+		mfaHandler: &refusingStepUpHandler{shed: true},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if res.State != store.DecisionDenied || res.Reason != decision.ReasonChallengeRateLimited {
+		t.Fatalf("a shed issuance answered %q/%q, want denied/%q",
+			res.State, res.Reason, decision.ReasonChallengeRateLimited)
+	}
+
+	// No decision object at all — the identifier is the thing a caller follows,
+	// and there has to be nothing to follow.
+	if res.ID != "" {
+		t.Errorf("a shed issuance created decision %q", res.ID)
+	}
+	if got := countDecisions(t, h); got != 0 {
+		t.Errorf("the decisions table holds %d rows after a shed issuance, want 0", got)
+	}
+
+	// And nothing on the subject's history. This is the assertion the whole
+	// change is for: the person nobody was asked about must not be carrying a
+	// decision that says they were refused.
+	if got := decisionsFor(t, h, "u1"); got != 0 {
+		t.Errorf("subject u1 holds %d decisions after an issuance that was shed at them, want 0", got)
+	}
+
+	// The wait comes from the handler, because the handler owns the budget that
+	// refused. A refusal with no wait is one a caller can only respond to by
+	// guessing.
+	if res.RetryAfter != refusedIssueRetryAfter {
+		t.Errorf("retry-after = %s, want %s — the interval the handler that shed it reported",
+			res.RetryAfter, refusedIssueRetryAfter)
+	}
+
+	// The refusal is still audited. R43 wants the refusal itself on the record,
+	// and a refusal that leaves no trace is indistinguishable from a request
+	// nobody made — the trace just is not a judgement about the person.
+	if got := refusalsFor(t, h, "u1"); got != 1 {
+		t.Errorf("the audit chain holds %d refusal entries for u1, want 1", got)
+	}
+}
+
+// A deny that is a judgement carries no wait. Inviting a retry against a policy
+// deny or the outstanding cap would be inviting a caller to be refused
+// identically, at a cadence this deployment picked for a different reason.
+func TestOnlyAShedRefusalCarriesAWait(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		maxOutstanding: 1,
+		ttl:            time.Hour,
+		policies:       []*policy.Policy{gatedPolicy("wire-transfer", 2, "alice", "bob")},
+	})
+
+	if _, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"), Input: transferRequest("u1"),
+	}); err != nil {
+		t.Fatalf("first decide: %v", err)
+	}
+	capped, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"), Input: transferRequest("u1"),
+	})
+	if err != nil {
+		t.Fatalf("decide at the cap: %v", err)
+	}
+	if capped.Reason != decision.ReasonOutstandingCap {
+		t.Fatalf("reason = %q, want %q", capped.Reason, decision.ReasonOutstandingCap)
+	}
+	if capped.RetryAfter != 0 {
+		t.Errorf("the outstanding cap carried a wait of %s: what clears it is another decision "+
+			"closing, not a timer", capped.RetryAfter)
+	}
+
+	denied, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"),
+		Input:  engine.Input{Action: "transfer", Subject: engine.Entity{Type: "user", ID: "u9"}},
+	})
+	if err != nil {
+		t.Fatalf("decide with no matching policy: %v", err)
+	}
+	if denied.RetryAfter != 0 {
+		t.Errorf("a policy deny carried a wait of %s: retrying it answers the same forever",
+			denied.RetryAfter)
+	}
+}
+
+// decisionsFor counts the decisions a subject holds, which is the thing a person
+// carries and the thing a shed issuance must not add to.
+func decisionsFor(t *testing.T, h *harness, subjectID string) int {
+	t.Helper()
+	var n int
+	if err := h.store.Pool().QueryRow(context.Background(),
+		`SELECT count(*) FROM decisions WHERE subject_id = $1`, subjectID).Scan(&n); err != nil {
+		t.Fatalf("count decisions for %q: %v", subjectID, err)
+	}
+	return n
+}
+
+// refusalsFor counts the refusal entries the audit chain holds for a subject.
+func refusalsFor(t *testing.T, h *harness, subjectID string) int {
+	t.Helper()
+	var n int
+	if err := h.store.Pool().QueryRow(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE kind = $1 AND subject = $2`,
+		decision.AuditKindDecisionRefused, subjectID).Scan(&n); err != nil {
+		t.Fatalf("count refusals for %q: %v", subjectID, err)
+	}
+	return n
+}
+
+// The other half of the separation: a challenge that failed for any reason other
+// than being shed still denies on the old ground. The bit is one bit and it is
+// not set by "failed".
+func TestAChallengeThatFailedForAnotherReasonStillSaysChallengeFailed(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:        time.Hour,
+		policies:   []*policy.Policy{mfaPolicy("step-up")},
+		mfaHandler: &refusingStepUpHandler{shed: false},
+	})
+
+	res, err := h.svc.Decide(ctx, decision.Request{Caller: workload("payments"), Input: transferRequest("u1")})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if res.State != store.DecisionDenied {
+		t.Fatalf("state = %q, want denied", res.State)
+	}
+	if res.Reason != decision.ReasonChallengeFailed {
+		t.Errorf("reason = %q, want %q", res.Reason, decision.ReasonChallengeFailed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// idempotent decide (#47(a))
+// ---------------------------------------------------------------------------
+
+// A client that times out and retries must not leave a decision nobody can name
+// behind, and — the part a unique index cannot deliver — must not push a second
+// prompt at the person.
+//
+// The issuance tally is the assertion that matters. Decide mints the identifier,
+// issues every challenge and only then writes the row, so a key enforced solely
+// as a uniqueness constraint at insert time would send the subject a second
+// step-up on every retry and refuse afterwards. That is why the lookup stands
+// ahead of the evaluation rather than beside the insert (KTD5).
+func TestARetriedDecideReturnsTheSameDecisionAndIssuesNoSecondChallenge(t *testing.T) {
+	ctx := context.Background()
+	issuer := &countingStepUpHandler{}
+	h := newHarness(t, harnessOptions{
+		ttl:        time.Hour,
+		policies:   []*policy.Policy{mfaPolicy("step-up")},
+		mfaHandler: issuer,
+	})
+
+	req := decision.Request{
+		Caller:         workload("payments"),
+		Input:          transferRequest("u1"),
+		IdempotencyKey: "transfer-9f3c",
+	}
+	first, err := h.svc.Decide(ctx, req)
+	if err != nil {
+		t.Fatalf("first decide: %v", err)
+	}
+	if first.ID == "" {
+		t.Fatal("the first decide created no decision")
+	}
+	if issuer.count() != 1 {
+		t.Fatalf("the first decide issued %d challenges, want 1", issuer.count())
+	}
+
+	second, err := h.svc.Decide(ctx, req)
+	if err != nil {
+		t.Fatalf("retried decide: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("the retry answered decision %q, want the first one %q", second.ID, first.ID)
+	}
+	if second.State != first.State {
+		t.Errorf("the retry reported state %q, want %q", second.State, first.State)
+	}
+	if issuer.count() != 1 {
+		t.Errorf("challenges issued after one retry = %d, want 1: the retry reached the IdP again",
+			issuer.count())
+	}
+	if got := countDecisions(t, h); got != 1 {
+		t.Errorf("the decisions table holds %d rows after one retry, want 1", got)
+	}
+	// The retry answers the decision as it stands, so the caller that lost the
+	// first response gets the same thing it would have got by reading the row.
+	if len(second.Challenges) != len(first.Challenges) {
+		t.Errorf("the retry reported %d challenges, want %d", len(second.Challenges), len(first.Challenges))
+	}
+}
+
+// A key names one request, and reusing it for another one is refused.
+//
+// This is the substitution the fingerprint exists to stop. Before it, the lookup
+// compared `(caller, key)` and nothing else, so a caller that reused `job-91`
+// for a different subject, resource or action was handed the first decision back
+// — `201`, `state: allowed` — and the PEP granted a transfer this engine never
+// evaluated. Nothing in decision.Result carries a subject, a resource or an
+// action, so the PEP had no field to notice the substitution in; the answer had
+// to change, not the fields.
+//
+// Both halves are asserted, and the second is the one that would have been easy
+// to get wrong: the refusal must not carry the first decision's identifier. A
+// 409 that still named the first decision would leave a caller holding an
+// identifier it may then read (R40) for an authorization it did not ask about.
+func TestAKeyReusedForADifferentRequestIsRefused(t *testing.T) {
+	ctx := context.Background()
+	issuer := &countingStepUpHandler{}
+	h := newHarness(t, harnessOptions{
+		ttl:        time.Hour,
+		policies:   []*policy.Policy{mfaPolicy("step-up")},
+		mfaHandler: issuer,
+	})
+
+	first, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"), Input: transferRequest("u1"), IdempotencyKey: "job-91",
+	})
+	if err != nil {
+		t.Fatalf("first decide: %v", err)
+	}
+	if first.ID == "" {
+		t.Fatal("the first decide created no decision")
+	}
+
+	// Same caller, same key, a different person. Everything else about the call
+	// is identical, so the only thing that can separate the two is the request.
+	second, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"), Input: transferRequest("u2"), IdempotencyKey: "job-91",
+	})
+	if !errors.Is(err, decision.ErrIdempotencyKeyReused) {
+		t.Fatalf("a key reused for a different subject returned (%+v, %v), want decision.ErrIdempotencyKeyReused",
+			second, err)
+	}
+	if second.ID != "" {
+		t.Errorf("the refusal named decision %q: a caller that asked about u2 was handed u1's decision", second.ID)
+	}
+	if issuer.count() != 1 {
+		t.Errorf("challenges issued = %d, want 1: the refused request reached the idp", issuer.count())
+	}
+	if got := countDecisions(t, h); got != 1 {
+		t.Errorf("the decisions table holds %d rows, want 1: a refused key wrote a decision", got)
+	}
+
+	// The three fields the fingerprint covers, one at a time, so that a digest
+	// that happened to cover only the subject would still be caught.
+	resource := transferRequest("u1")
+	resource.Resource.ID = "acct-2"
+	action := transferRequest("u1")
+	action.Action = "withdraw"
+	attribute := transferRequest("u1")
+	attribute.Resource.Attributes = map[string]any{"tier": "silver"}
+	for name, in := range map[string]engine.Input{
+		"a different resource":           resource,
+		"a different action":             action,
+		"a different resource attribute": attribute,
+	} {
+		res, err := h.svc.Decide(ctx, decision.Request{
+			Caller: workload("payments"), Input: in, IdempotencyKey: "job-91",
+		})
+		if !errors.Is(err, decision.ErrIdempotencyKeyReused) {
+			t.Errorf("%s under a spent key returned (%+v, %v), want decision.ErrIdempotencyKeyReused",
+				name, res, err)
+		}
+	}
+
+	// And the request the key does name is still answered exactly as it was: the
+	// fingerprint narrows what a key admits, it does not make a retry a new call.
+	retry, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"), Input: transferRequest("u1"), IdempotencyKey: "job-91",
+	})
+	if err != nil {
+		t.Fatalf("retry of the request the key names: %v", err)
+	}
+	if retry.ID != first.ID {
+		t.Errorf("the retry answered decision %q, want the first one %q", retry.ID, first.ID)
+	}
+	if issuer.count() != 1 {
+		t.Errorf("challenges issued = %d, want 1: the retry reached the idp again", issuer.count())
+	}
+}
+
+// The key is the caller's, not the deployment's. Two workloads that happen to
+// number their retries the same way are two callers, and one of them must not
+// receive the other's decision — which would hand it a decision identifier it
+// may then read (R40).
+func TestTheSameKeyFromADifferentCallerIsADifferentDecision(t *testing.T) {
+	ctx := context.Background()
+	issuer := &countingStepUpHandler{}
+	h := newHarness(t, harnessOptions{
+		ttl:        time.Hour,
+		policies:   []*policy.Policy{mfaPolicy("step-up")},
+		mfaHandler: issuer,
+	})
+
+	one, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"), Input: transferRequest("u1"), IdempotencyKey: "retry-1",
+	})
+	if err != nil {
+		t.Fatalf("decide as payments: %v", err)
+	}
+	two, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("ledger"), Input: transferRequest("u1"), IdempotencyKey: "retry-1",
+	})
+	if err != nil {
+		t.Fatalf("decide as ledger: %v", err)
+	}
+	if one.ID == two.ID {
+		t.Errorf("two callers sharing the key %q got one decision %q", "retry-1", one.ID)
+	}
+	if issuer.count() != 2 {
+		t.Errorf("challenges issued = %d, want 2: two callers are two decisions", issuer.count())
+	}
+	if got := countDecisions(t, h); got != 2 {
+		t.Errorf("the decisions table holds %d rows, want 2", got)
+	}
+}
+
+// A caller that names nothing is retrying nothing. Two identical calls with no
+// key are two decisions, exactly as they were before the key existed.
+func TestDecidesWithoutAKeyAreStillTwoDecisions(t *testing.T) {
+	ctx := context.Background()
+	issuer := &countingStepUpHandler{}
+	h := newHarness(t, harnessOptions{
+		ttl:        time.Hour,
+		policies:   []*policy.Policy{mfaPolicy("step-up")},
+		mfaHandler: issuer,
+	})
+
+	req := decision.Request{Caller: workload("payments"), Input: transferRequest("u1")}
+	one, err := h.svc.Decide(ctx, req)
+	if err != nil {
+		t.Fatalf("first decide: %v", err)
+	}
+	two, err := h.svc.Decide(ctx, req)
+	if err != nil {
+		t.Fatalf("second decide: %v", err)
+	}
+	if one.ID == two.ID {
+		t.Errorf("two keyless decides collapsed into decision %q", one.ID)
+	}
+	if issuer.count() != 2 {
+		t.Errorf("challenges issued = %d, want 2: a keyless decide opens its own challenge", issuer.count())
+	}
+	if got := countDecisions(t, h); got != 2 {
+		t.Errorf("the decisions table holds %d rows, want 2", got)
+	}
+}
+
+// The lookup ahead of the evaluation is what a retry hits; the unique index is
+// what a race hits. Two calls that both miss the lookup still converge on one
+// decision, because the second insert violates the index and the loser reads the
+// winner's row rather than reporting a conflict to a caller that did nothing
+// wrong.
+//
+// The second challenge issuance is not asserted away here, and that is honest:
+// in a true race both callers are already past the lookup and past the issue
+// loop before either row lands. The backstop bounds the damage to one extra
+// prompt in a genuine race, which is a different thing from one extra prompt on
+// every retry.
+func TestConcurrentDecidesUnderOneKeyConvergeOnOneDecision(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{
+		ttl:      time.Hour,
+		policies: []*policy.Policy{gatedPolicy("wire-transfer", 2, "alice", "bob")},
+	})
+
+	const racers = 4
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		ids     []string
+		errored []error
+	)
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			res, err := h.svc.Decide(ctx, decision.Request{
+				Caller: workload("payments"), Input: transferRequest("u1"), IdempotencyKey: "race-1",
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errored = append(errored, err)
+				return
+			}
+			ids = append(ids, res.ID)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for _, err := range errored {
+		t.Errorf("a racing decide failed rather than converging: %v", err)
+	}
+	if len(ids) != racers {
+		t.Fatalf("%d of %d racing decides answered", len(ids), racers)
+	}
+	for _, id := range ids {
+		if id != ids[0] {
+			t.Fatalf("racing decides answered %v, want one decision", ids)
+		}
+	}
+	if got := countDecisions(t, h); got != 1 {
+		t.Errorf("the decisions table holds %d rows after a race under one key, want 1", got)
+	}
+}
+
+// A conflicting insert is reported as [store.ErrConflict] and not as an opaque
+// database failure, on the precedent of approvals_unique_approver: the service
+// re-reads on it, and a driver error it could not classify would come back out
+// of decide as a 500 for what is a retry.
+func TestASecondDecisionUnderOneKeyIsAConflict(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, harnessOptions{ttl: time.Hour, policies: []*policy.Policy{openPolicy("read-only")}})
+
+	first, err := h.svc.Decide(ctx, decision.Request{
+		Caller: workload("payments"), Input: transferRequest("u1"), IdempotencyKey: "dup-1",
+	})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	stored, err := store.GetDecision(ctx, h.store.Pool(), first.ID)
+	if err != nil {
+		t.Fatalf("read decision: %v", err)
+	}
+
+	// The fingerprint the first decision froze, carried over verbatim: this test
+	// is about the index refusing a second row under one key, so the two rows
+	// have to agree about everything the index does not look at. A different
+	// fingerprint here would still conflict — the index is on (caller, key) —
+	// but it would be testing two things at once.
+	second := store.NewDecision{
+		CallerID:               stored.CallerID,
+		PolicyID:               stored.PolicyID,
+		PolicyVersion:          stored.PolicyVersion,
+		SubjectID:              stored.SubjectID,
+		ResourceID:             stored.ResourceID,
+		Action:                 stored.Action,
+		Request:                stored.Request,
+		FactSnapshot:           stored.FactSnapshot,
+		ExpiresAt:              stored.ExpiresAt,
+		IdempotencyKey:         "dup-1",
+		IdempotencyFingerprint: stored.IdempotencyFingerprint,
+	}
+	if second.IdempotencyFingerprint == "" {
+		t.Fatal("the first decision stored no fingerprint: a key with nothing to compare it against " +
+			"is the state that let one key answer for two different requests")
+	}
+	_, err = h.writer.CreateDecision(ctx, second)
+	if !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("a second decision under one key returned %v, want store.ErrConflict", err)
+	}
+
+	// And a key with no fingerprint is refused before it reaches the database.
+	// The store is the last writer that could produce a row the decide path's
+	// lookup cannot answer for, so it is the last place the pairing can be
+	// enforced in a message that names the field rather than the constraint.
+	unpaired := second
+	unpaired.IdempotencyKey = "dup-2"
+	unpaired.IdempotencyFingerprint = ""
+	if _, err := h.writer.CreateDecision(ctx, unpaired); err == nil {
+		t.Error("a decision with a key and no fingerprint was written")
+	}
+}
+
+func countDecisions(t *testing.T, h *harness) int {
+	t.Helper()
+	var n int
+	if err := h.store.Pool().QueryRow(context.Background(), `SELECT count(*) FROM decisions`).Scan(&n); err != nil {
+		t.Fatalf("count decisions: %v", err)
+	}
+	return n
 }
 
 // TestTheDecisionLayerKnowsAChallengeKindInOneKnownPlace is KTD1 as an

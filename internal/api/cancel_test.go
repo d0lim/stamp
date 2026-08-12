@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -139,15 +140,34 @@ func TestWorkloadCredentialCannotCancel(t *testing.T) {
 }
 
 // Somebody who does not hold the authority is told the same thing they would be
-// told about a decision that does not exist.
-func TestCancellationByANonAuthorityIsForbidden(t *testing.T) {
+// told about a decision that does not exist — and "the same thing" is the whole
+// response, not the same shape of one.
+//
+// The cancellation surface borrows the approval surface's table, so this is the
+// second place #38's answer had to hold. It matters here in its own right: a
+// cancellation authority is named by the policy, so telling a stranger "not you"
+// would confirm both that the decision exists and that it is waiting on
+// somebody.
+func TestCancellationByANonAuthorityIsIndistinguishableFromAMissingDecision(t *testing.T) {
 	t.Parallel()
-	f := newCancelFixture(t)
-	f.collector.submitErr = challenge.ErrNotTarget
 
-	rec := f.post(t, api.SurfaceConsole, cancelPath, f.idp.token(t, "mallory", "console"), "")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403", rec.Code)
+	cancel := func(t *testing.T, err error) *httptest.ResponseRecorder {
+		t.Helper()
+		f := newCancelFixture(t)
+		f.collector.submitErr = err
+		return f.post(t, api.SurfaceConsole, cancelPath, f.idp.token(t, "mallory", "console"), "")
+	}
+
+	base := cancel(t, store.ErrNotFound)
+	if base.Code != http.StatusNotFound {
+		t.Fatalf("a decision that does not exist = %d, want 404: %s", base.Code, base.Body.String())
+	}
+	refused := cancel(t, challenge.ErrNotTarget)
+	if refused.Code != base.Code {
+		t.Errorf("a non-authority = %d, a missing decision = %d", refused.Code, base.Code)
+	}
+	if !bytes.Equal(refused.Body.Bytes(), base.Body.Bytes()) {
+		t.Errorf("body\n got %q\nwant %q", refused.Body.String(), base.Body.String())
 	}
 }
 

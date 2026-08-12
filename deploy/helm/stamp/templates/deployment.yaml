@@ -1,5 +1,6 @@
 {{- $ctx := . -}}
 {{- include "stamp.checkpointsValidated" . -}}
+{{- include "stamp.callbackSurfaceValidated" . -}}
 {{- $tiers := include "stamp.tiers" . | fromYamlArray -}}
 {{- $cp := .Values.audit.checkpoint -}}
 {{/*
@@ -166,6 +167,19 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "stamp.fullname" $ctx }}-env
+          # /healthz is liveness and /readyz is readiness, and they are two
+          # endpoints because they have two remedies. /healthz asks whether the
+          # process is wedged — nothing it consults can be fixed by waiting, so
+          # a failure there means restart. /readyz asks whether a request routed
+          # here would work, which on this chart is mostly one question: has the
+          # database reached the schema this image's queries are written against?
+          # Only the api tier migrates, and `helm upgrade` rolls every Deployment
+          # at once, so a decide pod can be ahead of the schema for as long as
+          # the migration takes. Pointing readiness at /healthz — which is what
+          # this chart used to do — put that pod in its Service answering 42703;
+          # pointing liveness at /readyz would restart it instead of letting it
+          # wait. A rollout that stalls here is the gate working: `kubectl
+          # describe` on an unready pod prints the version it is waiting for.
           livenessProbe:
             httpGet:
               path: /healthz
@@ -174,7 +188,7 @@ spec:
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: {{ index $tier.surfaces 0 }}
             initialDelaySeconds: 2
             periodSeconds: 5

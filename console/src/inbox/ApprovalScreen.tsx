@@ -56,7 +56,68 @@ const NOT_COVERED = [
   '정책 버전 식별자 — 같은 이유로 제외됩니다.',
 ]
 
-/** R21's four submission failures, each with its own words and its own next step. */
+/**
+ * What the server says when a decision cannot be read or acted on, and it is
+ * not the reader's session that is the problem.
+ *
+ * The server answers this on every surface that acts on one named decision, and
+ * it answers the same bytes for "there is no such decision" and for "it is not
+ * yours" (#38). That is deliberate: two requests with one identifier would
+ * otherwise read the status code as an oracle for whether the identifier names
+ * anything, which is what R40 exists to prevent.
+ *
+ * So this screen does not know which of the two happened, and says so. The
+ * approver who was revised out of the set is the one who pays for that, and the
+ * next step points them at the place where they are told the truth: a list of
+ * what is waiting on you leaks nothing by leaving out what is not.
+ */
+const NOT_FOUND = {
+  text: '이 결정을 열 수 없습니다 — 존재하지 않거나, 당신에게 열려 있지 않습니다. 서버는 이 둘을 구분해 답하지 않습니다.',
+  next: '승인함 목록을 다시 읽으십시오. 승인자 집합이 개정으로 바뀌었더라도, 당신을 기다리는 결정은 그 목록에 남아 있습니다.',
+} as const
+
+/**
+ * The error code the approval budget refuses under (R43), as `internal/api/
+ * approvals.go` spells it.
+ *
+ * It is not in FAILURES because its next step carries a number the table cannot
+ * hold — see [rateLimited].
+ */
+const RATE_LIMITED = 'rate_limited'
+
+/**
+ * An approval refused by the per-approver budget, worded as the wait it is.
+ *
+ * This is the one failure on this screen that clears by itself. Everything else
+ * here is final for this submission — the decision expired, the quorum closed,
+ * the material moved — and the generic branch's advice to hand the decision
+ * identifier to an operator is right for those. For a limit it is the opposite
+ * of right: there is nothing for an operator to do, the budget refills on a
+ * timer measured in seconds, and an approver who escalates instead of waiting
+ * has stopped doing the one thing that would work. The server states the wait in
+ * `Retry-After` precisely so a console can say it.
+ *
+ * The approval was not recorded, and that is said outright. An approver who
+ * believes a refused submission might have landed either walks away from a
+ * quorum still one short, or waits for a state change that is not coming.
+ *
+ * Without a readable `Retry-After` the copy still stands, minus the number. The
+ * header can be missing for reasons that have nothing to do with this
+ * deployment's budget — a cross-origin response that does not expose it, an
+ * intermediary that dropped it — and "잠시" is honest where a fabricated
+ * countdown would not be.
+ */
+function rateLimited(seconds: number | undefined): { text: string; next: string } {
+  return {
+    text: '승인 제출이 너무 잦아 이번 제출이 거부되었습니다. 이 승인은 기록되지 않았습니다.',
+    next:
+      seconds === undefined
+        ? '잠시 기다린 뒤 승인 버튼을 다시 누르십시오. 운영자에게 알릴 일은 아닙니다 — 이 한도는 시간이 지나면 저절로 풀립니다.'
+        : `약 ${seconds}초 뒤에 승인 버튼을 다시 누르십시오. 운영자에게 알릴 일은 아닙니다 — 이 한도는 시간이 지나면 저절로 풀립니다.`,
+  }
+}
+
+/** R21's submission failures, each with its own words and its own next step. */
 const FAILURES: Readonly<Record<string, { readonly text: string; readonly next: string }>> = {
   expired: {
     text: '이 결정은 만료되었습니다. 승인은 기록되지 않았습니다.',
@@ -66,10 +127,10 @@ const FAILURES: Readonly<Record<string, { readonly text: string; readonly next: 
     text: '이 challenge는 더 이상 제출을 받지 않습니다 — 이미 정족수가 충족되었거나 결정이 종결되었습니다.',
     next: '아래의 수집 현황을 확인하십시오. 추가 승인은 필요하지 않습니다.',
   },
-  not_an_approver: {
-    text: '이 결정은 당신을 기다리고 있지 않습니다.',
-    next: '승인자 집합이 개정으로 바뀌었을 수 있습니다. 승인함 목록을 다시 읽으십시오.',
-  },
+  // Where `not_an_approver` used to be. The server no longer sends it: being
+  // outside the approver set, naming a challenge that is not there, and naming
+  // a decision that does not exist are one 404 with one body.
+  not_found: NOT_FOUND,
   material_changed: {
     text: '표시된 이후 결정 내용이 바뀌어 승인이 거부되었습니다 — 당신이 읽은 자료에 묶인 해시가 더 이상 유효하지 않습니다.',
     next: '화면을 다시 읽고 바뀐 자료를 처음부터 검토하십시오.',
@@ -82,7 +143,7 @@ export function ApprovalScreen() {
   const decisionID = params.decisionId ?? ''
   const ordinal = params.ordinal ?? '0'
 
-  const { review, error, reload } = useReview(api, decisionID, ordinal)
+  const { review, error, unavailable, reload } = useReview(api, decisionID, ordinal)
   const proposal = useProposal(api, review)
 
   return (
@@ -93,14 +154,19 @@ export function ApprovalScreen() {
         <Link to="/inbox">승인함으로 돌아가기</Link>
       </p>
 
-      {error === null ? null : (
+      {unavailable ? (
+        <div className="notice notice--warning" role="alert" data-testid="review-unavailable">
+          <p className="notice__text">{NOT_FOUND.text}</p>
+          <p>{NOT_FOUND.next}</p>
+        </div>
+      ) : error === null ? null : (
         <p className="notice notice--warning" role="alert" data-testid="review-error">
           승인 자료를 읽지 못했습니다: {error}
         </p>
       )}
 
       {review === null ? (
-        <p>승인 자료를 읽는 중입니다…</p>
+        unavailable ? null : <p>승인 자료를 읽는 중입니다…</p>
       ) : (
         <ReviewBody
           api={api}
@@ -119,6 +185,11 @@ export function ApprovalScreen() {
 function useReview(api: ApiClient, decisionID: string, ordinal: string) {
   const [review, setReview] = useState<QuorumReview | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Kept apart from `error` because it is not one: the read succeeded and the
+  // answer was that there is nothing here for this reader. It gets the refusal
+  // the server can no longer word for us, rather than "읽지 못했습니다: 대상을
+  // 찾을 수 없습니다", which reads like an outage.
+  const [unavailable, setUnavailable] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -128,8 +199,23 @@ function useReview(api: ApiClient, decisionID: string, ordinal: string) {
         }),
       )
       setError(null)
+      setUnavailable(false)
     } catch (cause) {
       if (cause instanceof ApiError && cause.isUnauthenticated) return
+      // The body goes with the failure. This screen polls, so a read that stops
+      // working leaves the last successful one behind — and the last successful
+      // one is a fully drawn review with a live submit panel underneath a notice
+      // saying the decision cannot be opened. An approver reading that has been
+      // shown material the server has just refused to stand behind, next to a
+      // button that would submit against it. The audit detail screen clears its
+      // body for the same reason; this is the same rule.
+      //
+      // A 401 is the one failure that does not clear, and the early return above
+      // is why: the session is being refreshed, the material is still the
+      // material, and blanking the screen on every token expiry would be a
+      // flicker rather than a refusal.
+      setReview(null)
+      setUnavailable(cause instanceof ApiError && cause.isNotFound)
       setError(describe(cause))
     }
   }, [api, decisionID, ordinal])
@@ -140,7 +226,7 @@ function useReview(api: ApiClient, decisionID: string, ordinal: string) {
     return () => clearInterval(timer)
   }, [load])
 
-  return { review, error, reload: load }
+  return { review, error, unavailable, reload: load }
 }
 
 /**
@@ -488,12 +574,27 @@ function SubmitPanel({
   )
 }
 
-/** Maps a submission failure to R21's four screens. */
+/**
+ * Maps a submission failure to the screen that words it.
+ *
+ * The 404 is matched on the status as well as on the code, because it is the
+ * one failure here that the console can meet without a body it understands —
+ * an identifier that never named anything answers it too.
+ */
 export function failureOf(cause: unknown): { text: string; next: string } {
   if (cause instanceof ApiError) {
     const body = cause.body as { error?: string; message?: string } | undefined
+    // Before the table, because the words depend on a value the table cannot
+    // hold: how long to wait. Matched on the status as well as on the code for
+    // the reason the 404 below is — a 429 from anything between the console and
+    // the engine is still a limit, and telling an approver to escalate one is
+    // the worst answer available.
+    if (cause.isRateLimited || body?.error === RATE_LIMITED) {
+      return rateLimited(cause.retryAfterSeconds)
+    }
     const known = body?.error === undefined ? undefined : FAILURES[body.error]
     if (known) return known
+    if (cause.isNotFound) return NOT_FOUND
     return {
       text: body?.message !== undefined && body.message !== '' ? body.message : cause.message,
       next: '문제가 계속되면 운영자에게 이 화면의 결정 식별자를 전달하십시오.',

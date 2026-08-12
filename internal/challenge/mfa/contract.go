@@ -243,6 +243,16 @@ type Detail struct {
 	// correlator.
 	ConsumedAt *time.Time `json:"consumed_at,omitempty"`
 	ConsumedBy string     `json:"consumed_by,omitempty"`
+	// Failure is why no challenge was opened, from the closed vocabulary in
+	// delegated.go, and empty for every challenge that was.
+	//
+	// It is the field [Delegated.Status] reads to keep a refused issue refused:
+	// the lifecycle stores every challenge pending and asks Status afterwards, so
+	// a refusal that lived only in Issue's return value would leave the challenge
+	// open. A detail carrying it is a challenge that never existed — no
+	// correlator, no transport, nothing to complete — and every path that takes
+	// evidence refuses it.
+	Failure string `json:"failure,omitempty"`
 }
 
 // Consumed reports whether the correlator has been spent.
@@ -507,6 +517,15 @@ func DecodeDetail(raw json.RawMessage) (Detail, error) {
 	var detail Detail
 	if err := json.Unmarshal(raw, &detail); err != nil {
 		return Detail{}, fmt.Errorf("%w: mfa detail: %w", challenge.ErrInvalidPayload, err)
+	}
+	// A detail that names a failure is a challenge that never opened: the refusal
+	// happened before a correlator was minted and before a transport was chosen,
+	// so the two checks below are asking after fields that do not exist. It is
+	// readable rather than rejected because [Delegated.Status] has to read it to
+	// keep the challenge failed, and it is fail-closed anyway — Submit and Redeem
+	// refuse it on sight, so the relaxation admits nothing.
+	if detail.Failure != "" {
+		return detail, nil
 	}
 	if detail.Correlator == "" {
 		return Detail{}, fmt.Errorf("%w: mfa detail carries no correlator", challenge.ErrInvalidPayload)

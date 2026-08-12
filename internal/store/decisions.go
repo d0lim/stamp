@@ -85,6 +85,26 @@ type Decision struct {
 	NextDeadline     *time.Time
 	NextDeadlineKind DeadlineKind
 	ResolvedAt       *time.Time
+	// IdempotencyKey is the caller's name for the decide attempt that created
+	// this decision, empty for a decision created by an attempt that named
+	// none. It is read back so that the row can say who it already answers for:
+	// the uniqueness that makes a retry safe is on (caller_id, this), and a
+	// column the code cannot see is a column the code cannot check.
+	IdempotencyKey string
+
+	// IdempotencyFingerprint is the digest of the request this decision froze,
+	// and it is what makes the key above safe to answer from.
+	//
+	// The key alone says which *attempt* a caller is asking after; it says
+	// nothing about what that attempt was for. A caller reusing one key for a
+	// different subject, resource or action was handed the first decision back —
+	// an allow for an authorization the engine never evaluated — and nothing on
+	// the answer let it notice. So the key is only honoured when this matches,
+	// and decision.requestFingerprint is the one thing that computes it.
+	//
+	// It is NULL exactly when IdempotencyKey is NULL, enforced by a CHECK in
+	// migration 000008 rather than by every writer remembering.
+	IdempotencyFingerprint string
 }
 
 // Expired reports whether the decision's own deadline has passed. It reads
@@ -126,6 +146,13 @@ type NewDecision struct {
 	Obligations   any
 	ExpiresAt     time.Time
 	Challenges    []NewChallenge
+	// IdempotencyKey is the caller's name for the attempt that produced this
+	// decision, or empty for a decision nobody named.
+	IdempotencyKey string
+	// IdempotencyFingerprint is the digest of the request the attempt named.
+	// Required whenever IdempotencyKey is set and refused otherwise — a key
+	// without one is a key nothing can safely be answered from.
+	IdempotencyFingerprint string
 }
 
 // NewDecisionID returns a random UUIDv4 in string form.
@@ -154,6 +181,18 @@ func (w *AuditWriter) CreateDecision(ctx context.Context, in NewDecision) (Decis
 	}
 	if in.ExpiresAt.IsZero() {
 		return Decision{}, errors.New("store: a decision must have an expires_at")
+	}
+	// Refused here as well as by the CHECK, because the two refusals are read by
+	// different people. The constraint is what makes the invariant true of the
+	// table for every writer that will ever exist; this is what tells the one
+	// writing Go which field they left out, instead of a 23514 naming a
+	// constraint they have never heard of.
+	if (in.IdempotencyKey == "") != (in.IdempotencyFingerprint == "") {
+		return Decision{}, fmt.Errorf(
+			"store: a decision's idempotency key and fingerprint are set together or not at all "+
+				"(key %q, fingerprint %q): a key with no fingerprint names an attempt but not what it was for, "+
+				"which is what let one key answer for two different requests",
+			in.IdempotencyKey, in.IdempotencyFingerprint)
 	}
 	id := in.ID
 	if id == "" {
@@ -195,20 +234,36 @@ func (w *AuditWriter) CreateDecision(ctx context.Context, in NewDecision) (Decis
 		ExpiresAt:        expiresAt,
 		NextDeadline:     deadline,
 		NextDeadlineKind: kind,
+
+		IdempotencyKey:         in.IdempotencyKey,
+		IdempotencyFingerprint: in.IdempotencyFingerprint,
 	}
 
 	err = w.InTx(ctx, func(ctx context.Context, tx pgx.Tx, ap *Appender) error {
 		insertErr := tx.QueryRow(ctx, `
 			INSERT INTO decisions
 				(id, caller_id, policy_id, policy_version, subject_id, resource_id, action,
-				 request, fact_snapshot, obligations, state, expires_at, next_deadline, next_deadline_kind)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+				 request, fact_snapshot, obligations, state, expires_at, next_deadline, next_deadline_kind,
+				 idempotency_key, idempotency_fingerprint)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 			RETURNING created_at, updated_at`,
 			out.ID, out.CallerID, out.PolicyID, out.PolicyVersion, out.SubjectID, out.ResourceID,
 			out.Action, []byte(out.Request), []byte(out.FactSnapshot), []byte(out.Obligations),
 			string(out.State), out.ExpiresAt, out.NextDeadline, nullableKind(out.NextDeadlineKind),
+			nullableText(out.IdempotencyKey), nullableText(out.IdempotencyFingerprint),
 		).Scan(&out.CreatedAt, &out.UpdatedAt)
 		if insertErr != nil {
+			// Both conflicts are ErrConflict and they are told apart in the
+			// message rather than in the sentinel, because the caller acts the
+			// same way on either: re-read and see what is already there. The
+			// constraint name is what separates them, and it is read rather than
+			// guessed from the fields — an identifier collision and a repeated
+			// key are one SQLSTATE, and naming the wrong one in a log is how an
+			// operator spends an afternoon on the wrong hypothesis.
+			if isUniqueViolationOn(insertErr, "decisions_unique_idempotency_key") {
+				return fmt.Errorf("store: caller %q already holds a decision under key %q: %w",
+					out.CallerID, out.IdempotencyKey, ErrConflict)
+			}
 			if isUniqueViolation(insertErr) {
 				return fmt.Errorf("store: decision %q already exists: %w", out.ID, ErrConflict)
 			}
@@ -295,9 +350,21 @@ func nullableKind(k DeadlineKind) *string {
 	return &s
 }
 
+// nullableText writes an absent string as SQL NULL rather than as the empty
+// string. The distinction is load-bearing for idempotency_key: the unique index
+// is partial on `IS NOT NULL`, so a decision nobody named has to arrive as NULL
+// or every keyless decide by one caller would collide with every other.
+func nullableText(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 const decisionColumns = `id, caller_id, policy_id, policy_version, subject_id, resource_id, action,
 	request::text, fact_snapshot::text, obligations::text, state, created_at, updated_at,
-	expires_at, next_deadline, next_deadline_kind, resolved_at`
+	expires_at, next_deadline, next_deadline_kind, resolved_at, idempotency_key,
+	idempotency_fingerprint`
 
 // GetDecision reads a decision by identifier. It reports the row as stored and
 // makes no judgement about deadlines.
@@ -305,14 +372,40 @@ func GetDecision(ctx context.Context, q Querier, id string) (Decision, error) {
 	return scanDecision(q.QueryRow(ctx, `SELECT `+decisionColumns+` FROM decisions WHERE id = $1`, id))
 }
 
+// DecisionByIdempotencyKey reads the decision a caller already created under a
+// key, or ErrNotFound when it created none.
+//
+// It is scoped to the caller for the reason the index is: the key is a name the
+// caller chose for its own attempt, not a coordinate in a namespace it shares
+// with every other workload. An unscoped lookup would let one workload's
+// "retry-1" answer another's, which is a decision identifier crossing a trust
+// boundary — and R40 makes that identifier readable.
+//
+// The row is returned whatever state it is in, including expired. A retry asking
+// after an attempt whose decision has since expired is entitled to that answer:
+// it names the thing it created, and creating a second decision because the
+// first one is over is exactly the orphan this is here to prevent.
+func DecisionByIdempotencyKey(ctx context.Context, q Querier, callerID, key string) (Decision, error) {
+	if key == "" {
+		return Decision{}, ErrNotFound
+	}
+	return scanDecision(q.QueryRow(ctx, `SELECT `+decisionColumns+`
+		FROM decisions WHERE caller_id = $1 AND idempotency_key = $2`, callerID, key))
+}
+
 // ActiveDecision reads a decision and refuses it if its own deadline has
 // passed.
 //
 // The expiry test is `expires_at <= now`. next_deadline is not consulted, and
 // that is the whole point of the column split: a decision holding a delay timer
-// in next_deadline is still active, and every entry point that asks this
-// question — status reads, approval submission, transition functions — gets the
-// same answer because they all ask it here.
+// in next_deadline is still active.
+//
+// This is the read-and-test shape, for a caller that has no reason to hold the
+// row when the answer is "expired". A caller that has to see the row first — the
+// submission and review paths settle the caller's standing before they judge
+// anything about the decision's state (#38) — reads it with GetDecision and
+// applies [EnsureActive], which is the same test and the same sentence. Two
+// shapes, one rule, so that every entry point still gets the same answer.
 func (s *Store) ActiveDecision(ctx context.Context, id string) (Decision, error) {
 	return ActiveDecisionTx(ctx, s.pool, id, s.Now())
 }
@@ -324,10 +417,28 @@ func ActiveDecisionTx(ctx context.Context, q Querier, id string, now time.Time) 
 	if err != nil {
 		return Decision{}, err
 	}
-	if d.Expired(now) {
-		return d, fmt.Errorf("store: decision %q expired at %s: %w", id, d.ExpiresAt, ErrDecisionExpired)
+	if err := EnsureActive(d, now); err != nil {
+		return d, err
 	}
 	return d, nil
+}
+
+// EnsureActive is the expiry half of [ActiveDecisionTx], applied to a row the
+// caller already has.
+//
+// It exists because two paths have to read a decision *before* they may judge
+// its state: an approval submission and the approval screen's read both settle
+// whether the caller has any standing first, so that a caller with none cannot
+// tell a decision that expired from one that never existed (#38). Reading the
+// row again through ActiveDecisionTx to get the deadline tested would be a
+// second query for a row already in hand, and — the part that matters — a second
+// place the rule "expired means expires_at is not in the future" is written
+// down. It is written here, once, and ActiveDecisionTx is its first caller.
+func EnsureActive(d Decision, now time.Time) error {
+	if d.Expired(now) {
+		return fmt.Errorf("store: decision %q expired at %s: %w", d.ID, d.ExpiresAt, ErrDecisionExpired)
+	}
+	return nil
 }
 
 // ChallengeProgressFor reads the challenge rows of a decision, ordered by
@@ -543,10 +654,12 @@ func scanDecision(row pgx.Row) (Decision, error) {
 		obligations string
 		state       string
 		kind        *string
+		key         *string
+		fingerprint *string
 	)
 	err := row.Scan(&d.ID, &d.CallerID, &d.PolicyID, &d.PolicyVersion, &d.SubjectID, &d.ResourceID,
 		&d.Action, &request, &facts, &obligations, &state, &d.CreatedAt, &d.UpdatedAt,
-		&d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt)
+		&d.ExpiresAt, &d.NextDeadline, &kind, &d.ResolvedAt, &key, &fingerprint)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Decision{}, ErrNotFound
 	}
@@ -559,6 +672,12 @@ func scanDecision(row pgx.Row) (Decision, error) {
 	d.State = DecisionState(state)
 	if kind != nil {
 		d.NextDeadlineKind = DeadlineKind(*kind)
+	}
+	if key != nil {
+		d.IdempotencyKey = *key
+	}
+	if fingerprint != nil {
+		d.IdempotencyFingerprint = *fingerprint
 	}
 	d.CreatedAt = d.CreatedAt.UTC()
 	d.UpdatedAt = d.UpdatedAt.UTC()

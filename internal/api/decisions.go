@@ -36,11 +36,11 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/d0lim/stamp/internal/challenge"
 	"github.com/d0lim/stamp/internal/decision"
-	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
 	"github.com/d0lim/stamp/internal/store"
@@ -60,6 +60,23 @@ const (
 	DecisionReadPattern = "GET " + DecisionsPath + "/{id}"
 )
 
+// CodeNotInstalled is the `error` code for the one server state several
+// surfaces have to describe: this deployment holds no policy set yet.
+//
+// It is a constant because it was two words before it was one. decide answered
+// `policy_set_stale` and the policy surface answered `not_installed`, which made
+// one state two states to anyone writing a client against both — and the split
+// happened by each handler reaching for whatever word was nearest, which is what
+// a shared name prevents from happening again.
+//
+// `error` and `reason` are different vocabularies and this is why they must not
+// be confused: engine.ReasonPolicySetStale is the ground a *decision* was
+// reached on, carried inside a decision object that exists. This is what a
+// surface says when it produced no decision at all. A client reading the two as
+// one word would treat "no answer" and "answered, on this ground" as the same
+// event.
+const CodeNotInstalled = "not_installed"
+
 // DefaultMaxDecisionTTL bounds the lifetime a caller may ask for.
 //
 // The cap is not about the request body's size but about what a request can
@@ -69,6 +86,42 @@ const (
 // less — a decision that expires at a different time than the caller was told
 // is worse than a decision that was not created.
 const DefaultMaxDecisionTTL = 24 * time.Hour
+
+// IdempotencyKeyHeader is where a PEP names the decide attempt it is making, so
+// that a retry of that attempt answers with the decision the attempt created
+// rather than creating a second one (#47(a)).
+//
+// It is a header rather than a body field, and the choice is not arbitrary: the
+// decide body is the AuthZEN evaluation request plus `ttl`, and it is that shape
+// so a PEP can send one value to both `POST /decisions` and
+// `POST /access/v1/evaluation` (KTD1). A retry name is a property of the HTTP
+// attempt and not of the access request being judged — check has no decisions to
+// deduplicate — so putting it in the body would put a field into the shared shape
+// that only one of the two endpoints reads. The name is the one the industry
+// already uses for this, so a client library that has an idempotency setting can
+// be pointed at this endpoint without a translation layer.
+const IdempotencyKeyHeader = "Idempotency-Key"
+
+// MaxIdempotencyKeyBytes bounds a key. It is a caller-chosen string that lands
+// in a column and an index, so it is bounded here and again by a CHECK in
+// migration 000008 — a bound that lives only at the surface is a bound that the
+// next write path does not have.
+const MaxIdempotencyKeyBytes = 255
+
+// CodeIdempotencyKeyReused is the `error` code for a key the caller has already
+// used for a different request.
+//
+// It is its own word rather than a reuse of `invalid_request`, because the two
+// call for opposite responses from a client: `invalid_request` means fix the
+// request and send it again, and this one means the request is fine and the name
+// is spent — send it under a new key. A client that read them as one word would
+// retry the same key forever.
+//
+// It is deliberately not `expired` or `not_collecting`, the console's two 409s.
+// Those are about a decision's state and are only shown to a caller with
+// standing on it; this one is about the caller's own key namespace and says
+// nothing about any decision.
+const CodeIdempotencyKeyReused = "idempotency_key_reused"
 
 // DecisionCreator creates decisions.
 //
@@ -131,10 +184,13 @@ type DecisionsConfig struct {
 	// which is how an operator says they mean it.
 	Rate        stream.RateLimit
 	SubjectRate stream.RateLimit
-	// MaxRateEntries bounds the limiter's table. Zero selects
-	// [stream.DefaultMaxRateEntries]. It is not on the deployment surface: it is
-	// a memory bound rather than a policy, and the sweep-or-refuse behaviour when
-	// it fills is what makes leaving it alone safe.
+	// MaxRateEntries bounds each of the limiter's two tables — the caller
+	// budget's and the subject budget's — rather than a total shared between
+	// them, so the configured number is what either namespace may hold and the
+	// memory cost is twice it. Zero selects [stream.DefaultMaxRateEntries]. It is
+	// not on the deployment surface: it is a memory bound rather than a policy,
+	// and the sweep-or-refuse behaviour when it fills is what makes leaving it
+	// alone safe.
 	MaxRateEntries int
 	// Now overrides the clock, for tests.
 	Now func() time.Time
@@ -272,6 +328,17 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A key that this deployment cannot store is refused rather than dropped. A
+	// caller that sent one believes its retries are safe, and silently ignoring
+	// the header would leave it believing that while every retry opened another
+	// decision — the failure it asked to be protected from, arriving without a
+	// word.
+	key, err := idempotencyKey(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
 	schema := d.schemas.Schema()
 	if schema == nil {
 		// An instance with no policy set cannot judge, and unlike the check
@@ -279,7 +346,13 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		// carry a deny with a reason, but a decision object that was never
 		// created and never audited would be a record of something that did not
 		// happen. So this is a refusal with a status, not a decision.
-		writeError(w, http.StatusServiceUnavailable, string(engine.ReasonPolicySetStale),
+		//
+		// And because it is a refusal rather than a decision, the code is
+		// [CodeNotInstalled] and not the engine's reason for the same state.
+		// This once answered `policy_set_stale`, which is what a *decision*
+		// carries as its ground; borrowing it here made one server state look
+		// like two to a client that also reads the policy surface.
+		writeError(w, http.StatusServiceUnavailable, CodeNotInstalled,
 			"this instance holds no policy set yet")
 		return
 	}
@@ -289,7 +362,9 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := d.decisions.Decide(r.Context(), decision.Request{Caller: caller, Input: in, TTL: ttl})
+	result, err := d.decisions.Decide(r.Context(), decision.Request{
+		Caller: caller, Input: in, TTL: ttl, IdempotencyKey: key,
+	})
 	if err != nil {
 		status, code, message := decisionError(err)
 		writeError(w, status, code, message)
@@ -300,6 +375,16 @@ func (d *Decisions) create(w http.ResponseWriter, r *http.Request) {
 		// to — and the service has already recorded it in the audit chain. The
 		// response says exactly that: a denied state, its ground, and no
 		// identifier to follow, because there is nothing to follow.
+		//
+		// A deny the lifecycle shed carries the wait it asked for, rendered by
+		// the same function the surface's own budget uses so that one client
+		// reads one number in one unit. Every other deny leaves the header off:
+		// a policy deny and the outstanding cap do not clear on a timer, and
+		// inviting a retry against either is inviting a caller to be refused
+		// identically at a cadence this deployment chose.
+		if result.RetryAfter > 0 {
+			w.Header().Set(RetryAfterHeader, strconv.Itoa(retryAfterSecondsFor(result.RetryAfter)))
+		}
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
@@ -349,6 +434,33 @@ func (req DecisionRequest) ttl(maxTTL time.Duration) (time.Duration, error) {
 	return d, nil
 }
 
+// idempotencyKey reads and validates the retry name a request carries. An absent
+// header is the empty string and no error: a caller that names nothing is
+// retrying nothing, and every caller did that before this header existed.
+//
+// The accepted shape is deliberately narrow — printable, no spaces, bounded —
+// because the value is chosen by the caller and ends up in an index, in error
+// messages and in an audit trail an operator reads. A key is an opaque token the
+// caller generates, so nothing legitimate needs a control character in it, and
+// refusing them here is cheaper than discovering later which log line was
+// forged. Whitespace is refused rather than trimmed: `"k"` and `"k "` would
+// otherwise be one key on the way in and two keys in anything that echoed them.
+func idempotencyKey(r *http.Request) (string, error) {
+	key := r.Header.Get(IdempotencyKeyHeader)
+	if key == "" {
+		return "", nil
+	}
+	if len(key) > MaxIdempotencyKeyBytes {
+		return "", fmt.Errorf("%s is longer than %d bytes", IdempotencyKeyHeader, MaxIdempotencyKeyBytes)
+	}
+	for i := 0; i < len(key); i++ {
+		if c := key[i]; c <= ' ' || c > '~' {
+			return "", fmt.Errorf("%s must be printable ascii without spaces", IdempotencyKeyHeader)
+		}
+	}
+	return key, nil
+}
+
 // decodeDecisionRequest reads the decide body, bounded, and holds it to the same
 // shape the check surface holds an evaluation request to.
 func decodeDecisionRequest(w http.ResponseWriter, r *http.Request, maxBytes int64) (DecisionRequest, error) {
@@ -365,18 +477,48 @@ func decodeDecisionRequest(w http.ResponseWriter, r *http.Request, maxBytes int6
 
 // decisionError maps a lifecycle failure to a status a PEP can act on.
 //
-// It is a table for the same reason [approvalError] is, and it differs from that
-// one in a single deliberate place: there, a caller who may not act is told so
-// with a 403, because the caller is a named person on the console surface who
-// has to be able to tell "not yours" from "gone". Here the caller is any
-// workload holding a valid credential, and telling it apart is exactly what must
-// not be possible — so refusal and absence are one answer.
+// It is a table for the same reason [approvalError] is, and it answers "you may
+// not have this" and "there is no such decision" with the same bytes for the
+// same reason that one does: a caller that can tell them apart can ask about an
+// identifier and learn whether it names anything. This description used to say
+// the console's table differed here — that it answered 403 to a named person who
+// has to tell "not yours" from "gone" — and that stopped being true when #38
+// collapsed the two there as well.
+//
+// Where the two tables now differ is their 409s, and they differ in both
+// directions. The console's — `expired`, `not_collecting`, `material_changed` —
+// are the signals an approver waiting on a decision needs, and this surface has
+// no use for any of them: a PEP's decide either produced a decision or did not.
+// The one below goes the other way and the console has no use for it, because it
+// is about the caller's own idempotency keys rather than about anybody's
+// standing on a decision, and the console does not send keys.
 func decisionError(err error) (status int, code, message string) {
 	switch {
 	case errors.Is(err, decision.ErrUnauthenticated):
 		return http.StatusUnauthorized, "unauthenticated", "this endpoint requires a workload credential"
 	case errors.Is(err, decision.ErrNotAuthorized), errors.Is(err, store.ErrNotFound):
 		return noSuchDecision()
+	case errors.Is(err, decision.ErrIdempotencyKeyReused):
+		// A key the caller has already spent on a different request. It is a
+		// 409 and not a 400 because nothing about *this* request is malformed —
+		// the request is fine and the name it arrived under is taken — and the
+		// distinction is what tells a client to mint a new key rather than to
+		// fix its body.
+		//
+		// It opens no oracle, and that is worth stating on a surface where
+		// every other refusal has been collapsed to one answer (#38). The
+		// lookup behind it is scoped to the caller's own keys, so a caller can
+		// only ever learn that a key **it** has used is taken. It learns
+		// nothing about another workload's keys, nothing about any decision
+		// identifier, and nothing it could not learn by retrying the request
+		// the key does name.
+		//
+		// The message says what to do and names nothing. The decision the key
+		// already holds is the caller's own and it may read it — but by asking
+		// with the request that key names, not by being handed an identifier in
+		// an error string that every log between here and the caller will keep.
+		return http.StatusConflict, CodeIdempotencyKeyReused,
+			"this Idempotency-Key was already used for a different request; use a new key"
 	case errors.Is(err, challenge.ErrNoHandler), errors.Is(err, challenge.ErrUnsupportedSpec),
 		errors.Is(err, challenge.ErrGroupSourceUnsupported):
 		// The policy demands a challenge kind this build cannot issue. It is not

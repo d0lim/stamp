@@ -21,9 +21,33 @@ export class ApiError extends Error {
     readonly status: number,
     message: string,
     readonly body?: unknown,
+    /**
+     * The `Retry-After` the response carried, in seconds, when it carried one
+     * this client could read.
+     *
+     * Undefined is not "retry now": it means the header was absent, unparseable,
+     * or withheld by the browser. A cross-origin API response only exposes
+     * `Retry-After` to script when the server lists it in
+     * `Access-Control-Expose-Headers`, which the split topology's proxy may not
+     * do — so a screen that words a wait must word one that works without a
+     * number as well as one that has it.
+     */
+    readonly retryAfterSeconds?: number,
   ) {
     super(message)
     this.name = 'ApiError'
+  }
+
+  /**
+   * The request was refused by a budget rather than by a rule (R43).
+   *
+   * It is a wait and not an escalation: whatever was refused can be sent again
+   * shortly, and copy that sends the reader to an operator is worse than no copy
+   * at all — the operator has nothing to do, and the reader stops trying the one
+   * thing that works.
+   */
+  get isRateLimited(): boolean {
+    return this.status === 429
   }
 
   /** The session is gone or was never good enough. */
@@ -33,6 +57,21 @@ export class ApiError extends Error {
 
   get isForbidden(): boolean {
     return this.status === 403
+  }
+
+  /**
+   * The server has nothing to give under this identifier.
+   *
+   * On the surfaces that act on one named decision — the approval submission and
+   * its review, the delegated cancellation, the audit detail — this is also the
+   * answer to "you may not have it". The server collapsed the two deliberately
+   * (#38): telling them apart would make the status code an oracle for whether
+   * an identifier names anything, which is what R40 exists to prevent. So a
+   * screen that reads this cannot tell which one happened, and must not write
+   * copy that claims to know.
+   */
+  get isNotFound(): boolean {
+    return this.status === 404
   }
 }
 
@@ -113,7 +152,12 @@ export function createApiClient(deps: ApiClientDeps): ApiClient {
       onUnauthenticated?.()
     }
     if (!response.ok) {
-      throw new ApiError(response.status, await describeFailure(response), await safeBody(response))
+      throw new ApiError(
+        response.status,
+        await describeFailure(response),
+        await safeBody(response),
+        retryAfterOf(response),
+      )
     }
     if (response.status === 204) return undefined as T
     return (await response.json()) as T
@@ -145,6 +189,25 @@ async function describeFailure(response: Response): Promise<string> {
     default:
       return `요청이 ${response.status}로 실패했습니다.`
   }
+}
+
+/**
+ * The response's `Retry-After` as a number of seconds, when it has one.
+ *
+ * Only the delta-seconds form is read. RFC 9110 also allows an HTTP-date, and
+ * this API never sends one — the value is a refill interval computed from the
+ * budget, which is a duration and not an instant — so parsing a date here would
+ * be code for a case that cannot arrive, resolved against a client clock that
+ * may be wrong. Anything else, including an absent or non-numeric header, is
+ * undefined: the caller words the wait without a number rather than inventing
+ * one.
+ */
+function retryAfterOf(response: Response): number | undefined {
+  const raw = response.headers.get('Retry-After')
+  if (raw === null) return undefined
+  const seconds = Number(raw.trim())
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined
+  return Math.ceil(seconds)
 }
 
 async function safeBody(response: Response): Promise<unknown> {

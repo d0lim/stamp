@@ -22,6 +22,7 @@ import (
 	"github.com/d0lim/stamp/internal/engine"
 	"github.com/d0lim/stamp/internal/identity"
 	"github.com/d0lim/stamp/internal/policy"
+	"github.com/d0lim/stamp/internal/policy/revision"
 	"github.com/d0lim/stamp/internal/store"
 	"github.com/d0lim/stamp/internal/stream"
 )
@@ -298,6 +299,20 @@ func (f *decideFixture) do(surface api.Surface, method, path, token, body string
 func (f *decideFixture) create(t *testing.T, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	return f.do(api.SurfacePEP, http.MethodPost, api.DecisionsPath, token, body)
+}
+
+// createWithKey is create with a retry name on it. It builds the request the
+// long way rather than going through do, because the header is the subject of
+// the test and a helper that could not carry it would be testing the default.
+func (f *decideFixture) createWithKey(t *testing.T, token, body, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, api.DecisionsPath, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(api.IdempotencyKeyHeader, key)
+	rec := httptest.NewRecorder()
+	f.server.Handler(api.SurfacePEP).ServeHTTP(rec, req)
+	return rec
 }
 
 func (f *decideFixture) read(t *testing.T, token, id string) *httptest.ResponseRecorder {
@@ -879,6 +894,234 @@ func TestTheRequestedLifetimeIsBounded(t *testing.T) {
 	})
 }
 
+// TestTheIdempotencyKeyIsCarriedToTheLifecycle is the surface's whole share of
+// #47(a). Whether a repeated key returns the same decision is a question about
+// rows and challenge issuance, and it is answered in internal/decision against a
+// real database; what this endpoint owes is that the header reaches the
+// lifecycle intact, that a key it cannot store is refused rather than dropped,
+// and that a request without one behaves exactly as it did before.
+func TestTheIdempotencyKeyIsCarriedToTheLifecycle(t *testing.T) {
+	t.Run("a key is carried to the lifecycle", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{})
+		rec := f.createWithKey(t, f.workload(t, "svc-a"), decideBody(""), "attempt-7f3c")
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := f.life.lastRequest(t).IdempotencyKey; got != "attempt-7f3c" {
+			t.Errorf("idempotency key = %q, want %q", got, "attempt-7f3c")
+		}
+	})
+
+	t.Run("no key leaves the request unnamed", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{})
+		if rec := f.create(t, f.workload(t, "svc-a"), decideBody("")); rec.Code != http.StatusCreated {
+			t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := f.life.lastRequest(t).IdempotencyKey; got != "" {
+			t.Errorf("idempotency key = %q, want empty: a caller that sent no header named nothing", got)
+		}
+	})
+
+	t.Run("a key this deployment cannot store is refused, not dropped", func(t *testing.T) {
+		f := newDecideFixture(t, decideOptions{})
+		for name, key := range map[string]string{
+			"too long":        strings.Repeat("k", api.MaxIdempotencyKeyBytes+1),
+			"a space":         "attempt 7f3c",
+			"a newline":       "attempt\n7f3c",
+			"a control byte":  "attempt\x00",
+			"a non-ascii run": "attempt-\xc3\xa9",
+		} {
+			rec := f.createWithKey(t, f.workload(t, "svc-a"), decideBody(""), key)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("%s key = %d, want %d: %s", name, rec.Code, http.StatusBadRequest, rec.Body.String())
+				continue
+			}
+			var body api.ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Errorf("%s key: decode error body: %v", name, err)
+				continue
+			}
+			if body.Error != "invalid_request" {
+				t.Errorf("%s key error = %q, want invalid_request", name, body.Error)
+			}
+		}
+		// A refused key must not have been judged. Silently evaluating and then
+		// refusing would mean the caller was charged an evaluation for a request
+		// whose retry safety it was told it does not have.
+		if f.life.decided() != 0 {
+			t.Errorf("%d unusable keys reached the lifecycle, want 0", f.life.decided())
+		}
+	})
+}
+
+// TestASpentIdempotencyKeyIsAConflictWithItsOwnCode is the surface's share of
+// binding a key to the request it names.
+//
+// Whether two requests are the same request is the lifecycle's judgement and is
+// tested there against a real database. What this endpoint owes is the answer:
+// a status a client can branch on and a code that tells it to mint a new key
+// rather than to fix its body. It used to be neither — the lifecycle handed back
+// the first decision and this surface answered `201 Created` with somebody
+// else's decision on it.
+func TestASpentIdempotencyKeyIsAConflictWithItsOwnCode(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.decideErr = fmt.Errorf("reusing a key: %w", decision.ErrIdempotencyKeyReused)
+
+	rec := f.createWithKey(t, f.workload(t, "svc-a"), decideBody(""), "job-91")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("a spent key = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	var body api.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body.Error != api.CodeIdempotencyKeyReused {
+		t.Errorf("error = %q, want %q", body.Error, api.CodeIdempotencyKeyReused)
+	}
+	// Not one of the codes that means "fix the request and send it again". The
+	// request is fine; the name is taken.
+	if body.Error == "invalid_request" || body.Error == "not_found" {
+		t.Errorf("a spent key answers %q, which tells a client to change the wrong thing", body.Error)
+	}
+	// And it names no decision. The caller may read the decision its key holds —
+	// by asking with the request that key names — but an identifier in an error
+	// body is an identifier in every log between here and the caller, on a path
+	// whose whole subject is a caller that confused two requests.
+	if strings.Contains(rec.Body.String(), testDecideID) {
+		t.Errorf("the refusal carried a decision identifier: %s", rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Errorf("the refusal carried Location %q", got)
+	}
+}
+
+// TestAShedDecideCarriesTheWaitTheLifecycleReported is #45's mechanism applied
+// to the refusal it could not see.
+//
+// The surface renders `Retry-After` for its own budgets from a rate it holds. A
+// challenge issuance shed inside the lifecycle is a different budget, held by a
+// handler this package does not know about, so the wait arrives on the result
+// and this endpoint only writes it down. Without that, the one deny a caller
+// genuinely should retry was the one deny that said nothing about when.
+func TestAShedDecideCarriesTheWaitTheLifecycleReported(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.result = decision.Result{
+		State:       store.DecisionDenied,
+		Outcome:     engine.Deny,
+		Reason:      decision.ReasonChallengeRateLimited,
+		Obligations: []decision.Obligation{},
+		RetryAfter:  90 * time.Second,
+	}
+
+	rec := f.create(t, f.workload(t, "svc-payments"), decideBody(""))
+	// A shed issuance creates no decision, so it is the deny shape: 200, no
+	// identifier. The transport does not change because the request was judged
+	// either way, which is the property refuseRate is built on.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a shed decide = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "90" {
+		t.Errorf("Retry-After = %q, want %q — the wait the handler that shed it reported", got, "90")
+	}
+	var body decision.Result
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.ID != "" {
+		t.Errorf("a shed issuance answered with decision %q", body.ID)
+	}
+	if body.Reason != decision.ReasonChallengeRateLimited {
+		t.Errorf("reason = %q, want %q", body.Reason, decision.ReasonChallengeRateLimited)
+	}
+	// The wait is not in the body. It is a fact about this instance's buckets and
+	// not part of the decision, and putting it in the JSON would make it a
+	// response field this contract then owes forever.
+	if strings.Contains(rec.Body.String(), "retry") {
+		t.Errorf("the wait leaked into the decision body: %s", rec.Body.String())
+	}
+}
+
+// The other side: a deny that is a judgement invites no retry. This is the same
+// claim TestAPolicyDenyCarriesNoRetryAfter makes about the surface's own budget,
+// made again about the lifecycle's — a deny that reached this handler with no
+// wait on it must not acquire one here.
+func TestALifecycleDenyWithNoWaitCarriesNoRetryAfter(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.result = decision.Result{
+		State:       store.DecisionDenied,
+		Outcome:     engine.Deny,
+		Reason:      decision.ReasonOutstandingCap,
+		Obligations: []decision.Obligation{},
+	}
+
+	rec := f.create(t, f.workload(t, "svc-payments"), decideBody(""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("the outstanding cap carried Retry-After %q: what clears it is another decision "+
+			"closing, not a timer", got)
+	}
+}
+
+// TestAnEntityIdentifierIsBounded is the other caller-chosen string that lands
+// in memory this process keeps.
+//
+// The subject identifier is the key of the per-subject rate limiter's table, and
+// a Go map key retains its bytes for as long as the entry lives. Unbounded, the
+// only ceiling was the 1 MiB body cap, so 8192 entries — the table's own default
+// bound, the thing that is supposed to make the limiter safe — could be made to
+// hold gigabytes by a caller who simply sent long identifiers. The same value is
+// concatenated into the audit event on every refusal.
+//
+// The bound is stated in [api.EvaluationRequest]'s validation, which is upstream
+// of both charges and of the audit record, so what this test asserts is that
+// nothing downstream of it ran: no evaluation, no charge, no event carrying the
+// value that was refused.
+func TestAnEntityIdentifierIsBounded(t *testing.T) {
+	// A budget of one, so that a second request over it would be shed and
+	// audited. If the charge were still happening ahead of the bound, that
+	// refusal — and the oversized identifier inside it — is what the recorder
+	// below would be holding.
+	f := newDecideFixture(t, decideOptions{subjectRate: stream.RateLimit{PerSecond: 1, Burst: 1}})
+	oversized := strings.Repeat("s", api.MaxEntityIDBytes+1)
+
+	for _, body := range []string{
+		decideBodyFor(oversized),
+		`{"subject":  {"type": "account", "id": "acct-src"},
+		  "resource": {"type": "account", "id": "` + oversized + `"},
+		  "action":   {"name": "close"}}`,
+	} {
+		for i := 0; i < 3; i++ {
+			rec := f.create(t, f.workload(t, "svc-payments"), body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("an identifier of %d bytes = %d, want %d: %s",
+					len(oversized), rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			var refusal api.ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &refusal); err != nil {
+				t.Fatalf("decode error body: %v", err)
+			}
+			if refusal.Error != "invalid_request" {
+				t.Errorf("error = %q, want invalid_request: an identifier this deployment will not "+
+					"store is a malformed request, not a verdict", refusal.Error)
+			}
+		}
+	}
+
+	if f.life.decided() != 0 {
+		t.Errorf("%d oversized identifiers reached the lifecycle, want 0", f.life.decided())
+	}
+	for _, e := range f.audit.snapshot() {
+		if strings.Contains(e.Subject, oversized) || strings.Contains(e.Resource, oversized) {
+			t.Fatalf("an audit event carries the %d-byte identifier that was refused: %+v", len(oversized), e)
+		}
+	}
+	if events := f.audit.snapshot(); len(events) != 0 {
+		t.Errorf("%d events were recorded for requests that were never judged: %+v", len(events), events)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the states the surface has to answer for
 // ---------------------------------------------------------------------------
@@ -899,11 +1142,78 @@ func TestDecidingWithNoPolicySetIsAnExplicitRefusal(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode %q: %v", rec.Body.String(), err)
 	}
-	if body.Error != string(engine.ReasonPolicySetStale) {
-		t.Errorf("error = %q, want the ground the check surface uses for the same state", body.Error)
+	if body.Error != api.CodeNotInstalled {
+		t.Errorf("error = %q, want %q", body.Error, api.CodeNotInstalled)
 	}
 	if f.life.decided() != 0 {
 		t.Errorf("a request reached the lifecycle with no policy set to judge it")
+	}
+}
+
+// TestNotInstalledIsOneCodeOnEverySurface is #45's second half.
+//
+// `error` and `reason` are different vocabularies. `reason` is the ground a
+// decision was reached on and belongs to the engine; `error` is what a surface
+// says when it produced no decision at all, and it is read by clients that never
+// see an engine reason. A server state that both surfaces are describing — this
+// deployment holds no policy set — must arrive under one word, because a client
+// that learns to recognise it from one surface will meet it on another.
+//
+// It used to arrive as `policy_set_stale` from decide and `not_installed` from
+// the policy surface, which made the same state two states to anyone writing
+// against both. Nothing about the engine's reason changed: `policy_set_stale` is
+// still what the check path answers *inside a decision*, where it is a ground and
+// not an error code.
+func TestNotInstalledIsOneCodeOnEverySurface(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{noSchema: true})
+	// The policy surface, mounted on the same server, in the same state: nothing
+	// installed. Its two reads reach the same answer by two different routes —
+	// the listing through the revision table, the schema read past it — and both
+	// are surfaces a console meets before the first policy exists.
+	policies, err := api.NewPolicies(api.PoliciesConfig{
+		Governance: &recordingGovernor{},
+		Policies: api.PolicyListerFunc(func(context.Context) ([]store.PolicyRecord, error) {
+			return nil, revision.ErrNotInstalled
+		}),
+		Schema: api.SchemaReaderFunc(func(context.Context) (store.SchemaRecord, error) {
+			return store.SchemaRecord{}, store.ErrNotFound
+		}),
+	})
+	if err != nil {
+		t.Fatalf("build the policy surface: %v", err)
+	}
+	if err := f.server.Mount(policies); err != nil {
+		t.Fatalf("mount the policy surface: %v", err)
+	}
+
+	codeOf := func(t *testing.T, what string, rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s with nothing installed = %d, want 503: %s", what, rec.Code, rec.Body.String())
+		}
+		var body api.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s: decode %q: %v", what, rec.Body.String(), err)
+		}
+		return body.Error
+	}
+
+	user := f.idp.token(t, "alice", "console")
+	decide := codeOf(t, "decide", f.create(t, f.workload(t, "svc-payments"), decideBody("")))
+	listing := codeOf(t, "GET /policies", f.do(api.SurfaceConsole, http.MethodGet, "/policies", user, ""))
+	schema := codeOf(t, "GET /policies/schema",
+		f.do(api.SurfaceConsole, http.MethodGet, api.SchemaReadPath, user, ""))
+
+	if decide != listing || decide != schema {
+		t.Errorf("one server state, three codes: decide %q, listing %q, schema %q", decide, listing, schema)
+	}
+	if decide != api.CodeNotInstalled {
+		t.Errorf("the shared code is %q, want %q", decide, api.CodeNotInstalled)
+	}
+	// The engine's reason is untouched by any of this. It is the word a decision
+	// carries, and a decision is not what any of these three answered with.
+	if api.CodeNotInstalled == string(engine.ReasonPolicySetStale) {
+		t.Error("the error code and the engine reason have become the same word")
 	}
 }
 
