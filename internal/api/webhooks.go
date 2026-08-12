@@ -134,7 +134,7 @@ func (c *Callbacks) external(w http.ResponseWriter, r *http.Request) {
 		Ordinal:    ordinal,
 		Payload:    payload,
 	})
-	switch status := callbackStatus(err); status {
+	switch callbackStatus(err) {
 	case http.StatusAccepted:
 		// The decision itself is not returned. The target answered a question;
 		// what STAMP concluded is not theirs to read.
@@ -142,7 +142,18 @@ func (c *Callbacks) external(w http.ResponseWriter, r *http.Request) {
 	case http.StatusForbidden:
 		rejectCallback(w)
 	default:
-		writeError(w, status, "internal_error", "the callback could not be processed")
+		// [callbackStatus] answers with exactly three statuses and the two
+		// above are taken, so this arm is the outage one and writes its status
+		// out rather than forwarding the switch tag. That is not style: the
+		// error code artifact is rendered by reading these call sites
+		// (internal/api/errorcodes_test.go), and a status that is a local
+		// variable is a row the scanner cannot fill in. It fails the run rather
+		// than rendering a hole, so this used to be the one call site standing
+		// between the package and a machine-checkable vocabulary.
+		//
+		// The bytes are unchanged: the old code forwarded a value that could
+		// only ever have been this constant.
+		writeError(w, http.StatusInternalServerError, "internal_error", "the callback could not be processed")
 	}
 }
 

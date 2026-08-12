@@ -35,9 +35,12 @@ console-test: ## Typecheck the console, run its contract boundary check and its 
 console-e2e: ## Run the Playwright smoke suite (builder and approval round trips, axe with contrast)
 	cd $(CONSOLE_DIR) && $(NPM) ci && $(NPM) run e2e:install && $(NPM) run e2e
 
+# The Go tests come first and regenerate console/contract/, so the Node check
+# never compares against a stale export. Reversing the order would let a
+# contract file that is behind the code report agreement.
 .PHONY: console-contract
-console-contract: ## Verify the exported public contract and the console's calls against it
-	$(GO) test ./internal/api/ -run TestConsoleContract -count=1
+console-contract: ## Verify the exported public contract, the emittable error codes, and the console's use of both
+	$(GO) test ./internal/api/ -run 'TestConsoleContract|TestErrorCode' -count=1
 	cd $(CONSOLE_DIR) && $(NPM) run check:contract
 
 .PHONY: build-all
