@@ -778,6 +778,58 @@ func TestApplyGrantsSurvivesConcurrentBootAcrossDatabases(t *testing.T) {
 	}
 }
 
+// TestMigrateSurvivesConcurrentBoot is the same question one line earlier on the
+// boot path. STAMP_DB_MIGRATE defaults to true, so every replica that boots also
+// migrates, and Migrate ends by calling ApplyGrants — a Migrate that cannot
+// survive a peer leaves the process dying on exactly the rollout the grants fix
+// was meant to make survivable.
+func TestMigrateSurvivesConcurrentBoot(t *testing.T) {
+	ctx := context.Background()
+	dsn := freshDB(t)
+
+	stores := make([]*store.Store, concurrentBoots)
+	for i := range stores {
+		stores[i] = openStore(t, dsn)
+	}
+
+	errs := make([]error, len(stores))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, s := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = s.Migrate(ctx)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("boot %d: migrate: %v", i, err)
+		}
+	}
+
+	// Every boot must also agree the schema arrived. A migrate that returned nil
+	// without the schema being at the latest version would be the quiet failure
+	// this is guarding against, and readiness reads exactly this number.
+	want, err := store.LatestSchemaVersion()
+	if err != nil {
+		t.Fatalf("latest schema version: %v", err)
+	}
+	for i, s := range stores {
+		version, dirty, ok, err := s.AppliedSchemaVersion(ctx)
+		if err != nil {
+			t.Fatalf("boot %d: applied schema version: %v", i, err)
+		}
+		if !ok || dirty || version != want {
+			t.Errorf("boot %d: applied version = %d (dirty=%v, ok=%v), want %d clean", i, version, dirty, ok, want)
+		}
+	}
+}
+
 // assertGrantsAreRestrictive checks a sample of the privilege matrix R39 and R42
 // pin down: every role can read what it has to read, and none of them gained a
 // write the grants file does not hand out.
