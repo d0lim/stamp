@@ -247,11 +247,52 @@ func closeMigrator(m *migrate.Migrate) {
 // there is no legitimate role name that needs quoting.
 var roleNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 
+// grantsLockKey serialises concurrent applies of the grants file. It is a
+// different key from the migration lock on purpose: the two are taken by the
+// same process one after the other, and sharing a key would make Migrate's own
+// call to ApplyGrants wait on a lock it had just released for no reason.
+var grantsLockKey = advisoryKey("stamp:grants")
+
 // ApplyGrants provisions the per-role database roles and their privileges.
 //
 // The roles are created without LOGIN and without a password: they are
 // privilege templates that a deployment grants to the login roles it already
 // manages. Credentials never ship in a file embedded in the binary.
+//
+// This is safe to run concurrently with an identical apply, which it has to be:
+// it runs at pod boot (see internal/runtime/wiring.go), Kubernetes rolls a
+// Deployment's replicas together, and `helm upgrade` rolls every tier at once
+// with nothing sequencing them. Two boots landing in the same millisecond is the
+// normal case on a rollout, not a pathological one. It is also run twice by one
+// process whenever both migrate and applyGrants are enabled, since Migrate ends
+// by calling it, so it has to be repeatable as well as concurrent.
+//
+// The apply is wrapped in a transaction holding a transaction-scoped advisory
+// lock. Three reasons for that shape:
+//
+// The file is not just role creation. It REVOKEs everything from the four roles
+// and re-GRANTs the current set, so two uncoordinated applies interleave
+// catalogue updates on the same pg_class rows — which Postgres answers with
+// `tuple concurrently updated` rather than by merging. Serialising the whole
+// file is the fix; serialising only the CREATE ROLE would leave that.
+//
+// The lock is transaction-scoped rather than session-scoped, unlike
+// pgxMigrationDriver.Lock. That driver has no choice: golang-migrate's interface
+// hands it Lock and Unlock as separate calls spanning many statements, so it has
+// to hold the lock across them and carry the risk that a pooled connection is
+// returned still holding it. Here the entire apply is one transaction, so
+// pg_advisory_xact_lock releases at commit or rollback with no bookkeeping and
+// no way to leak a held lock back into the pool.
+//
+// It is the blocking pg_advisory_xact_lock and not pg_try_advisory_xact_lock,
+// because the desired outcome is that both boots succeed. A try-lock would make
+// the loser choose between failing (the bug this fixes) and skipping the apply
+// (worse: a pod would proceed believing privileges it never confirmed). Waiting
+// costs one apply's duration and is bounded by the caller's context.
+//
+// What the lock cannot cover is role creation itself — advisory locks are
+// per-database and roles are cluster-global — so grants.sql tolerates the
+// duplicate-role error separately. See the comment there.
 func (s *Store) ApplyGrants(ctx context.Context) error {
 	roles := s.roles.withDefaults()
 	seen := map[string]struct{}{}
@@ -276,10 +317,19 @@ func (s *Store) ApplyGrants(ctx context.Context) error {
 	if err := tmpl.Execute(&sql, roles); err != nil {
 		return fmt.Errorf("store: render grants: %w", err)
 	}
-	if _, err := s.pool.Exec(ctx, sql.String()); err != nil {
-		return fmt.Errorf("store: apply grants: %w", err)
-	}
-	return nil
+	return s.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, grantsLockKey); err != nil {
+			return fmt.Errorf("store: lock grants: %w", err)
+		}
+		// One Exec for the whole file. pgx sends a statement without arguments
+		// over the simple protocol, which is what allows the multi-statement
+		// body at all — and the grants have to arrive together, or a REVOKE
+		// could commit without the GRANT that restores what it took away.
+		if _, err := tx.Exec(ctx, sql.String()); err != nil {
+			return fmt.Errorf("store: apply grants: %w", err)
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------
