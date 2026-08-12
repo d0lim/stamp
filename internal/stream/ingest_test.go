@@ -2,6 +2,8 @@ package stream_test
 
 import (
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -505,5 +507,74 @@ func TestIngestReportsLagFromProducerTimestamps(t *testing.T) {
 	lag, ok := h.ingest.Lag(h.clock.Now())
 	if !ok || lag != 4*time.Minute {
 		t.Errorf("lag = %s (reported %v), want 4m", lag, ok)
+	}
+}
+
+// TestIngestRateLimitHoldsWhenSubmitsArriveTogether is R43 at the ingest
+// adapter, asserted where the budget's exactness stops being about a counter.
+//
+// The limiter's own concurrency is pinned in ratelimit_test.go. What this adds
+// is the consequence: an event the budget refused must not reach the aggregate.
+// A limit that leaks by one under contention leaks one event into a velocity
+// metric, and a velocity metric is what a policy then judges on — so the failure
+// does not stay inside the limiter, it becomes a decision made on a number that
+// was supposed to be bounded.
+//
+// The clock does not move for the length of the storm, so nothing here can be
+// explained by refill. Both key namespaces of the one table are charged by every
+// submit — the caller's, deliberately generous, and the subject's, which is the
+// one that binds — so the table is being written under contention on two keys
+// at once, which is the shape the ingest path actually runs in.
+func TestIngestRateLimitHoldsWhenSubmitsArriveTogether(t *testing.T) {
+	const (
+		burst    = 8
+		inFlight = 96
+	)
+	h := newIngestHarness(t, stream.IngestCredential{
+		CallerID:    producer,
+		Scope:       []stream.ScopeEntry{{Source: sourceName, Metric: metricWithdrawal}},
+		Rate:        stream.RateLimit{PerSecond: 1e6, Burst: 1e6},
+		SubjectRate: stream.RateLimit{PerSecond: 1000, Burst: burst},
+	})
+
+	var refused atomic.Int64
+	accepted, peak := storm(inFlight, func(i int) bool {
+		_, err := h.ingest.Submit(t.Context(), producer, batch(sourceName, stream.IngestEvent{
+			EventID:    fmt.Sprintf("e%d", i),
+			Subject:    "user-1",
+			Value:      1,
+			ProducedAt: h.clock.Now(),
+		}))
+		switch {
+		case err == nil:
+			return true
+		case errors.Is(err, stream.ErrRateLimited):
+			refused.Add(1)
+			return false
+		default:
+			t.Errorf("submit %d = %v, want either acceptance or ErrRateLimited", i, err)
+			return false
+		}
+	})
+	assertContended(t, peak, inFlight)
+
+	if accepted != burst {
+		t.Fatalf("%d of %d simultaneous submits were accepted against a burst of %d, want exactly %d",
+			accepted, inFlight, burst, burst)
+	}
+	if got := int(refused.Load()); got != inFlight-burst {
+		t.Errorf("%d submits were refused, want %d", got, inFlight-burst)
+	}
+
+	// And the aggregate is the accepted count and nothing else. This is the
+	// assertion the whole test exists for: the budget is not a number the
+	// adapter reports, it is a bound on what a policy will later read.
+	v, err := h.sources.Lookup(t.Context(), sourceName, fact.String("user-1"))
+	if err != nil {
+		t.Fatalf("look the aggregate up: %v", err)
+	}
+	if v.Data != float64(burst) {
+		t.Errorf("the aggregate is %#v after %d simultaneous submits against a burst of %d, want %d: "+
+			"an event the limit refused was applied anyway", v.Data, inFlight, burst, burst)
 	}
 }
