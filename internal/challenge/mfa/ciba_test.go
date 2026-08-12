@@ -17,17 +17,21 @@ import (
 
 // mockOP is an OIDC OP that speaks just enough CIBA to answer this client, and
 // records what it was sent.
+//
+// One route, because the client makes one call. It used to serve a token
+// endpoint too, for the polling client that nothing in the product ever called;
+// a mock that answers a request the binary does not make is scaffolding that
+// looks like a covered path. `tokenCalls` is what remains of it, and it is an
+// assertion rather than a fixture — see [TestCIBANeverCallsTheTokenEndpoint].
 type mockOP struct {
 	server *httptest.Server
 
 	backchannelForm url.Values
-	tokenForm       url.Values
 	authHeader      string
+	tokenCalls      int
 
 	backchannelStatus int
 	backchannelBody   string
-	tokenStatus       int
-	tokenBody         string
 }
 
 func newMockOP(t *testing.T) *mockOP {
@@ -35,8 +39,6 @@ func newMockOP(t *testing.T) *mockOP {
 	m := &mockOP{
 		backchannelStatus: http.StatusOK,
 		backchannelBody:   `{"auth_req_id":"1c266114-a1be","expires_in":120,"interval":2}`,
-		tokenStatus:       http.StatusOK,
-		tokenBody:         `{"id_token":"header.payload.signature","token_type":"Bearer"}`,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ciba/auth", func(w http.ResponseWriter, r *http.Request) {
@@ -47,12 +49,9 @@ func newMockOP(t *testing.T) *mockOP {
 		w.WriteHeader(m.backchannelStatus)
 		_, _ = w.Write([]byte(m.backchannelBody))
 	})
-	mux.HandleFunc("/ciba/token", func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		m.tokenForm = r.PostForm
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(m.tokenStatus)
-		_, _ = w.Write([]byte(m.tokenBody))
+	mux.HandleFunc("/ciba/token", func(w http.ResponseWriter, _ *http.Request) {
+		m.tokenCalls++
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	m.server = httptest.NewServer(mux)
 	t.Cleanup(m.server.Close)
@@ -200,6 +199,15 @@ func TestCIBAClassifiesTheIdPsRefusals(t *testing.T) {
 			ErrInitiationUnsupported,
 		},
 		"endpoint absent": {http.StatusNotFound, `not found`, ErrInitiationUnsupported},
+		// This row moved here from the deleted polling test. `access_denied` is a
+		// backchannel answer as well as a token-endpoint one, so removing the
+		// client that polled did not make the mapping unreachable — it only moved
+		// the only place that can observe it.
+		"refused outright": {
+			http.StatusBadRequest,
+			`{"error":"access_denied","error_description":"the request was denied"}`,
+			ErrAuthorizationDeclined,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -215,49 +223,10 @@ func TestCIBAClassifiesTheIdPsRefusals(t *testing.T) {
 	}
 }
 
-func TestCIBAPollClassifiesTokenEndpointAnswers(t *testing.T) {
-	t.Parallel()
-	cases := map[string]struct {
-		status int
-		body   string
-		want   error
-		token  string
-	}{
-		"granted":  {http.StatusOK, `{"id_token":"a.b.c"}`, nil, "a.b.c"},
-		"pending":  {http.StatusBadRequest, `{"error":"authorization_pending"}`, ErrAuthorizationPending, ""},
-		"slow":     {http.StatusBadRequest, `{"error":"slow_down"}`, ErrSlowDown, ""},
-		"declined": {http.StatusBadRequest, `{"error":"access_denied"}`, ErrAuthorizationDeclined, ""},
-		"expired":  {http.StatusBadRequest, `{"error":"expired_token"}`, ErrAuthorizationDeclined, ""},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			op := newMockOP(t)
-			op.tokenStatus = tc.status
-			op.tokenBody = tc.body
-			token, err := op.client(t).Poll(t.Context(), "1c266114-a1be")
-			if tc.want != nil {
-				if !errors.Is(err, tc.want) {
-					t.Fatalf("poll err = %v, want %v", err, tc.want)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("poll: %v", err)
-			}
-			if token != tc.token {
-				t.Fatalf("id_token = %q, want %q", token, tc.token)
-			}
-			if got := op.tokenForm.Get("grant_type"); got != "urn:openid:params:grant-type:ciba" {
-				t.Fatalf("grant_type = %q", got)
-			}
-			if got := op.tokenForm.Get("auth_req_id"); got != "1c266114-a1be" {
-				t.Fatalf("auth_req_id = %q", got)
-			}
-		})
-	}
-}
-
+// TestCIBAHonoursTheOPsPollInterval pins what [CIBA.Authenticate] reports about
+// the OP's answer. Nothing spends this interval — the verdict comes back on the
+// callback POST — but reporting the OP's own number, and the RFC default when it
+// named none, is what makes the answer a faithful account of the exchange.
 func TestCIBAHonoursTheOPsPollInterval(t *testing.T) {
 	t.Parallel()
 	op := newMockOP(t)
@@ -282,6 +251,24 @@ func TestCIBAHonoursTheOPsPollInterval(t *testing.T) {
 	}
 }
 
+// TestCIBANeverCallsTheTokenEndpoint is what the deleted `Poll` leaves behind.
+//
+// The client is built with a token endpoint, because a deployment configures its
+// OP's endpoints as a set and this one still gets transport-checked. What is
+// asserted is that configuring it buys the OP no calls: the verdict for a CIBA
+// challenge comes back on `POST /decisions/{id}/challenges/{ordinal}/mfa`, and
+// if a polling loop is ever wired here this test is the thing that says so.
+func TestCIBANeverCallsTheTokenEndpoint(t *testing.T) {
+	t.Parallel()
+	op := newMockOP(t)
+	if _, err := op.client(t).Initiate(t.Context(), testInitiateRequest("c")); err != nil {
+		t.Fatalf("initiate: %v", err)
+	}
+	if op.tokenCalls != 0 {
+		t.Fatalf("the ciba client called the token endpoint %d times; the verdict arrives on the callback POST", op.tokenCalls)
+	}
+}
+
 func TestNewCIBARefusesAnIncompleteConfiguration(t *testing.T) {
 	t.Parallel()
 	base := CIBAConfig{
@@ -297,6 +284,14 @@ func TestNewCIBARefusesAnIncompleteConfiguration(t *testing.T) {
 		// CIBA has no public clients, so the credentials travel on every call —
 		// over plaintext they travel to whoever is on the path.
 		"plaintext": func(c *CIBAConfig) { c.AllowInsecureTransport = false },
+		// And the token endpoint is checked on the same terms even though this
+		// client never dials it. That is the whole reason the field survived the
+		// removal of the polling client, so it is asserted rather than assumed.
+		"plaintext token endpoint": func(c *CIBAConfig) {
+			c.BackchannelEndpoint = "https://op.example.test/ciba/auth"
+			c.TokenEndpoint = "http://op.example.test/ciba/token"
+			c.AllowInsecureTransport = false
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
