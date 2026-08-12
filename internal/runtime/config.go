@@ -240,31 +240,54 @@ type Config struct {
 	DecideRate        stream.RateLimit
 	DecideSubjectRate stream.RateLimit
 
-	// ChallengeIssueRate is R43's per-subject bound on challenge issuance, and
-	// ApprovalSubmitRate its per-approver bound on approval submission. A zero
-	// field selects the owning package's default for that field; a negative rate
-	// removes the limit.
+	// ChallengeIssueRate is R43's bound on challenge issuance,
+	// ChallengeIssueSubjectCeiling the ceiling above it, and ApprovalSubmitRate
+	// the per-approver bound on approval submission. A zero field selects the
+	// owning package's default for that field; a negative rate removes the
+	// limit.
 	//
-	// ChallengeIssueRate is not the same knob as the re-issue interval and does
-	// not replace it. That interval is keyed on the subject *and the decision
-	// content*, so it suppresses a re-evaluation of one decision and cannot see a
-	// caller creating a hundred different ones — which is N different keys, N IdP
-	// requests, and N prompts on one phone. This is the bound over that.
+	// **ChallengeIssueRate is charged on (caller, subject) and not on the
+	// subject alone.** It was the subject alone until #40's follow-up, and that
+	// made it a weapon rather than a bound: a subject identifier is a `sub`
+	// claim or an account number, not a secret, so any workload credential that
+	// could name a person could hold that person's bucket empty at three
+	// requests a minute and have every authorization they needed come back
+	// denied — and, until the same change, recorded as denied on their history.
+	// Keying the caller in means a caller can only spend its own share.
+	// ChallengeIssueSubjectCeiling is what still bounds the total one person can
+	// be asked for across every caller; without it, keying the caller in would
+	// remove the bound rather than distribute it.
 	//
-	// One rate configures the step-up handler and the webhook handler because an
-	// operator thinking about "how much may one subject cause" is thinking about
-	// one thing; each handler still defaults it separately when it is unset,
-	// because a prompt on a person's phone and a POST to a machine are not worth
-	// the same by default.
+	// The ceiling must not be tighter than the per-caller rate. A ceiling below
+	// it binds first, every caller shares it, and the deployment is back to the
+	// one subject-keyed bucket anybody could empty. mfa.NewDelegated refuses
+	// that configuration rather than booting into it.
 	//
-	// Both limits are **per instance**, like DecideRate above and for the same
-	// reason: the buckets live in the process, so a fleet of N replicas admits N
-	// times what is written here, and an operator sizing a fleet divides. What
-	// bounds the fleet as a whole is elsewhere — MaxOutstanding for decisions,
-	// and for these, the challenge deadline and the quorum threshold, which are
-	// counted in the database.
-	ChallengeIssueRate stream.RateLimit
-	ApprovalSubmitRate stream.RateLimit
+	// Neither is the same knob as the re-issue interval and neither replaces it.
+	// That interval is keyed on the subject *and the decision content*, so it
+	// suppresses a re-evaluation of one decision and cannot see a caller
+	// creating a hundred different ones — which is N different keys, N IdP
+	// requests, and N prompts on one phone. These are the bounds over that.
+	//
+	// **ChallengeIssueRate configures the step-up handler and the webhook
+	// handler; the ceiling configures only the step-up handler.** The webhook
+	// handler is deliberately still keyed on the subject alone, because what a
+	// refusal there protects is a machine this deployment does not operate and
+	// its defence is that the *total* is bounded rather than the per-caller
+	// share — challenge.External.allowNotify says so where it is keyed. Each
+	// handler still defaults its rate separately when it is unset, because a
+	// prompt on a person's phone and a POST to a machine are not worth the same
+	// by default.
+	//
+	// All three limits are **per instance**, like DecideRate above and for the
+	// same reason: the buckets live in the process, so a fleet of N replicas
+	// admits N times what is written here, and an operator sizing a fleet
+	// divides. What bounds the fleet as a whole is elsewhere — MaxOutstanding
+	// for decisions, and for these, the challenge deadline and the quorum
+	// threshold, which are counted in the database.
+	ChallengeIssueRate           stream.RateLimit
+	ChallengeIssueSubjectCeiling stream.RateLimit
+	ApprovalSubmitRate           stream.RateLimit
 
 	// GovernanceFloor is R33's operator lower bound on a revision quorum.
 	GovernanceFloor revision.Floor
@@ -715,10 +738,12 @@ const (
 	EnvDecideSubjectRate      = "STAMP_DECIDE_SUBJECT_RATE_PER_SECOND"
 	EnvDecideSubjectRateBurst = "STAMP_DECIDE_SUBJECT_RATE_BURST"
 
-	EnvChallengeIssueRate  = "STAMP_CHALLENGE_ISSUE_RATE_PER_SECOND"
-	EnvChallengeIssueBurst = "STAMP_CHALLENGE_ISSUE_RATE_BURST"
-	EnvApprovalRate        = "STAMP_APPROVAL_RATE_PER_SECOND"
-	EnvApprovalBurst       = "STAMP_APPROVAL_RATE_BURST"
+	EnvChallengeIssueRate         = "STAMP_CHALLENGE_ISSUE_RATE_PER_SECOND"
+	EnvChallengeIssueBurst        = "STAMP_CHALLENGE_ISSUE_RATE_BURST"
+	EnvChallengeIssueCeilingRate  = "STAMP_CHALLENGE_ISSUE_SUBJECT_CEILING_PER_SECOND"
+	EnvChallengeIssueCeilingBurst = "STAMP_CHALLENGE_ISSUE_SUBJECT_CEILING_BURST"
+	EnvApprovalRate               = "STAMP_APPROVAL_RATE_PER_SECOND"
+	EnvApprovalBurst              = "STAMP_APPROVAL_RATE_BURST"
 
 	EnvFloorMinApprovers       = "STAMP_GOVERNANCE_MIN_APPROVERS"
 	EnvFloorProposerMayApprove = "STAMP_GOVERNANCE_PROPOSER_MAY_APPROVE"
@@ -823,6 +848,10 @@ func ConfigFromEnv() (Config, error) {
 		ChallengeIssueRate: stream.RateLimit{
 			PerSecond: envFloat(EnvChallengeIssueRate, fail),
 			Burst:     envFloat(EnvChallengeIssueBurst, fail),
+		},
+		ChallengeIssueSubjectCeiling: stream.RateLimit{
+			PerSecond: envFloat(EnvChallengeIssueCeilingRate, fail),
+			Burst:     envFloat(EnvChallengeIssueCeilingBurst, fail),
 		},
 		ApprovalSubmitRate: stream.RateLimit{
 			PerSecond: envFloat(EnvApprovalRate, fail),
@@ -993,6 +1022,7 @@ func ConfigFromEnv() (Config, error) {
 	checkRate(EnvDecideRate, EnvDecideBurst, cfg.DecideRate, fail)
 	checkRate(EnvDecideSubjectRate, EnvDecideSubjectRateBurst, cfg.DecideSubjectRate, fail)
 	checkRate(EnvChallengeIssueRate, EnvChallengeIssueBurst, cfg.ChallengeIssueRate, fail)
+	checkRate(EnvChallengeIssueCeilingRate, EnvChallengeIssueCeilingBurst, cfg.ChallengeIssueSubjectCeiling, fail)
 	checkRate(EnvApprovalRate, EnvApprovalBurst, cfg.ApprovalSubmitRate, fail)
 
 	aliases, err := aliasesFrom(os.Getenv(EnvCheckPropertyAliases))

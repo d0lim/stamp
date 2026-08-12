@@ -59,7 +59,7 @@ import (
 
 // ContractVersion is the semantic version of the interfaces in this file. It is
 // bumped when the contract changes, not when a handler does.
-const ContractVersion = "1.3.0"
+const ContractVersion = "1.4.0"
 
 // Errors handlers and the registry return as sentinels. A handler may wrap them
 // with detail; callers branch with errors.Is.
@@ -197,6 +197,36 @@ type IssueResult struct {
 	// lifecycle folds the two together itself, and a handler that returned the
 	// decision's expiry here would make an unmet challenge look like a timer.
 	Deadline *time.Time
+
+	// Shed reports that this challenge was not opened because the handler
+	// refused to open it — the issuance was over a rate limit (R43) — rather
+	// than because anything about the request was judged. It is the same bit
+	// [Status.Shed] carries and it means the same thing; the difference is when
+	// the lifecycle can act on it.
+	//
+	// It exists on this type as well because a bit that arrived only through
+	// Status arrived too late to matter. The lifecycle used to store a shed
+	// challenge as a failed row and then ask Status what the row meant, which
+	// resolved the decision to a terminal deny on the subject's history — a
+	// permanent mark for a request nobody was ever asked about, and the thing
+	// that made the step-up budget a usable denial-of-authorization weapon.
+	// Reading the bit at issue lets decide answer the way the surface answers
+	// its own shed requests: a deny with no decision row and a Retry-After.
+	//
+	// A handler that sets it must also set it on Status for the same challenge,
+	// because a revalidation can still write a shed issuance onto a decision
+	// that already exists, and the ground of that decision is recomputed on
+	// every read.
+	Shed bool
+
+	// RetryAfter is how long until the budget that shed this issuance has a
+	// token again. It is meaningful only alongside Shed and is zero otherwise.
+	//
+	// The handler reports it because the handler is the only thing that knows
+	// which of its budgets refused; the decide surface renders it. A duration
+	// and not a rate, because what the surface has to write down is a number of
+	// seconds and a rate is one arithmetic step away from being the wrong one.
+	RetryAfter time.Duration
 }
 
 // SubmitRequest carries evidence toward a challenge.
@@ -279,10 +309,11 @@ type Status struct {
 	// this bit the decision reports `challenge_failed` for both, which reads as
 	// "the person rejected it" — the one thing that did not happen.
 	//
-	// It rides on Status rather than only on IssueResult because the decision's
-	// ground is recomputed on every read: the lifecycle stores every challenge
-	// pending and asks Status afterwards, so a bit that lived only in the issue
-	// return value would be gone by the time anyone read the decision back.
+	// It rides here as well as on [IssueResult] because the decision's ground is
+	// recomputed on every read: a revalidation can write a shed issuance onto a
+	// decision that already exists, and a bit that lived only in the issue
+	// return value would be gone by the time anyone read that decision back. A
+	// handler that sets one must set both.
 	Shed bool
 }
 

@@ -954,6 +954,116 @@ func TestTheIdempotencyKeyIsCarriedToTheLifecycle(t *testing.T) {
 	})
 }
 
+// TestASpentIdempotencyKeyIsAConflictWithItsOwnCode is the surface's share of
+// binding a key to the request it names.
+//
+// Whether two requests are the same request is the lifecycle's judgement and is
+// tested there against a real database. What this endpoint owes is the answer:
+// a status a client can branch on and a code that tells it to mint a new key
+// rather than to fix its body. It used to be neither — the lifecycle handed back
+// the first decision and this surface answered `201 Created` with somebody
+// else's decision on it.
+func TestASpentIdempotencyKeyIsAConflictWithItsOwnCode(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.decideErr = fmt.Errorf("reusing a key: %w", decision.ErrIdempotencyKeyReused)
+
+	rec := f.createWithKey(t, f.workload(t, "svc-a"), decideBody(""), "job-91")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("a spent key = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	var body api.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body.Error != api.CodeIdempotencyKeyReused {
+		t.Errorf("error = %q, want %q", body.Error, api.CodeIdempotencyKeyReused)
+	}
+	// Not one of the codes that means "fix the request and send it again". The
+	// request is fine; the name is taken.
+	if body.Error == "invalid_request" || body.Error == "not_found" {
+		t.Errorf("a spent key answers %q, which tells a client to change the wrong thing", body.Error)
+	}
+	// And it names no decision. The caller may read the decision its key holds —
+	// by asking with the request that key names — but an identifier in an error
+	// body is an identifier in every log between here and the caller, on a path
+	// whose whole subject is a caller that confused two requests.
+	if strings.Contains(rec.Body.String(), testDecideID) {
+		t.Errorf("the refusal carried a decision identifier: %s", rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Errorf("the refusal carried Location %q", got)
+	}
+}
+
+// TestAShedDecideCarriesTheWaitTheLifecycleReported is #45's mechanism applied
+// to the refusal it could not see.
+//
+// The surface renders `Retry-After` for its own budgets from a rate it holds. A
+// challenge issuance shed inside the lifecycle is a different budget, held by a
+// handler this package does not know about, so the wait arrives on the result
+// and this endpoint only writes it down. Without that, the one deny a caller
+// genuinely should retry was the one deny that said nothing about when.
+func TestAShedDecideCarriesTheWaitTheLifecycleReported(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.result = decision.Result{
+		State:       store.DecisionDenied,
+		Outcome:     engine.Deny,
+		Reason:      decision.ReasonChallengeRateLimited,
+		Obligations: []decision.Obligation{},
+		RetryAfter:  90 * time.Second,
+	}
+
+	rec := f.create(t, f.workload(t, "svc-payments"), decideBody(""))
+	// A shed issuance creates no decision, so it is the deny shape: 200, no
+	// identifier. The transport does not change because the request was judged
+	// either way, which is the property refuseRate is built on.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a shed decide = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "90" {
+		t.Errorf("Retry-After = %q, want %q — the wait the handler that shed it reported", got, "90")
+	}
+	var body decision.Result
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.ID != "" {
+		t.Errorf("a shed issuance answered with decision %q", body.ID)
+	}
+	if body.Reason != decision.ReasonChallengeRateLimited {
+		t.Errorf("reason = %q, want %q", body.Reason, decision.ReasonChallengeRateLimited)
+	}
+	// The wait is not in the body. It is a fact about this instance's buckets and
+	// not part of the decision, and putting it in the JSON would make it a
+	// response field this contract then owes forever.
+	if strings.Contains(rec.Body.String(), "retry") {
+		t.Errorf("the wait leaked into the decision body: %s", rec.Body.String())
+	}
+}
+
+// The other side: a deny that is a judgement invites no retry. This is the same
+// claim TestAPolicyDenyCarriesNoRetryAfter makes about the surface's own budget,
+// made again about the lifecycle's — a deny that reached this handler with no
+// wait on it must not acquire one here.
+func TestALifecycleDenyWithNoWaitCarriesNoRetryAfter(t *testing.T) {
+	f := newDecideFixture(t, decideOptions{})
+	f.life.result = decision.Result{
+		State:       store.DecisionDenied,
+		Outcome:     engine.Deny,
+		Reason:      decision.ReasonOutstandingCap,
+		Obligations: []decision.Obligation{},
+	}
+
+	rec := f.create(t, f.workload(t, "svc-payments"), decideBody(""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Errorf("the outstanding cap carried Retry-After %q: what clears it is another decision "+
+			"closing, not a timer", got)
+	}
+}
+
 // TestAnEntityIdentifierIsBounded is the other caller-chosen string that lands
 // in memory this process keeps.
 //

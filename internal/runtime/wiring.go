@@ -1150,13 +1150,20 @@ func (a *App) delegatedMFA() (*mfa.Delegated, error) {
 		Initiator:        initiator,
 		AllowedACRValues: cfg.MFA.AllowedACRValues,
 		RequiredAMR:      cfg.MFA.RequiredAMR,
-		// R43's issue budget. It is above the re-issue interval and not instead
-		// of it: that interval is keyed on the decision content and so cannot see
-		// a caller opening a different decision every time.
-		SubjectIssueRate: cfg.ChallengeIssueRate,
-		Issuer:           issuer,
-		ClientID:         clientID,
-		Audience:         audience,
+		// R43's two issue budgets. They are above the re-issue interval and not
+		// instead of it: that interval is keyed on the decision content and so
+		// cannot see a caller opening a different decision every time.
+		//
+		// The first is charged on (caller, subject) and the second on the
+		// subject across every caller. One bucket cannot be both — a
+		// subject-only bucket small enough to protect a person is a bucket any
+		// caller can hold empty against that person, which is what this was
+		// until #40's follow-up.
+		CallerSubjectIssueRate: cfg.ChallengeIssueRate,
+		SubjectIssueCeiling:    cfg.ChallengeIssueSubjectCeiling,
+		Issuer:                 issuer,
+		ClientID:               clientID,
+		Audience:               audience,
 		CallbackURL: func(in challenge.Instance) string {
 			if base == "" {
 				return ""

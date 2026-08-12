@@ -59,19 +59,76 @@ const (
 	correlatorBytes = 32
 )
 
-// DefaultSubjectIssueRate is how often one person may be sent a step-up prompt
-// by a deployment that configured no budget of its own (R43).
+// The two step-up issuance budgets a deployment gets when it configures none
+// (R43). They are two because one of them could not be both things at once.
 //
-// It is small because the resource being spent is a human's attention and an
-// IdP's push channel, not CPU. Five is a burst somebody could plausibly be owed
-// — several authorizations opened at once by a busy desk — and the sustained
-// three a minute is already faster than anyone completes a step-up, so a
-// legitimate subject never reaches it and a flood reaches it immediately.
+// **The single budget was a weapon.** Until #40's follow-up this was one bucket
+// keyed on the subject identifier alone, shared by every caller, at one token
+// every twenty seconds. A subject identifier is a `sub` claim or an account
+// number — it is an identifier, not a secret — so any workload credential that
+// could name a person could hold that person's bucket empty at three requests a
+// minute. Every legitimate authorization that person then needed came back
+// `denied / challenge_rate_limited`, and (until the second half of the same fix)
+// each one was written onto their audit trail as a decision that was refused.
+// The bound that exists to protect a human from being buzzed had become the
+// thing that stopped them working, aimable by anyone, for the price of three
+// requests a minute.
 //
-// An operator who genuinely wants no limit says so with a negative rate. Leaving
-// it unset is not that statement: an unconfigured deployment is the one most
-// likely to be the one that needed the bound.
-var DefaultSubjectIssueRate = stream.RateLimit{PerSecond: 0.05, Burst: 5}
+// Splitting it keeps both properties that were in tension:
+//
+//   - [DefaultCallerSubjectIssueRate] is charged on (caller, subject), so one
+//     caller cannot spend another caller's share of one person's prompts.
+//   - [DefaultSubjectIssueCeiling] is charged on the subject across every
+//     caller, so N callers do not each get N prompts' worth of one phone. That
+//     is the property KTD6 named, and it is the bound that actually protects
+//     the human.
+//
+// **What this does not fix, said out loud.** The ceiling is still shared, so a
+// caller determined to shed somebody else's step-ups can still empty it — at 20
+// an hour rather than 3 a minute, and only after spending its own share first. A
+// ceiling that could not be spent would not be a ceiling. What removes the harm
+// is the other half of the same change: a shed issuance is no longer a recorded
+// deny. It is a retryable refusal with `Retry-After`, it writes no decision row,
+// and it leaves nothing on the subject's history — so what an attacker can now
+// buy is delay, not a permanent mark on somebody's record.
+//
+// An operator who genuinely wants no limit says so with a negative rate on
+// either. Leaving one unset is not that statement: an unconfigured deployment is
+// the one most likely to be the one that needed the bound.
+var (
+	// DefaultCallerSubjectIssueRate is how often one caller may have a step-up
+	// opened against one person.
+	//
+	// It is small because the resource being spent is a human's attention and
+	// an IdP's push channel, not CPU. Five is a burst somebody could plausibly
+	// be owed — several authorizations opened at once by a busy desk — and the
+	// sustained three a minute is already faster than anyone completes a
+	// step-up, so a legitimate caller never reaches it and a flood reaches it
+	// immediately.
+	DefaultCallerSubjectIssueRate = stream.RateLimit{PerSecond: 0.05, Burst: 5}
+
+	// DefaultSubjectIssueCeiling is how many step-up prompts one person may be
+	// sent by this deployment in total, across every caller.
+	//
+	// **Twenty an hour, measured against what a phone can really be asked.** A
+	// push prompt costs the person it reaches an interruption, a look at a
+	// screen and a decision about something they may not have initiated. One
+	// every three minutes, sustained, is already past the point where a person
+	// reads them rather than clearing them reflexively — which is precisely the
+	// state MFA-fatigue attacks are trying to produce, and the reason a ceiling
+	// exists at all rather than only a per-caller rate. Above this the traffic
+	// is not somebody having a busy morning; twenty an hour is generous for the
+	// busiest legitimate morning anyone has and still well under what it takes
+	// to wear a person down.
+	//
+	// **The burst is twice the per-caller burst, and that ratio is the point.**
+	// One caller holding its entire burst of five cannot empty the ceiling, so a
+	// second caller arriving in the same instant still has a full burst of its
+	// own — the cross-caller denial this split exists to remove. A larger ratio
+	// would buy more headroom at the cost of letting more prompts land on one
+	// person at once, which is the thing being bounded.
+	DefaultSubjectIssueCeiling = stream.RateLimit{PerSecond: 20.0 / 3600.0, Burst: 10}
+)
 
 // Why an issue opened no challenge, as recorded in [Detail.Failure].
 //
@@ -129,9 +186,10 @@ type Config struct {
 	// MaxTrackedIssues overrides [DefaultMaxTrackedIssues].
 	MaxTrackedIssues int
 
-	// SubjectIssueRate bounds how often one subject may have a challenge opened
-	// against them (R43). A zero field selects [DefaultSubjectIssueRate] for
-	// that field; a negative rate removes the limit.
+	// CallerSubjectIssueRate bounds how often one caller may have a challenge
+	// opened against one subject (R43). A zero field selects
+	// [DefaultCallerSubjectIssueRate] for that field; a negative rate removes
+	// the limit.
 	//
 	// It is not MinReissueInterval and does not replace it. That interval is a
 	// coherence protection with a different key — the subject *and the decision
@@ -140,9 +198,25 @@ type Config struct {
 	// it, and the two are configured apart because they answer to different
 	// operators: one to whoever tunes revalidation, one to whoever sizes the
 	// deployment.
-	SubjectIssueRate stream.RateLimit
+	CallerSubjectIssueRate stream.RateLimit
 
-	// MaxTrackedSubjects overrides [DefaultMaxTrackedSubjects].
+	// SubjectIssueCeiling bounds how many challenges may be opened against one
+	// subject across every caller (R43). A zero field selects
+	// [DefaultSubjectIssueCeiling] for that field; a negative rate removes the
+	// limit.
+	//
+	// It is a separate knob from CallerSubjectIssueRate because the two answer
+	// different questions and an operator sizing one is not sizing the other:
+	// the first is "how much may one enforcement point ask of one person",
+	// which scales with how many decisions that workload makes, and this one is
+	// "how much may this deployment ask of one person at all", which does not
+	// scale with anything — it is a property of the person.
+	SubjectIssueCeiling stream.RateLimit
+
+	// MaxTrackedSubjects overrides [DefaultMaxTrackedSubjects]. It bounds each
+	// of the two budget tables, not the pair: they hold different keys and a
+	// shared cap would let a flood of invented callers evict the ceiling's
+	// entries, which is the cap becoming the way around the limit.
 	MaxTrackedSubjects int
 
 	// CallbackURL reports where a completion for one challenge should land.
@@ -177,11 +251,19 @@ type Delegated struct {
 	recent      map[string]recentIssue
 	initiations int
 
-	// The per-subject issue budget, charged at the instant the lifecycle
-	// supplies rather than at wall time — see [stream.Limiter.AllowAt] for why
-	// that needs more than a bare limiter.
-	limiter   *stream.Limiter
-	issueRate stream.RateLimit
+	// The two issue budgets, charged at the instant the lifecycle supplies
+	// rather than at wall time — see [stream.Limiter.AllowAt] for why that needs
+	// more than a bare limiter.
+	//
+	// Two tables and not one with two key namespaces in it, for the reason
+	// api.decideLimiter gives: a bounded table refuses when it is full, so the
+	// entries in it are a resource the keys compete for. Sharing one would let a
+	// flood of invented caller identifiers fill it and evict the ceiling's
+	// entries — the cap becoming the way around the limit it enforces.
+	callerSubjects *stream.Limiter
+	subjects       *stream.Limiter
+	callerRate     stream.RateLimit
+	subjectCeiling stream.RateLimit
 }
 
 // recentIssue is one challenge this process opened recently.
@@ -222,18 +304,19 @@ func NewDelegated(cfg Config) (*Delegated, error) {
 	}
 
 	d := &Delegated{
-		initiator:   cfg.Initiator,
-		allowedACR:  allowed,
-		requireAMR:  normalizeACR(cfg.RequiredAMR),
-		issuer:      cfg.Issuer,
-		clientID:    cfg.ClientID,
-		audience:    cfg.Audience,
-		minReissue:  cfg.MinReissueInterval,
-		maxTracked:  cfg.MaxTrackedIssues,
-		callbackURL: cfg.CallbackURL,
-		correlator:  cfg.NewCorrelator,
-		recent:      make(map[string]recentIssue),
-		issueRate:   cfg.SubjectIssueRate,
+		initiator:      cfg.Initiator,
+		allowedACR:     allowed,
+		requireAMR:     normalizeACR(cfg.RequiredAMR),
+		issuer:         cfg.Issuer,
+		clientID:       cfg.ClientID,
+		audience:       cfg.Audience,
+		minReissue:     cfg.MinReissueInterval,
+		maxTracked:     cfg.MaxTrackedIssues,
+		callbackURL:    cfg.CallbackURL,
+		correlator:     cfg.NewCorrelator,
+		recent:         make(map[string]recentIssue),
+		callerRate:     cfg.CallerSubjectIssueRate,
+		subjectCeiling: cfg.SubjectIssueCeiling,
 	}
 	if d.minReissue == 0 {
 		d.minReissue = DefaultMinReissueInterval
@@ -244,12 +327,44 @@ func NewDelegated(cfg Config) (*Delegated, error) {
 	if d.correlator == nil {
 		d.correlator = randomCorrelator
 	}
-	d.issueRate = d.issueRate.WithZeroDefault(DefaultSubjectIssueRate)
+	d.callerRate = d.callerRate.WithZeroDefault(DefaultCallerSubjectIssueRate)
+	d.subjectCeiling = d.subjectCeiling.WithZeroDefault(DefaultSubjectIssueCeiling)
+	// The bursts, and only the bursts, have to be ordered.
+	//
+	// **The sustained rates deliberately are not.** The ceiling is the slower of
+	// the two by design — twenty an hour against three a minute — because it is
+	// the bound on what a person can be asked for at all, and a person is not a
+	// queue that drains faster when more callers join. A check that demanded the
+	// ceiling be the looser rate would forbid the only configuration that
+	// protects anybody.
+	//
+	// **The bursts are what carries the cross-caller property.** A caller
+	// holding its entire burst must leave the shared ceiling with at least one
+	// token in it, or a second caller arriving in the same instant is shed for
+	// traffic it did not send — which is the denial this split exists to remove,
+	// rebuilt by configuration. So the ceiling's burst has to be strictly larger
+	// than one caller's. It is refused at wiring time rather than resolved into
+	// one of the two things it might have meant, on the precedent of
+	// runtime.checkRate: an operator who wrote down a bound and got a different
+	// one is the direction worth refusing to boot in.
+	//
+	// An operator who disabled either budget with a negative rate has said
+	// something different, and is left alone: one budget can be off without the
+	// other being meaningless.
+	if !d.callerRate.Unlimited() && !d.subjectCeiling.Unlimited() &&
+		d.subjectCeiling.Burst <= d.callerRate.Burst {
+		return nil, fmt.Errorf(
+			"mfa: the per-subject step-up ceiling bursts to %g, which is not more than one caller's %g: "+
+				"the ceiling is shared by every caller, so a caller spending its whole burst would leave "+
+				"nothing for anyone else and could shed another caller's step-ups at the same person",
+			d.subjectCeiling.Burst, d.callerRate.Burst)
+	}
 	tracked := cfg.MaxTrackedSubjects
 	if tracked <= 0 {
 		tracked = DefaultMaxTrackedSubjects
 	}
-	d.limiter = stream.NewLimiter(tracked, time.Now)
+	d.callerSubjects = stream.NewLimiter(tracked, time.Now)
+	d.subjects = stream.NewLimiter(tracked, time.Now)
 	return d, nil
 }
 
@@ -324,22 +439,34 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 	// The refusal is a failed challenge and not an error. An error here would
 	// come back out of decide as a 500 — an outage where what happened is that
 	// the system judged the request — so it takes the shape the external
-	// handler's refused round trip takes: a challenge that can never be met,
-	// which the lifecycle resolves into a denied decision and an audit row. The
+	// handler's refused round trip takes: a challenge that can never be met. The
 	// word saying which refusal it was travels on the challenge row.
-	if !d.allowIssue(subjectID, req.Now) {
-		return challenge.IssueResult{State: challenge.StateFailed, Detail: Detail{
-			Mode:              policy.MFADelegated,
-			SubjectID:         subjectID,
-			RequiredACRValues: required,
-			AllowedACRValues:  slices.Clone(d.allowedACR),
-			Issuer:            d.issuer,
-			ClientID:          d.clientID,
-			Audience:          d.audience,
-			IssuedAt:          req.Now.UTC(),
-			ContextHash:       contextHash,
-			Failure:           FailureIssueRateLimited,
-		}}, nil
+	//
+	// **The Shed bit is what keeps this off the subject's record.** A shed
+	// issuance used to be stored as a failed challenge, which the lifecycle
+	// resolved into a denied decision and an audit row — a terminal deny on the
+	// history of the person nobody had asked anything. With the bit set at issue
+	// rather than only at Status, decide can refuse before it writes a row: see
+	// decision.Service.Decide. The bit is still set on Status too, for the row a
+	// revalidation can still write.
+	if refused, ok := d.allowIssue(req.Decision.CallerID, subjectID, req.Now); !ok {
+		return challenge.IssueResult{
+			State:      challenge.StateFailed,
+			Shed:       true,
+			RetryAfter: refused.RefillInterval(),
+			Detail: Detail{
+				Mode:              policy.MFADelegated,
+				SubjectID:         subjectID,
+				RequiredACRValues: required,
+				AllowedACRValues:  slices.Clone(d.allowedACR),
+				Issuer:            d.issuer,
+				ClientID:          d.clientID,
+				Audience:          d.audience,
+				IssuedAt:          req.Now.UTC(),
+				ContextHash:       contextHash,
+				Failure:           FailureIssueRateLimited,
+			},
+		}, nil
 	}
 
 	correlator, err := d.correlator()
@@ -393,20 +520,47 @@ func (d *Delegated) Issue(ctx context.Context, req challenge.IssueRequest) (chal
 	return challenge.IssueResult{State: challenge.StatePending, Detail: detail}, nil
 }
 
-// allowIssue charges one issuance against the subject's budget.
+// allowIssue charges one issuance against both budgets and reports which one ran
+// out, so that the refusal can say how long to wait.
 //
-// The key is prefixed the way the decide surface's is, and for the same reason:
-// a table shared by more than one namespace is a budget that can be spent by
-// something it was not measuring. There is only one namespace in it today, and
-// the prefix is what keeps adding a second from being a silent collision.
+// The keys are prefixed the way the decide surface's are, and for the same
+// reason: a table shared by more than one namespace is a budget that can be
+// spent by something it was not measuring, and the prefix is what keeps adding a
+// namespace from being a silent collision. `\x1f` is the separator because it
+// cannot occur in either a caller identifier or a subject identifier, so
+// `("a\x1fb", "c")` and `("a", "b\x1fc")` cannot become one key.
 //
-// The key is the subject identifier alone — not the caller, not the decision.
-// Not the caller, because the resource being protected is one person's phone and
-// N callers must not each get their own N prompts' worth of it. Not the
-// decision, because keying on the decision is exactly what [Delegated.reuse]
-// does, and it is why that key cannot see this attack.
-func (d *Delegated) allowIssue(subjectID string, now time.Time) bool {
-	return d.limiter.AllowAt("subject\x1f"+subjectID, d.issueRate, 1, now)
+// **Neither key is the decision.** Keying on the decision is exactly what
+// [Delegated.reuse] does, and it is why that key cannot see a caller opening a
+// hundred different decisions about one person.
+//
+// **The order is load-bearing and the short circuit is the fix.** The per-caller
+// budget is charged first and the ceiling is not charged when it refuses, so a
+// caller that has spent its own share stops costing the shared ceiling anything.
+// Charging both unconditionally would leave the attack intact with an extra
+// step: the attacker would be shed on its own budget and would drain the
+// ceiling with the very requests that were refused, which is the whole
+// cross-caller denial back again, paid for with rejected requests.
+//
+// The reverse order fails for the same reason a limiter never refunds: a request
+// the ceiling admits and the per-caller budget then refuses has still spent a
+// token of the ceiling, so an attacker over its own budget would again be
+// charging somebody else's.
+//
+// A decision with no caller identifier is charged on the ceiling alone. It
+// cannot be attributed, and inventing a shared key for it would put every such
+// decision in one bucket — which is the shape being removed, not a fallback for
+// it.
+func (d *Delegated) allowIssue(callerID, subjectID string, now time.Time) (stream.RateLimit, bool) {
+	if callerID = strings.TrimSpace(callerID); callerID != "" {
+		if !d.callerSubjects.AllowAt("caller\x1f"+callerID+"\x1fsubject\x1f"+subjectID, d.callerRate, 1, now) {
+			return d.callerRate, false
+		}
+	}
+	if !d.subjects.AllowAt("subject\x1f"+subjectID, d.subjectCeiling, 1, now) {
+		return d.subjectCeiling, false
+	}
+	return stream.RateLimit{}, true
 }
 
 // callbackFor asks where a completion for this challenge should land.

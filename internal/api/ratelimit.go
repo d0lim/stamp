@@ -115,13 +115,25 @@ const maxRetryAfterSeconds = 3600
 // ships by default refills faster than once a second, so zero would be the
 // common answer rather than the edge case.
 func retryAfterSeconds(l stream.RateLimit) int {
-	if l.PerSecond <= 0 {
+	return retryAfterSecondsFor(l.RefillInterval())
+}
+
+// retryAfterSecondsFor is [retryAfterSeconds] for a wait somebody else computed.
+//
+// It exists because the surface is no longer the only thing that sheds. A
+// challenge handler owns its own issuance budgets and is the only thing that
+// knows which of them refused, so it reports a duration and this renders it —
+// rather than the surface guessing from a budget it does not hold. Two renderers
+// would be two clamps and eventually two answers to "how long", which is the one
+// number the header exists to carry.
+func retryAfterSecondsFor(d time.Duration) int {
+	if d <= 0 {
 		// Not reachable from a refusal — an unlimited budget refuses nothing —
 		// but a header that said "0" or "-1" would be worse than the one second
 		// this answers with if a later caller finds a path here.
 		return 1
 	}
-	interval := math.Ceil(1 / l.PerSecond)
+	interval := math.Ceil(d.Seconds())
 	if interval < 1 {
 		return 1
 	}
@@ -237,11 +249,19 @@ type rateRefusal struct {
 // was worse in both directions: changing the status to 429 breaks the property
 // above (a PEP would have to read the transport to learn it was judged), and
 // leaving the header off leaves every intermediary unable to tell a shed request
-// from a judged one, which is the whole of #45. What is being claimed is narrow
-// — the header is advisory in every direction, a client that ignores it is
-// correct, and no cache or proxy behaviour keys on it at 200 — so an
-// intermediary that reads it gains a true signal and one that does not loses
-// nothing it had.
+// from a judged one, which is the whole of #45.
+//
+// **What it buys here is observability and not client back-off, and the claim
+// should not be made larger than that.** Every mainstream retry implementation
+// branches on the status line first — Go's http.Client, urllib3's Retry, Java's
+// HttpClient, the axios retry plugins all look for 429 or 5xx before they read a
+// header — so a 200 never reaches the layer that would honour this one. A client
+// that backs off does so because it read `state` and `reason` out of the body,
+// which is code it could have written before this header existed. What genuinely
+// changed is that meshes, log pipelines and exporters read header tables without
+// parsing bodies, and they can now count shed requests apart from judged ones.
+// On the approval surface's 429 the header is in its specified place and clients
+// do honour it; describing the two with one sentence would overstate this one.
 //
 // The audit goes through the buffer rather than through a synchronous chain
 // append, and the reasoning is in the shape of the thing being recorded. This is

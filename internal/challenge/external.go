@@ -383,12 +383,24 @@ func (x *External) Issue(ctx context.Context, req IssueRequest) (IssueResult, er
 	// The budget is charged before the call and not after it, which is the whole
 	// point of standing here: a limit applied after the POST has not declined to
 	// make the POST. The refusal takes the shape every other refused round trip
-	// takes — a failed challenge, so the lifecycle denies the decision and audits
-	// it — because there is no HTTP response of this handler's own to put a
-	// status code on. Issue answers the decide path, not the target.
+	// takes — a failed challenge — because there is no HTTP response of this
+	// handler's own to put a status code on. Issue answers the decide path, not
+	// the target.
+	//
+	// Shed says which kind of refusal it is, and it is what keeps this off the
+	// decision's record: on the decide path the lifecycle now answers a shed
+	// issuance with a retryable deny and no decision row at all, rather than
+	// storing a failed challenge and resolving the decision onto the subject's
+	// history. The word for *which* budget shed it stays on the row, where a
+	// revalidation can still write one.
 	if !x.allowNotify(req.Decision.SubjectID, req.Now) {
 		detail.Failure = ExternalFailureRateLimited
-		return IssueResult{State: StateFailed, Detail: detail}, nil
+		return IssueResult{
+			State:      StateFailed,
+			Shed:       true,
+			RetryAfter: x.subjectRate.RefillInterval(),
+			Detail:     detail,
+		}, nil
 	}
 
 	if err := x.notify(ctx, target, detail, req.Instance, req.Decision); err != nil {
@@ -411,6 +423,20 @@ func (x *External) Issue(ctx context.Context, req IssueRequest) (IssueResult, er
 // Not the caller, because what is being bounded is how much of somebody else's
 // system this deployment will consume on one subject's account, and N callers
 // each holding a full budget is N times the flood arriving at the same webhook.
+//
+// **This deliberately keeps the shape mfa.Delegated.allowIssue just gave up.**
+// That handler was re-keyed on (caller, subject) because a subject-only bucket
+// at one token every twenty seconds could be held empty by anyone who could name
+// a person, and the refusal fell on that person. Neither half of that reasoning
+// carries here. This budget is 1/s bursting to 10 — three orders of magnitude
+// more traffic to hold down, and traffic a caller cannot send without being
+// visibly the source of it — and what a refusal here protects is a machine this
+// deployment does not operate, whose defence is precisely that the total is
+// bounded rather than the per-caller share. Re-keying would multiply the flood
+// this handler is willing to send at one webhook by the number of callers, which
+// is the failure this key exists to prevent. The two handlers diverge because
+// what they are protecting diverges, and this comment is here so that the
+// divergence reads as a decision rather than as one of them being unfinished.
 //
 // A decision with no subject identifier is not charged. It cannot be keyed, and
 // inventing a shared key for it would put every such decision in one bucket.

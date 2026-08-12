@@ -93,7 +93,33 @@ type RateLimit struct {
 	Burst float64
 }
 
-func (r RateLimit) unlimited() bool { return r.PerSecond <= 0 }
+// Unlimited reports the operator's statement that this budget applies no limit.
+//
+// It is exported because a package that holds two budgets has to be able to
+// compare them, and "is this one turned off" is the first question such a
+// comparison asks: mfa.NewDelegated refuses a per-subject ceiling tighter than
+// its per-caller budget, and a ceiling an operator turned off is not tighter
+// than anything.
+func (r RateLimit) Unlimited() bool { return r.PerSecond <= 0 }
+
+func (r RateLimit) unlimited() bool { return r.Unlimited() }
+
+// RefillInterval is how long this budget takes to earn one token back.
+//
+// It is what a refused caller needs to be told: the moment one more request will
+// be admitted, not the moment the bucket is full again, because the burst above
+// that is capacity they have already spent. Zero for a budget with no limit,
+// which refuses nothing and so is never asked.
+//
+// It lives here rather than in the surface that renders `Retry-After` because
+// two of them now render it — internal/api for its own decide budget, and a
+// challenge handler for the issuance it shed — and one arithmetic is one answer.
+func (r RateLimit) RefillInterval() time.Duration {
+	if r.Unlimited() {
+		return 0
+	}
+	return time.Duration(float64(time.Second) / r.PerSecond)
+}
 
 // WithZeroDefault fills each zero field from fallback, so an operator who
 // raised the burst does not have to restate the rate.
