@@ -2,7 +2,6 @@ package stream_test
 
 import (
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -127,12 +126,19 @@ func TestLimiterWithNoRateAdmitsWithoutRecording(t *testing.T) {
 //     A test that asserted only "no panic, no race" would pass against a
 //     limiter that admitted twice its burst.
 //
-// The charges are released together through a barrier: every goroutine is
-// parked on the same channel and nothing charges until all of them are there.
-// A concurrency test whose goroutines run one after another is a sequential
-// test with extra machinery, and this is the cheapest way to be sure they did
-// not. `peak` reports how many were inside the charge at once, which is the
-// measurement that says the contention was real rather than hoped for.
+// The charges are released together through a barrier, and then held at a
+// second one until every goroutine has arrived at the charge. A concurrency
+// test whose goroutines run one after another is a sequential test with extra
+// machinery, and the second rendezvous is what makes sure they did not: it
+// constructs the overlap rather than measuring whether the scheduler granted
+// it. `peak` then reports n, and a `peak` below n means the rendezvous itself
+// is broken.
+//
+// The first version of this measured overlap without constructing it and
+// asserted only that two goroutines coincided. CI serialized all 512 and the
+// build went red on a test whose subject was fine — a guard failing for a
+// reason that has nothing to do with what it guards, which is the same class of
+// defect as a guard that passes for one.
 
 // storm fires n charges from n goroutines released at the same instant.
 //
@@ -143,13 +149,33 @@ func TestLimiterWithNoRateAdmitsWithoutRecording(t *testing.T) {
 func storm(n int, charge func(i int) bool) (admitted, peak int) {
 	var (
 		arrived sync.WaitGroup
-		done    sync.WaitGroup
-		release = make(chan struct{})
+		// atCharge is a second rendezvous, and it is the one that makes this a
+		// concurrency test rather than a hope.
+		//
+		// Releasing n goroutines from a channel does not make them run at once:
+		// they land on one run queue, work-stealing spreads them at the
+		// scheduler's convenience, and charge() is a mutex acquisition and some
+		// float arithmetic — short enough that the whole storm can drain before
+		// a second P ever picks any of it up. CI proved that on 2026-08-14: 512
+		// charges, peak depth 1, on a runner with GOMAXPROCS >= 2. The old
+		// comment here said the depth "holds easily" everywhere but a single-P
+		// runtime, and it was simply wrong.
+		//
+		// So the overlap is constructed instead of observed. Every goroutine
+		// records its depth and then waits here until the last one has arrived,
+		// which puts all n in the counted region before any of them charges. The
+		// peak is then n by construction on any GOMAXPROCS, and the exactness
+		// assertions downstream are running against a genuine simultaneous
+		// arrival rather than one the scheduler happened to grant.
+		atCharge sync.WaitGroup
+		done     sync.WaitGroup
+		release  = make(chan struct{})
 
 		ok      atomic.Int64
 		inside  atomic.Int64
 		highest atomic.Int64
 	)
+	atCharge.Add(n)
 	arrived.Add(n)
 	done.Add(n)
 	for i := range n {
@@ -165,6 +191,10 @@ func storm(n int, charge func(i int) bool) (admitted, peak int) {
 					break
 				}
 			}
+			// Nothing charges until every goroutine is counted as present.
+			atCharge.Done()
+			atCharge.Wait()
+
 			allowed := charge(i)
 			inside.Add(-1)
 
@@ -182,20 +212,25 @@ func storm(n int, charge func(i int) bool) (admitted, peak int) {
 
 // assertContended fails a concurrency test that turned out not to be one.
 //
-// It is skipped on a single-P runtime, where simultaneous execution is not a
-// thing the scheduler can produce and the assertion would be a lie rather than
-// a check. Everywhere else it holds easily: [stream.Limiter.AllowAt] takes a
-// mutex, so contention parks goroutines *inside* the charge and the depth
-// climbs well past two.
+// Since storm's second rendezvous, the depth is n by construction rather than
+// by scheduler luck, so this checks storm itself: a peak below n means the
+// rendezvous is broken and every exactness assertion downstream is running
+// against however many goroutines happened to be running, which is the state
+// this helper existed to catch and previously could not.
+//
+// The old version skipped on a single-P runtime and asserted only `peak >= 2`
+// elsewhere. Both parts were wrong. The skip is unnecessary — a rendezvous
+// works on one P, because a blocked goroutine yields — and `>= 2` was a
+// threshold weak enough to pass on 511 serialized charges out of 512 while
+// still failing outright when the scheduler serialized all of them, which is
+// what CI hit.
 func assertContended(t *testing.T, peak, n int) {
 	t.Helper()
 	t.Logf("%d charges, %d of them inside the limiter at once", n, peak)
-	if runtime.GOMAXPROCS(0) < 2 {
-		return
-	}
-	if peak < 2 {
-		t.Errorf("no two of the %d charges were ever inside the limiter at the same time: this ran "+
-			"sequentially and asserts nothing about concurrency", n)
+	if peak != n {
+		t.Errorf("%d of the %d charges were inside the limiter at once, want all %d: storm's rendezvous "+
+			"did not hold every goroutine until the last arrived, so this test is asserting exactness "+
+			"against a charge count it did not actually run concurrently", peak, n, n)
 	}
 }
 

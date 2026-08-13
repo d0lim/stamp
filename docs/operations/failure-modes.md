@@ -251,14 +251,57 @@ it does.
 | 128 simultaneous decides admit exactly the burst, and every refusal has one audit record naming the budget that bound | `TestDecideBudgetsAreExactUnderConcurrentLoad` (`internal/api`) |
 | A refused ingest event is not applied to the aggregate a policy later reads | `TestIngestRateLimitHoldsWhenSubmitsArriveTogether` (`internal/stream`) |
 
-Each of those tests releases its goroutines through a barrier and then asserts
-how many were inside the limiter at the same time, so that a run which happened
-to serialize fails instead of passing quietly.
+Each of those tests releases its goroutines through a barrier and then holds
+them at a second one until every goroutine has arrived at the charge, so the
+overlap is a fact of the test's construction rather than something the scheduler
+had to grant. The earlier version only measured whether goroutines coincided and
+required that two of them did; CI serialized all 512 on a runner with more than
+one P and the build went red on a test whose subject was fine.
 
 Remember what the limit is and is not: **it is per instance**, so N replicas
-admit N times the configured rate. The absolute bound on what one subject can
-accumulate is the outstanding-decision cap, which is counted in the database and
-does hold across the fleet. Size a fleet by dividing.
+admit N times the configured rate — **measured, not assumed**: two instances on
+one database, one caller, a configured burst of 3, and 6 requests admitted
+(`TestTheDecideBudgetIsPerInstanceAndNotFleetWide`, `internal/runtime`). The
+absolute bound on what one subject can accumulate is the outstanding-decision
+cap, which is counted in the database and does hold across the fleet. Size a
+fleet by dividing.
+
+**A refused decide is a `200` carrying a denied decision whose reason is
+`rate_limited`, not a `429`.** An authorization engine answers "denied"; it does
+not error. Do not alert on 4xx to find rate limiting on this surface.
+
+**The check surface has no budget, and that is R43's scope rather than a gap.**
+R43 names decide creation, challenge issuance, external webhook dispatch,
+approval submission, and revision-proposal operations — the things that create
+state, spend an IdP call, or reach a third party. A stateless evaluation does
+none of those. If a deployment needs the check surface bounded against volume,
+that is a load-balancer or gateway concern, not one this engine currently claims.
+
+---
+
+## Saturation: what happens at the limits
+
+The bounds below are the ones a deployment actually meets. Until 2026-08-14 all
+three were documented and none had been driven to its boundary; these rows are
+what was observed when they were.
+
+| Boundary | Value | Observed behaviour | Held by |
+|---|---|---|---|
+| Rate-limiter table | `DefaultMaxRateEntries` = 8192 | Full table with nothing sweepable **refuses** a new key rather than admitting it unmetered; keys already in the table keep being charged; the table recovers once buckets refill | `TestLimiterRefusesANewKeyAtTheRealTableBound`, `TestLimiterAdmitsAgainOnceTheTableCanBeSwept` (`internal/stream`) |
+| Audit buffer | `DefaultAuditCapacity` = 4096 **per flush interval** | Loss begins at exactly capacity + 1, not before; the loss is written to the chain as a gap marker naming the count and window; the first lost record alerts | `TestTheAuditBufferDropsOnlyOnceItIsFull`, `TestSaturationLeavesAMarkedGapRatherThanASilentHole` (`internal/api`) |
+| Audit alert latch | `DefaultAuditAlertThreshold` = 1 | Clears only once the loss is marked **and** the queue has drained below half capacity — it stays up while the buffer is still full | `TestTheSaturationAlertClearsOnlyAfterTheLossIsRecorded`, `TestSaturationStillAlertsWhileThePressureHolds` (`internal/api`) |
+| `STAMP_AUDIT_FAIL_CLOSED` under saturation | — | Engages on a **full buffer**, not only on an unreachable chain — a traffic spike produces the same refusal an outage does | `TestFailClosedFollowsSaturationNotOnlyChainFailure` (`internal/api`) |
+
+The audit threshold is stated in **events per flush interval**, not as a rate,
+because that is the unit the buffer decides in: it drops when the queue reaches
+capacity between two flushes. Convert with your own
+`STAMP_AUDIT_FLUSH_INTERVAL` — at the 1s default, 4096 events per second.
+
+Two of these were open questions before they were measured. Whether
+`STAMP_AUDIT_FAIL_CLOSED` covered saturation as well as chain failure was not
+written down anywhere; it does. And the rate-limiter bound had only ever been
+exercised at `MaxRateEntries: 2`, which proves the branch exists and says
+nothing about 8192.
 
 ---
 
