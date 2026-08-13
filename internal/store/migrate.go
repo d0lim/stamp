@@ -177,10 +177,12 @@ func (s *Store) SchemaBehind(ctx context.Context, want uint) (version uint, dirt
 //
 // [Store.SchemaVersion] answers the same question and cannot be used here.
 // Building a migrator acquires a dedicated pooled connection for the life of the
-// call and runs `CREATE TABLE IF NOT EXISTS schema_migrations` before it reads
-// anything, which is both more than a readiness probe every few seconds should
-// cost and more privilege than a non-migrating tier's login is given: R39's
-// grants hand the decide role SELECT and nothing that creates objects. A probe
+// call and runs `CREATE TABLE IF NOT EXISTS schema_migrations` — inside a
+// transaction holding an advisory lock every other booting replica contends for
+// — before it reads anything, which is both far more than a readiness probe
+// every few seconds should cost and more privilege than a non-migrating tier's
+// login is given: R39's grants hand the decide role SELECT and nothing that
+// creates objects. A probe
 // that needed DDL rights to answer "may I serve?" would fail closed on exactly
 // the least-privilege deployments this project asks operators to run.
 //
@@ -389,52 +391,104 @@ func newPgxMigrationDriver(ctx context.Context, pool *pgxpool.Pool) (*pgxMigrati
 	return d, nil
 }
 
+// versionTableLockKey serialises the version-table create against a peer's.
+//
+// It is deliberately not lockKey. Reusing the migration lock would make every
+// boot wait out a peer's entire migration run before executing a create that
+// finds the table already there, and then wait again in Lock. This key is held
+// only for the create, so boots serialise against each other's create and
+// nothing else.
+//
+// Nothing ever holds both this and lockKey at once — this one is taken and
+// released inside newPgxMigrationDriver, before the driver is handed to
+// golang-migrate and long before Lock runs — so the two cannot deadlock.
+var versionTableLockKey = advisoryKey("stamp:migrations:version-table")
+
 // ensureVersionTable creates the version table if it is not there.
 //
-// This runs before the migration lock is taken and it has to: golang-migrate
-// calls Lock and then immediately Version, so the table has to exist before the
-// driver is handed to the library. That leaves the create itself unprotected,
-// and `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent identical
-// create — the IF NOT EXISTS check and the catalogue insert are separate steps.
-// Two processes booting together both find nothing, both insert, and the loser
-// blocks until the winner commits and then takes
-// `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`
-// (23505, on the table's implicit row type). Every replica migrates by default,
-// so that killed a booting pod on a normal rollout.
+// This runs before the migration lock is taken and it has to. The reason is
+// narrower than "golang-migrate calls Lock then Version": Migrate.Version calls
+// the driver's Version with no lock at all (golang-migrate v4.19.1
+// migrate.go:384 — it and Close are the only two driver calls that bypass
+// m.lock), and Store.SchemaVersion goes through exactly that path. A create
+// moved inside Lock would leave an unmigrated database answering 42P01 to
+// SchemaVersion instead of "nothing applied yet".
 //
-// The retry is what makes it safe, and it verifies rather than assumes: the
-// second attempt re-runs the same statement, which now finds the committed table
-// and does nothing. Tolerating the error without re-running would be trusting
-// that a duplicate could only ever have come from an identical create. One retry
-// is enough because the only way to lose this race is against a create that has
-// already committed — there is no third state to converge on.
+// So the create stays here, and the lock comes to it. `CREATE TABLE IF NOT
+// EXISTS` is not atomic against a concurrent identical create — the existence
+// check and the catalogue insert are separate steps, and which of them notices
+// the peer decides which error Postgres raises:
+//
+//	42P07  the pg_class pre-check in heap_create_with_catalog saw a committed peer
+//	42710  the pg_type pre-check saw one — every table has an implicit row type
+//	23505  both pre-checks passed and pg_type_typname_nsp_index caught the insert
+//
+// That set is closed for this statement: two pre-checks and one unique index,
+// with no fourth place to lose. Which one fires is pure scheduling luck, which
+// is why this was fixed twice before and stayed broken — each fix recorded the
+// code that incident produced rather than the mechanisms that can produce one.
+//
+// Under the lock none of them can fire. isDuplicateObject stays as a belt for
+// the one window the lock cannot cover: the rolling upgrade that deploys this
+// code, where pods still running the previous build create without taking it.
+//
+// The lock is transaction-scoped and blocking for the reasons ApplyGrants gives
+// at length above — it releases at commit with no bookkeeping and no way to leak
+// a held lock back into the pool, and both boots are meant to succeed. The
+// polling try-lock in Lock is not the pattern to copy here: that shape exists
+// because golang-migrate abandons an over-budget Driver.Lock goroutine while the
+// caller releases the pooled connection underneath it. Nothing abandons this
+// call — it is our own code, synchronous, inside the constructor.
 func (d *pgxMigrationDriver) ensureVersionTable() error {
 	const stmt = `CREATE TABLE IF NOT EXISTS ` + migrationsTableName + ` (
 		version bigint NOT NULL PRIMARY KEY,
 		dirty   boolean NOT NULL
 	)`
-	var err error
-	for attempt := 0; attempt < 2; attempt++ {
-		if _, err = d.conn.Exec(d.ctx, stmt); err == nil {
-			return nil
-		}
-		if !isDuplicateObject(err) {
-			break
-		}
+	tx, err := d.conn.Begin(d.ctx)
+	if err != nil {
+		return fmt.Errorf("store: begin %s create: %w", migrationsTableName, err)
 	}
-	return fmt.Errorf("store: create %s: %w", migrationsTableName, err)
+	defer func() { _ = tx.Rollback(d.ctx) }()
+
+	if _, err := tx.Exec(d.ctx, `SELECT pg_advisory_xact_lock($1)`, versionTableLockKey); err != nil {
+		return fmt.Errorf("store: lock %s create: %w", migrationsTableName, err)
+	}
+	if _, err := tx.Exec(d.ctx, stmt); err != nil && !isDuplicateObject(err) {
+		return fmt.Errorf("store: create %s: %w", migrationsTableName, err)
+	}
+	if err := tx.Commit(d.ctx); err != nil {
+		return fmt.Errorf("store: commit %s create: %w", migrationsTableName, err)
+	}
+	return nil
 }
 
 // isDuplicateObject reports whether err is Postgres refusing to create something
-// that is already there. 42P07 is the ordinary answer; 23505 is what a caller
-// gets when it lost a race to a concurrent creator, because then it is the
-// catalogue's own unique index that notices rather than an up-front check.
+// that is already there.
+//
+// The three codes are the ones a concurrent `CREATE TABLE IF NOT EXISTS` can
+// raise, enumerated by the mechanism that raises each rather than by the ones
+// this project has met — ensureVersionTable's comment has the table.
+//
+// Matching the whole 42 class would be wrong, and dangerously so. Class 42 is
+// `syntax_error_or_access_rule_violation`: it holds 42501 insufficient_privilege
+// alongside the duplicate codes. A predicate named isDuplicateObject that
+// answered true for 42501 would let a least-privilege deployment read "you may
+// not create this" as "it is already there" and boot anyway — the exact opposite
+// of what grants.sql promises for the sibling role-creation race, where a
+// permissions failure still aborts the apply and fails the boot loudly.
 func isDuplicateObject(err error) bool {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
 		return false
 	}
-	return pgErr.Code == "42P07" || pgErr.Code == "23505"
+	switch pgErr.Code {
+	case "42P07", // duplicate_table — the pg_class pre-check
+		"42710", // duplicate_object — the pg_type pre-check on the row type
+		"23505": // unique_violation — pg_type_typname_nsp_index on the insert
+		return true
+	default:
+		return false
+	}
 }
 
 // Open is part of database.Driver but is only used by the URL-registered path.
