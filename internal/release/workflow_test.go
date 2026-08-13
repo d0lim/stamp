@@ -32,6 +32,7 @@ package release_test
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,11 +56,12 @@ const (
 // --- reading the real workflow --------------------------------------------
 
 type wfStep struct {
-	Name string `yaml:"name"`
-	ID   string `yaml:"id"`
-	Uses string `yaml:"uses"`
-	If   string `yaml:"if"`
-	Run  string `yaml:"run"`
+	Name string            `yaml:"name"`
+	ID   string            `yaml:"id"`
+	Uses string            `yaml:"uses"`
+	If   string            `yaml:"if"`
+	Run  string            `yaml:"run"`
+	Env  map[string]string `yaml:"env"`
 }
 
 // label is what the step is called in a failure message. A `uses:` step often
@@ -658,4 +660,413 @@ func changelogSection(t *testing.T, heading string) string {
 		}
 	}
 	return strings.Join(body, "\n")
+}
+
+// --- the checks that make a silent no-op impossible ------------------------
+//
+// Everything above establishes the rule. Nothing above stops the rule from
+// being wrong: if publish ever fails to be the string 'true' on a real tag, all
+// seven publishing steps skip, skipped is not failed, and the release is green
+// and empty.
+//
+// So each job ends with a step that reads what is actually there — the registry,
+// dist/, and the recorded outcome of every gated step — and fails if it does not
+// match what publish claimed. Those steps carry no `if:`, which is the property
+// asserted first below, because a check gated on the condition it is checking
+// skips in precisely the runs where it was needed.
+
+const (
+	imageCheckStep     = "the image this run promised exists"
+	artifactsCheckStep = "the artifacts this run promised exist"
+)
+
+// TestTheChecksAreNotGatedOnWhatTheyCheck is the check on the checks.
+//
+// It is one line of assertion and it is the reason the other tests in this
+// section mean anything. `if: needs.gates.outputs.publish == 'true'` on the
+// verification step would make every test below pass and the workflow still ship
+// nothing, because the verification would skip alongside the publishing.
+func TestTheChecksAreNotGatedOnWhatTheyCheck(t *testing.T) {
+	wf := loadWorkflow(t)
+	for job, name := range map[string]string{"image": imageCheckStep, "artifacts": artifactsCheckStep} {
+		s := stepNamed(t, wf, job, name)
+		if s.If != "" {
+			t.Errorf("job %q step %q carries `if: %s`. A check gated on the condition it is "+
+				"checking skips exactly when the condition is wrong, which is the only run it "+
+				"was written for.", job, name, s.If)
+		}
+		steps := wf.Jobs[job].Steps
+		if last := steps[len(steps)-1]; last.Name != name {
+			t.Errorf("job %q ends with %q, not with its check %q; anything after the check is unchecked",
+				job, last.label(), name)
+		}
+	}
+}
+
+// stepOutcomes is what GitHub would record for each identified step of a job on
+// a run with this publish value: a gated step that fires is "success", a gated
+// step that does not is "skipped", and an ungated step just runs.
+func stepOutcomes(wf workflow, job, publish string) map[string]string {
+	out := map[string]string{}
+	for _, s := range wf.Jobs[job].Steps {
+		if s.ID == "" {
+			continue
+		}
+		g := gatedStep{job: job, label: s.label(), cond: strings.TrimSpace(s.If)}
+		switch {
+		case s.If == "":
+			out[s.ID] = "success"
+		case g.runsWhen(publish):
+			out[s.ID] = "success"
+		default:
+			out[s.ID] = "skipped"
+		}
+	}
+	return out
+}
+
+// checkEnv renders a check step's `env:` block for a run, so the body is fed the
+// values GitHub would feed it rather than values invented here. overrides is how
+// a red scenario says "this step skipped even though publish was true".
+func checkEnv(t *testing.T, wf workflow, job, name, publish, version string, overrides map[string]string) (wfStep, map[string]string) {
+	t.Helper()
+	step := stepNamed(t, wf, job, name)
+
+	values := map[string]string{
+		publishExpr:                   publish,
+		"needs.gates.outputs.version": version,
+		"steps.ref.outputs.ref":       "ghcr.io/d0lim/stamp:" + version,
+		"github.ref_name":             "v" + version,
+		"secrets.GITHUB_TOKEN":        "token",
+		"steps.build.outputs.digest":  "",
+	}
+	if publish == "true" {
+		values["steps.build.outputs.digest"] = "sha256:" + strings.Repeat("a", 64)
+	}
+	for id, outcome := range stepOutcomes(wf, job, publish) {
+		values["steps."+id+".outcome"] = outcome
+	}
+	for k, v := range overrides {
+		values[k] = v
+	}
+
+	env := map[string]string{}
+	for k, expr := range step.Env {
+		env[k] = substitute(t, expr, values)
+	}
+	return step, env
+}
+
+// stubTools puts the commands a check reaches for outside the runner on PATH.
+// Each one's exit status comes from the environment, so a scenario can say "the
+// registry does not have it" without a second stub.
+//
+// sha256sum is stubbed only where it is missing (macOS ships shasum instead), so
+// the checksum verification in the check runs for real rather than against a
+// program that always agrees.
+func stubTools(t *testing.T, dir string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o750); err != nil {
+		t.Fatalf("stub bin: %v", err)
+	}
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o700); err != nil { //nolint:gosec // test-owned stub
+			t.Fatalf("write stub %s: %v", name, err)
+		}
+	}
+	for _, tool := range []string{"docker", "helm", "gh"} {
+		write(tool, "#!/usr/bin/env bash\nexit \"${"+strings.ToUpper(tool)+"_EXIT:-0}\"\n")
+	}
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		write("sha256sum", "#!/usr/bin/env bash\nexec shasum -a 256 \"$@\"\n")
+	}
+	return bin + string(os.PathListSeparator) + os.Getenv("PATH")
+}
+
+// writeDist builds the dist/ directory release-artifacts.sh produces, in the
+// two states it can be in when the check runs: signed (a real release) and
+// unsigned (a rehearsal).
+func writeDist(t *testing.T, dir, version string, signed bool) {
+	t.Helper()
+	dist := filepath.Join(dir, "dist")
+	if err := os.MkdirAll(dist, 0o750); err != nil {
+		t.Fatalf("dist: %v", err)
+	}
+	files := []string{"stamp-" + version + ".tgz", "sbom-source-" + version + ".spdx.json"}
+	put := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dist, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	put("RELEASE-NOTES-"+version+".md", "- something changed\n")
+	for _, f := range files {
+		put(f, "contents of "+f+"\n")
+	}
+
+	// The real checksums of the real files, so `sha256sum -c` in the check has
+	// something to disagree with.
+	var sums strings.Builder
+	for _, f := range files {
+		raw, err := os.ReadFile(filepath.Join(dist, f)) //nolint:gosec // test-owned temporary path
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		fmt.Fprintf(&sums, "%x  %s\n", sha256.Sum256(raw), f)
+	}
+	put("checksums.txt", sums.String())
+
+	manifest := ""
+	for _, f := range append(files, "checksums.txt") {
+		manifest += "file:" + f + "\n"
+	}
+	if signed {
+		manifest += "image:ghcr.io/d0lim/stamp:" + version + "\n"
+		for _, f := range append(files, "checksums.txt") {
+			for _, side := range []string{"sig", "pem", "cosign.bundle"} {
+				put(f+"."+side, "signature\n")
+			}
+		}
+	}
+	put("sign-manifest.txt", manifest)
+}
+
+// runCheck runs one of the two verification steps for real, under bash, against
+// a fabricated runner.
+func runCheck(t *testing.T, wf workflow, job, name, publish, version string, overrides, extraEnv map[string]string, signed bool) (string, error) {
+	t.Helper()
+	dir := t.TempDir()
+	writeDist(t, dir, version, signed)
+
+	step, env := checkEnv(t, wf, job, name, publish, version, overrides)
+	env["PATH"] = stubTools(t, dir)
+	env["REGISTRY"] = "ghcr.io"
+	env["IMAGE_NAME"] = "d0lim/stamp"
+	env["CHART_REPO"] = "oci://ghcr.io/d0lim/charts"
+	for k, v := range extraEnv {
+		env[k] = v
+	}
+	return runStep(t, dir, substitute(t, step.Run, nil), env)
+}
+
+// TestTheChecksPassTheRunsTheyAreMeantToPass is the green half. A guard that
+// only ever fails is as useless as one that only ever passes: it would be turned
+// off on the first real release.
+func TestTheChecksPassTheRunsTheyAreMeantToPass(t *testing.T) {
+	wf := loadWorkflow(t)
+	for _, tc := range []struct {
+		name    string
+		job     string
+		step    string
+		publish string
+		signed  bool
+	}{
+		{"the image job on a real release", "image", imageCheckStep, "true", true},
+		{"the image job on a rehearsal", "image", imageCheckStep, "false", false},
+		{"the artifacts job on a real release", "artifacts", artifactsCheckStep, "true", true},
+		{"the artifacts job on a rehearsal", "artifacts", artifactsCheckStep, "false", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runCheck(t, wf, tc.job, tc.step, tc.publish, "1.2.3", nil, nil, tc.signed)
+			if err != nil {
+				t.Fatalf("the check failed a run it is supposed to pass: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+// TestTheChecksFailWhenNothingWasPublished is the red half, and it is the whole
+// point: every scenario here is a run that is green today and would ship an
+// empty release.
+//
+// The workflow cannot be dispatched from here, so the step body is pulled out of
+// the real file and run under bash with the runner fabricated around it. What is
+// being proved is the step's own logic, not GitHub's — GitHub's part is that a
+// non-zero exit fails a step, which is not in doubt.
+func TestTheChecksFailWhenNothingWasPublished(t *testing.T) {
+	wf := loadWorkflow(t)
+	for _, tc := range []struct {
+		name      string
+		job       string
+		step      string
+		publish   string
+		signed    bool
+		overrides map[string]string
+		extraEnv  map[string]string
+		want      string
+	}{
+		{
+			// The failure this round exists for: publish said true, the gated
+			// step skipped anyway, and every other step was happy.
+			name:      "a publishing step skipped on a release",
+			job:       "image",
+			step:      imageCheckStep,
+			publish:   "true",
+			signed:    true,
+			overrides: map[string]string{"steps.sign.outcome": "skipped"},
+			want:      "sign the image by digest",
+		},
+		{
+			name:      "the build pushed nothing, so there is no digest",
+			job:       "image",
+			step:      imageCheckStep,
+			publish:   "true",
+			signed:    true,
+			overrides: map[string]string{"steps.build.outputs.digest": ""},
+			want:      "no digest",
+		},
+		{
+			name:     "the image is not in the registry it was said to be pushed to",
+			job:      "image",
+			step:     imageCheckStep,
+			publish:  "true",
+			signed:   true,
+			extraEnv: map[string]string{"DOCKER_EXIT": "1"},
+			want:     "is not in",
+		},
+		{
+			// The other direction. A rehearsal that signed something has
+			// published something, and nobody asked it to.
+			name:      "a rehearsal ran a publishing step",
+			job:       "image",
+			step:      imageCheckStep,
+			publish:   "false",
+			signed:    false,
+			overrides: map[string]string{"steps.sign.outcome": "success"},
+			want:      "sign the image by digest",
+		},
+		{
+			name:      "the signing loop skipped on a release",
+			job:       "artifacts",
+			step:      artifactsCheckStep,
+			publish:   "true",
+			signed:    true,
+			overrides: map[string]string{"steps.sign.outcome": "skipped"},
+			want:      "sign every file in the manifest",
+		},
+		{
+			// The signing step reads sign-manifest.txt in a loop. A loop over a
+			// manifest it never opened produces no error and no signatures.
+			name:    "a release whose artifacts were never signed",
+			job:     "artifacts",
+			step:    artifactsCheckStep,
+			publish: "true",
+			signed:  false,
+			want:    "unsigned",
+		},
+		{
+			name:     "the chart was never pushed to the registry",
+			job:      "artifacts",
+			step:     artifactsCheckStep,
+			publish:  "true",
+			signed:   true,
+			extraEnv: map[string]string{"HELM_EXIT": "1"},
+			want:     "is not in the registry",
+		},
+		{
+			name:     "there is no GitHub release for the tag",
+			job:      "artifacts",
+			step:     artifactsCheckStep,
+			publish:  "true",
+			signed:   true,
+			extraEnv: map[string]string{"GH_EXIT": "1"},
+			want:     "no GitHub release",
+		},
+		{
+			// The `!= 'true'` branch gets the same treatment as the seven. A
+			// rehearsal whose only visible output stopped being produced is a
+			// rehearsal nobody can read.
+			name:      "a rehearsal wrote no summary",
+			job:       "artifacts",
+			step:      artifactsCheckStep,
+			publish:   "false",
+			signed:    false,
+			overrides: map[string]string{"steps.rehearsal.outcome": "skipped"},
+			want:      "rehearsal summary",
+		},
+		{
+			name:    "a rehearsal signed and named an image",
+			job:     "artifacts",
+			step:    artifactsCheckStep,
+			publish: "false",
+			signed:  true,
+			want:    "run that publishes nothing",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runCheck(t, wf, tc.job, tc.step, tc.publish, "1.2.3", tc.overrides, tc.extraEnv, tc.signed)
+			if err == nil {
+				t.Fatalf("the check passed a run that published nothing:\n%s", out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("the check failed without saying what was missing: want %q in\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// TestTheArtifactCheckReadsTheArtifactsAndNotTheLog covers the half of the check
+// that does not depend on any step outcome: dist/ has to hold what the release
+// says it holds, on both paths. A run where every step reported success and the
+// directory is wrong is still a bad release.
+func TestTheArtifactCheckReadsTheArtifactsAndNotTheLog(t *testing.T) {
+	wf := loadWorkflow(t)
+	for _, tc := range []struct {
+		name    string
+		publish string
+		signed  bool
+		break_  func(t *testing.T, dist string)
+		want    string
+	}{
+		{
+			name: "the release notes are empty", publish: "false", signed: false,
+			break_: func(t *testing.T, dist string) { truncate(t, filepath.Join(dist, "RELEASE-NOTES-1.2.3.md")) },
+			want:   "no release notes",
+		},
+		{
+			name: "the chart was never packaged", publish: "false", signed: false,
+			break_: func(t *testing.T, dist string) { remove(t, filepath.Join(dist, "stamp-1.2.3.tgz")) },
+			want:   "no packaged chart",
+		},
+		{
+			name: "a file changed after its checksum was written", publish: "true", signed: true,
+			break_: func(t *testing.T, dist string) {
+				if err := os.WriteFile(filepath.Join(dist, "stamp-1.2.3.tgz"), []byte("tampered\n"), 0o600); err != nil {
+					t.Fatalf("tamper: %v", err)
+				}
+			},
+			want: "does not match its own checksums",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeDist(t, dir, "1.2.3", tc.signed)
+			tc.break_(t, filepath.Join(dir, "dist"))
+
+			step, env := checkEnv(t, wf, "artifacts", artifactsCheckStep, tc.publish, "1.2.3", nil)
+			env["PATH"] = stubTools(t, dir)
+			env["CHART_REPO"] = "oci://ghcr.io/d0lim/charts"
+			out, err := runStep(t, dir, substitute(t, step.Run, nil), env)
+			if err == nil {
+				t.Fatalf("the check passed on a broken dist/:\n%s", out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("want %q in\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+func truncate(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("truncate %s: %v", path, err)
+	}
+}
+
+func remove(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove %s: %v", path, err)
+	}
 }
