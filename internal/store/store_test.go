@@ -855,6 +855,58 @@ func TestMigrateSurvivesConcurrentBoot(t *testing.T) {
 	}
 }
 
+// TestCommitAfterAFailedStatementReportsRollback pins the driver behaviour
+// ensureVersionTable's duplicate branch is shaped around.
+//
+// A statement that errors inside an explicit transaction leaves it aborted, so
+// Postgres answers COMMIT with a ROLLBACK tag rather than an error — and pgx
+// turns that tag into ErrTxCommitRollback. Code that tolerates an error and then
+// commits anyway therefore fails at the commit, not at the statement it chose to
+// tolerate.
+//
+// That is not a hypothetical here: it is the rolling upgrade that introduces the
+// version-table lock, where a pod on the previous build can commit the table
+// between this transaction's lock and its create. Tolerating the duplicate and
+// committing would turn that into a failed boot on the one deploy the tolerance
+// exists for.
+//
+// This test is a claim about pgx and Postgres, not about this package, which is
+// exactly why it is worth having: the reason ensureVersionTable returns early
+// instead of falling through lives outside our code, so nothing else would go
+// red if the assumption stopped holding.
+func TestCommitAfterAFailedStatementReportsRollback(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, freshDB(t))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Any error will do; a duplicate is the one this mirrors.
+	if _, err := tx.Exec(ctx, `CREATE TABLE pinned (id int)`); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	_, err = tx.Exec(ctx, `CREATE TABLE pinned (id int)`)
+	if err == nil {
+		t.Fatal("a second CREATE TABLE of the same name succeeded")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "42P07" {
+		t.Fatalf("second create = %v, want 42P07 duplicate_table", err)
+	}
+
+	if cerr := tx.Commit(ctx); !errors.Is(cerr, pgx.ErrTxCommitRollback) {
+		t.Fatalf("commit after a failed statement = %v, want pgx.ErrTxCommitRollback; "+
+			"if this driver behaviour changed, ensureVersionTable's duplicate branch can be simplified", cerr)
+	}
+}
+
 // assertGrantsAreRestrictive checks a sample of the privilege matrix R39 and R42
 // pin down: every role can read what it has to read, and none of them gained a
 // write the grants file does not hand out.

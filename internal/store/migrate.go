@@ -182,9 +182,9 @@ func (s *Store) SchemaBehind(ctx context.Context, want uint) (version uint, dirt
 // — before it reads anything, which is both far more than a readiness probe
 // every few seconds should cost and more privilege than a non-migrating tier's
 // login is given: R39's grants hand the decide role SELECT and nothing that
-// creates objects. A probe
-// that needed DDL rights to answer "may I serve?" would fail closed on exactly
-// the least-privilege deployments this project asks operators to run.
+// creates objects. A probe that needed DDL rights to answer "may I serve?"
+// would fail closed on exactly the least-privilege deployments this project
+// asks operators to run.
 //
 // A missing table is reported as "nothing applied" rather than as an error for
 // the same reason SchemaVersion reports a missing row that way: a database
@@ -432,6 +432,12 @@ var versionTableLockKey = advisoryKey("stamp:migrations:version-table")
 // the one window the lock cannot cover: the rolling upgrade that deploys this
 // code, where pods still running the previous build create without taking it.
 //
+// The transaction is opened on d.conn rather than through Store.InTx, which is
+// how the rest of this package writes one. InTx is a method on *Store and begins
+// on any pooled connection; this driver holds its own connection and has no
+// Store to reach, so going through it would mean plumbing one in to acquire a
+// second connection for work the driver's own can already do.
+//
 // The lock is transaction-scoped and blocking for the reasons ApplyGrants gives
 // at length above — it releases at commit with no bookkeeping and no way to leak
 // a held lock back into the pool, and both boots are meant to succeed. The
@@ -453,8 +459,25 @@ func (d *pgxMigrationDriver) ensureVersionTable() error {
 	if _, err := tx.Exec(d.ctx, `SELECT pg_advisory_xact_lock($1)`, versionTableLockKey); err != nil {
 		return fmt.Errorf("store: lock %s create: %w", migrationsTableName, err)
 	}
-	if _, err := tx.Exec(d.ctx, stmt); err != nil && !isDuplicateObject(err) {
-		return fmt.Errorf("store: create %s: %w", migrationsTableName, err)
+	if _, err := tx.Exec(d.ctx, stmt); err != nil {
+		if !isDuplicateObject(err) {
+			return fmt.Errorf("store: create %s: %w", migrationsTableName, err)
+		}
+		// A peer committed the table between this transaction's lock and its
+		// create. Under the lock that cannot happen between two processes
+		// running this code, so what is left is the rollout that introduces the
+		// lock: pods still on the previous build create without taking it.
+		//
+		// Returning here rather than falling through to Commit is not tidiness.
+		// The failed statement put the transaction in an aborted state, so
+		// Postgres answers COMMIT with a ROLLBACK tag — and pgx reports that as
+		// ErrTxCommitRollback (pgx/v5 tx.go, dbTx.Commit). Committing here would
+		// turn "a peer already made the table" into a failed boot, on exactly
+		// the deploy this tolerance exists for. The deferred rollback closes the
+		// transaction; the table is there either way, which is all the caller
+		// needs. TestCommitAfterAFailedStatementReportsRollback pins the pgx
+		// behaviour this depends on.
+		return nil
 	}
 	if err := tx.Commit(d.ctx); err != nil {
 		return fmt.Errorf("store: commit %s create: %w", migrationsTableName, err)
