@@ -95,7 +95,12 @@ jobs:
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
+      # Every gated step in this job carries an id, and the check at the end of
+      # the job reads its outcome. That is the only way a step that was supposed
+      # to run and silently skipped becomes visible: a skipped step is not a
+      # failed step, and a job of skipped steps is green.
       - name: log in to the registry
+        id: login
         if: needs.gates.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
@@ -132,13 +137,63 @@ jobs:
           tags: ${{ steps.ref.outputs.tags }}
 
       - name: install cosign
+        id: cosign
         if: needs.gates.outputs.publish == 'true'
         uses: sigstore/cosign-installer@v3
       - name: sign the image by digest
+        id: sign
         if: needs.gates.outputs.publish == 'true'
         # Keyless: the signature is bound to this workflow's OIDC identity, so
         # there is no key to rotate and no key to leak.
         run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+
+      # This step has no `if:`, and that absence is the whole point of it.
+      #
+      # Three steps above are gated on needs.gates.outputs.publish. If that
+      # value is ever wrong, they skip; skipped is not failed, so the job ends
+      # green having pushed nothing. A check written as
+      # `if: needs.gates.outputs.publish == 'true'` would skip in exactly the
+      # same runs as the steps it is checking and could never see the failure —
+      # a guard gated on the condition it is guarding is not a guard.
+      #
+      # So it runs on every path, and it has an answer for both. When publish is
+      # true it insists the image is in the registry. When publish is false it
+      # insists nothing was published and that the rehearsal still produced an
+      # image, which is what a rehearsal is for.
+      - name: the image this run promised exists
+        env:
+          PUBLISH: ${{ needs.gates.outputs.publish }}
+          REF: ${{ steps.ref.outputs.ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          LOGIN_OUTCOME: ${{ steps.login.outcome }}
+          COSIGN_OUTCOME: ${{ steps.cosign.outcome }}
+          SIGN_OUTCOME: ${{ steps.sign.outcome }}
+        run: |
+          fail() { echo "release: $*" >&2; exit 1; }
+          # A gated step reports "success", "failure" or "skipped". Comparing
+          # against what publish says turns a silent skip into a red job.
+          expect() {
+            [ "$2" = "$3" ] || fail "step '$1' was $2 but publish=${PUBLISH} means it must be $3"
+          }
+
+          if [ "${PUBLISH}" = "true" ]; then
+            expect "log in to the registry" "${LOGIN_OUTCOME}" success
+            expect "install cosign"         "${COSIGN_OUTCOME}" success
+            expect "sign the image by digest" "${SIGN_OUTCOME}" success
+            [ -n "${DIGEST}" ] || fail "the build produced no digest, so nothing reached the registry"
+            docker buildx imagetools inspect "${REF}" > /dev/null \
+              || fail "${REF} is not in ${REGISTRY}, and this run reported publishing it"
+            echo "published ${REF} at ${DIGEST}"
+          else
+            expect "log in to the registry" "${LOGIN_OUTCOME}" skipped
+            expect "install cosign"         "${COSIGN_OUTCOME}" skipped
+            expect "sign the image by digest" "${SIGN_OUTCOME}" skipped
+            # `load: true` on a rehearsal leaves the image on the runner. If it
+            # is not there, the rehearsal rehearsed nothing.
+            docker image inspect "${REF}" > /dev/null \
+              || fail "the rehearsal left no ${REF} on the runner, so it built nothing"
+            echo "rehearsed ${REF} and published nothing, which is what publish=${PUBLISH} asked for"
+          fi
 
   artifacts:
     name: chart, sbom and notes
@@ -176,9 +231,11 @@ jobs:
           retention-days: 14
 
       - uses: sigstore/cosign-installer@v3
+        id: cosign
         if: needs.gates.outputs.publish == 'true'
 
       - name: sign every file in the manifest
+        id: sign
         if: needs.gates.outputs.publish == 'true'
         run: |
           cd dist
@@ -196,6 +253,7 @@ jobs:
           done < sign-manifest.txt
 
       - name: publish the chart
+        id: chart
         if: needs.gates.outputs.publish == 'true'
         run: |
           helm registry login ${{ env.REGISTRY }} \
@@ -203,6 +261,7 @@ jobs:
           helm push "dist/stamp-${{ needs.gates.outputs.version }}.tgz" "${CHART_REPO}"
 
       - name: publish the release
+        id: release
         if: needs.gates.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -212,7 +271,14 @@ jobs:
             --notes-file "dist/RELEASE-NOTES-${{ needs.gates.outputs.version }}.md" \
             dist/*
 
+      # The one step gated the other way. It is the only visible evidence a
+      # rehearsal produces, so it gets an id like the seven above and the check
+      # below asserts its outcome too: on a real release it must be skipped, and
+      # on a rehearsal it must have run. A `!= 'true'` branch that silently stops
+      # firing leaves a rehearsal with nothing to look at, which is the same
+      # failure as a release with nothing published.
       - name: rehearsal summary
+        id: rehearsal
         if: needs.gates.outputs.publish != 'true'
         run: |
           {
@@ -227,3 +293,89 @@ jobs:
             cat dist/sign-manifest.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # No `if:`. See the same step in the image job: a check that carries the
+      # condition it is checking skips whenever the thing it guards skips, and
+      # that is the failure, not the guard.
+      #
+      # This job is the one that can end green having published nothing at all.
+      # Five of its steps are gated, `build the artifacts` writes everything to
+      # dist/ whether or not anything is published, and upload-artifact happily
+      # uploads a directory nobody signed. So the check reads dist/ and the
+      # registry rather than the log.
+      - name: the artifacts this run promised exist
+        env:
+          PUBLISH: ${{ needs.gates.outputs.publish }}
+          VERSION: ${{ needs.gates.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_OUTCOME: ${{ steps.cosign.outcome }}
+          SIGN_OUTCOME: ${{ steps.sign.outcome }}
+          CHART_OUTCOME: ${{ steps.chart.outcome }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          REHEARSAL_OUTCOME: ${{ steps.rehearsal.outcome }}
+        run: |
+          fail() { echo "release: $*" >&2; exit 1; }
+          expect() {
+            [ "$2" = "$3" ] || fail "step '$1' was $2 but publish=${PUBLISH} means it must be $3"
+          }
+
+          # Built on both paths, so checked on both paths.
+          [ -s "dist/RELEASE-NOTES-${VERSION}.md" ] || fail "no release notes for ${VERSION} in dist/"
+          [ -s "dist/stamp-${VERSION}.tgz" ]        || fail "no packaged chart for ${VERSION} in dist/"
+          [ -s dist/checksums.txt ]                 || fail "dist/checksums.txt is missing or empty"
+          [ -s dist/sign-manifest.txt ]             || fail "dist/sign-manifest.txt is missing or empty"
+          ( cd dist && sha256sum -c checksums.txt > /dev/null ) \
+            || fail "dist/ does not match its own checksums"
+
+          if [ "${PUBLISH}" = "true" ]; then
+            expect "install cosign"                "${COSIGN_OUTCOME}" success
+            expect "sign every file in the manifest" "${SIGN_OUTCOME}" success
+            expect "publish the chart"             "${CHART_OUTCOME}" success
+            expect "publish the release"           "${RELEASE_OUTCOME}" success
+            expect "rehearsal summary"             "${REHEARSAL_OUTCOME}" skipped
+
+            # Every file the manifest named has a signature next to it. This is
+            # the assertion the signing loop cannot make about itself: it reads
+            # the manifest, and a manifest it never opened produces no error.
+            while IFS= read -r entry; do
+              case "${entry}" in
+                file:*)
+                  f="dist/${entry#file:}"
+                  for side in sig pem cosign.bundle; do
+                    [ -s "${f}.${side}" ] || fail "${f} went out unsigned: no ${f}.${side}"
+                  done
+                  ;;
+              esac
+            done < dist/sign-manifest.txt
+            grep -q '^image:' dist/sign-manifest.txt \
+              || fail "the manifest names no image, so the build step was told there was nothing to release"
+
+            # The two things that live outside this runner.
+            helm show chart "${CHART_REPO}/stamp" --version "${VERSION}" > /dev/null \
+              || fail "${CHART_REPO}/stamp ${VERSION} is not in the registry"
+            gh release view "${TAG}" > /dev/null \
+              || fail "there is no GitHub release for ${TAG}"
+            echo "published the chart, the release and ${VERSION}'s signed artifacts"
+          else
+            expect "install cosign"                "${COSIGN_OUTCOME}" skipped
+            expect "sign every file in the manifest" "${SIGN_OUTCOME}" skipped
+            expect "publish the chart"             "${CHART_OUTCOME}" skipped
+            expect "publish the release"           "${RELEASE_OUTCOME}" skipped
+            expect "rehearsal summary"             "${REHEARSAL_OUTCOME}" success
+
+            # Not publishing has to be as verifiable as publishing, or "nothing
+            # happened" and "nothing was supposed to happen" look identical.
+            # `if` and not `x && fail`: under `bash -e` a trailing && list that
+            # ends false is the loop's exit status, and the check would fail on
+            # the runs it is supposed to pass.
+            for stray in dist/*.sig dist/*.pem dist/*.cosign.bundle; do
+              if [ -e "${stray}" ]; then
+                fail "${stray} exists on a run that publishes nothing"
+              fi
+            done
+            if grep -q '^image:' dist/sign-manifest.txt; then
+              fail "the manifest names a published image on a run that publishes nothing"
+            fi
+            echo "built ${VERSION}'s full artifact set and published none of it, as publish=${PUBLISH} asked"
+          fi
