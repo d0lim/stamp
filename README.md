@@ -253,6 +253,7 @@ Contributions follow the landing strategy in the plan: one implementation unit p
 | [`docs/security.md`](docs/security.md) | The trust boundary, how secrets arrive, and what the demo does that you must not |
 | [`docs/break-glass.md`](docs/break-glass.md) | The offline recovery procedure for an unreachable governance quorum |
 | [`docs/operations/failure-modes.md`](docs/operations/failure-modes.md) | What each surface answers when the database is gone, which fail-open windows exist, and the test holding every claim |
+| [`docs/operations/release.md`](docs/operations/release.md) | What each way of starting the release workflow publishes, what to do before the first tag, and what is still unverified |
 | [`docs/file-authoring.md`](docs/file-authoring.md) | Authoring policy as a directory, and how it relates to the console |
 | [`STRATEGY.md`](STRATEGY.md) | Target problem, approach, who it's for, what we're not building |
 | [`docs/plans/2026-08-07-001-feat-stamp-feature-map-plan.md`](docs/plans/2026-08-07-001-feat-stamp-feature-map-plan.md) | What v1 is and how it gets built — requirements, units, verification, landing strategy |
