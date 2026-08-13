@@ -795,13 +795,29 @@ func TestMigrateSurvivesConcurrentBoot(t *testing.T) {
 
 	errs := make([]error, len(stores))
 	start := make(chan struct{})
+	// inFlight counts boots currently inside Migrate; peak remembers the most
+	// that were ever there at once. Without this the test passes on a run that
+	// happened to serialize, which is the failure mode that let this defect
+	// survive two rounds: measured against the unfixed code it failed twice in
+	// 145 runs, so a green run said nothing about 98.6% of the time. The limiter
+	// tests in internal/stream and internal/api already count entrants this way;
+	// this is that idiom reaching internal/store.
+	var inFlight, peak atomic.Int64
 	var wg sync.WaitGroup
 	for i, s := range stores {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			<-start
+			n := inFlight.Add(1)
+			for {
+				seen := peak.Load()
+				if n <= seen || peak.CompareAndSwap(seen, n) {
+					break
+				}
+			}
 			errs[i] = s.Migrate(ctx)
+			inFlight.Add(-1)
 		}()
 	}
 	close(start)
@@ -811,6 +827,14 @@ func TestMigrateSurvivesConcurrentBoot(t *testing.T) {
 		if err != nil {
 			t.Errorf("boot %d: migrate: %v", i, err)
 		}
+	}
+
+	// A run where no two boots overlapped exercised nothing this test exists to
+	// exercise, so it is reported rather than counted as a pass. It is not a
+	// product defect — hence Errorf on the observation, not Fatalf — but a green
+	// tick against a serialized run is exactly the false assurance being removed.
+	if got := peak.Load(); got < 2 {
+		t.Errorf("at most %d boot was inside Migrate at a time: the run serialized and proved nothing about the race", got)
 	}
 
 	// Every boot must also agree the schema arrived. A migrate that returned nil
