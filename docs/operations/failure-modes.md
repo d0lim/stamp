@@ -35,10 +35,16 @@ is either optional or already fails closed by construction (see
 | `POST /decisions/{id}/challenges/{n}/approvals` | `500 internal_error` — the evidence is refused, never accepted and lost | `.../a_challenge_takes_no_evidence` |
 | `GET /decisions/{id}` | `500 internal_error` | `.../the_reads_refuse_rather_than_answer_from_nothing` |
 | `GET /audit/decisions` | `500 internal_error` — never an empty history | `.../the_reads_refuse_rather_than_answer_from_nothing` |
-| `GET /healthz` | `200 ok` | `.../liveness_stays_up_and_readiness_does_not_reopen` |
-| `GET /readyz` | `200 ready` — see [the readiness note](#readyz-does-not-close-once-it-has-opened) | `.../liveness_stays_up_and_readiness_does_not_reopen` |
+| `GET /healthz` | `200 ok` — liveness is not a database probe | `.../liveness_stays_up_and_readiness_closes` |
+| `GET /readyz` | `503 not ready` — the pod takes itself out of its Service; see [the readiness note](#readyz-closes-when-this-process-stops-reaching-the-database) | `.../liveness_stays_up_and_readiness_closes` |
 
-Two things about that table are worth reading twice.
+Three things about that table are worth reading twice.
+
+**The two probes disagree, on purpose.** Liveness asks whether the process is
+wedged and readiness asks whether a request routed here can be served. A
+database that went away makes the second false and leaves the first true, and a
+liveness probe that followed the database would restart every pod in a fleet
+during an incident that no restart fixes.
 
 **The check surface answers a deny, not a 500.** A policy enforcement point has
 to do something with what it gets back, and a 500 with no verdict is not
@@ -54,17 +60,30 @@ auditor would act on. An error is the honest answer.
 No restart, no reconfiguration, no operator action. The same pool, the same
 buffer, the same process: when the database returns, every surface in the table
 above starts answering normally again — measured in the low hundreds of
-milliseconds. A refusal that outlives its cause would be its own outage, so the
-recovery is asserted as hard as the refusal.
+milliseconds, and `/readyz` back to `200` within 2ms of the first probe after
+the database returned. A refusal that outlives its cause would be its own
+outage, so the recovery is asserted as hard as the refusal, and that goes double
+for readiness: a pod that leaves its Service and never comes back is a larger
+outage than the fail-open that behaviour replaced.
 
 Held by `TestTheSurfacesAnswerWhenTheDatabaseIsGone/every_surface_recovers`.
 
 ---
 
-## Two fail-open windows, both bounded, neither fixed
+## Two fail-open windows: one closed, one described
 
-These were found by observing the process rather than by reasoning about it.
-Both are pinned by tests. Neither was changed, and the reasons are below.
+Both were found by observing the process rather than by reasoning about it, and
+both were the same shape — the system's claims about itself had come apart from
+what it did. They needed opposite fixes.
+
+For `/readyz` the intent was right and the code was wrong: the comment in
+`internal/runtime/readiness.go` said an unreachable database is reported
+unready, and the code said that exactly once. **The code was changed.**
+
+For the check surface the code is right and the claim was wrong: the window is a
+property of an asynchronous audit, and the asynchrony is a trade R32 made
+deliberately for the cost of the check path. **The claim was changed**, and the
+size of the window is now pinned by tests so it cannot grow quietly.
 
 ### The check surface serves allows for one audit flush interval
 
@@ -74,58 +93,113 @@ serialization on every check. The consequence is that **the surface finds out
 the chain is unreachable when a flush fails**, and until that moment it answers
 from the policy set it is holding.
 
-Measured, with a 50ms flush interval: between 2 and 56 allows over 6ms to 48ms.
-The bound is the flush interval, so with the shipped default of one second it is
-**about a second of allows**.
+Measured by stopping a real Postgres under a running process, at two flush
+intervals:
 
-Those allows are not in the audit chain. They are not silent either: each is
-counted as a loss, and once the database returns a `check.gap` marker naming the
-window and the number of lost records is appended, and the chain still verifies.
-An operator reading "fail closed" as *no allow is served that is not in the
-chain* is reading a stronger promise than this process makes.
+| `STAMP_AUDIT_FLUSH_INTERVAL` | allows served before the surface refused | over |
+|---|---|---|
+| 50ms (the test harness's) | 2 – 56 | 6 – 48ms |
+| **1s (the shipped default)** | **276 – 364** | **769 – 826ms** |
+
+The second row is five repeats at the interval a deployment actually runs, and
+it is what the first row's mechanism predicts: the window is bounded by one
+flush interval, and where in the interval the outage begins decides where in
+that range a given incident lands.
+
+Here is the promise, stated so it can be checked:
+
+- **`STAMP_AUDIT_FAIL_CLOSED=true` guarantees** that once the buffer has
+  *detected* it cannot write to the chain, the check surface refuses, and keeps
+  refusing until the loss has been written into the chain as a gap marker.
+- **It does not guarantee** that no allow is served outside the chain. Detection
+  is a flush that fails, so one flush interval of judgments is answered from the
+  policy set the surface holds and then dropped.
+- **The dropped ones are counted, not silent.** A `check.gap` marker naming the
+  window and the number of lost records is appended once the database returns,
+  and the chain still verifies afterwards: a marked hole, not a clean chain that
+  quietly skipped a window of traffic.
 
 - Held by `.../the_check_surface_refuses` (the bound: the surface stops allowing
-  quickly, and never allows again while the database is down) and
+  quickly, and never allows again while the database is down),
   `.../the_audit_loss_is_marked_in_the_chain` (the loss is marked and the chain
-  still verifies).
+  still verifies), and — the size of the window itself —
+  `TestFailClosedEngagesOnTheFirstFailedFlush` and
+  `TestTheUnauditedWindowIsBoundedByTheFlushInterval` (`internal/api`), which
+  fail if detection ever comes to cost more than one flush.
 - **Shorten the window** with `STAMP_AUDIT_FLUSH_INTERVAL`. The cost is one
   chain write per interval per instance whether or not there is traffic.
-- **Not fixed** because closing it means making the audit write synchronous with
-  the judgment, which is the trade R32 already made in the other direction. The
-  window is a property of an asynchronous audit, not a bug in this one:
+- **Not closed** because closing it means making the audit write synchronous
+  with the judgment, which is the trade R32 already made in the other direction.
+  The window is a property of an asynchronous audit, not a bug in this one:
   detection cannot precede the first failed write.
+- **Not renamed.** `STAMP_AUDIT_FAIL_CLOSED` is not wrong about direction, only
+  silent about when — and "when" belongs to the buffer, not to the switch.
+  Renaming an environment variable breaks every values file, sealed secret and
+  runbook that sets it, and no name short enough to be an environment variable
+  could state the size of the window anyway, so this page has to say it either
+  way.
 
-### `/readyz` does not close once it has opened
+### `/readyz` closes when this process stops reaching the database
 
-The schema gate that answers `/readyz` **latches**. The first time it confirms
-the database is at the schema this binary needs, it stops asking, and every
-later probe is answered without touching the database. So a process that has
-been found ready once reports ready for the rest of its life — including with no
-database at all.
+This one used to be the other fail-open, and it is worth keeping the history on
+the page. The schema gate that answers `/readyz` **latched**: the first time it
+confirmed the database was at the schema this binary needs, it stopped asking,
+so a pod that had been found ready once reported ready for the rest of its life
+— including with no database at all. The Helm chart probes readiness every 5
+seconds starting 2 seconds after the container starts, so in a deployment the
+gate was open within seconds of boot and stayed open. A pod that could not serve
+anything stayed in its Service and kept being sent traffic.
 
-The Helm chart probes readiness every 5 seconds starting 2 seconds after the
-container starts, so in a real deployment the gate is open within seconds of
-boot and stays open.
+It now closes again. What closes it is **failures this process already observed
+while serving** — not a health check on a timer. Every statement the process
+issues reports whether it reached Postgres at all, which costs nothing because
+the statements were happening anyway; three consecutive failures to reach the
+server, with none succeeding in between, and the pod reports itself unready.
 
-This contradicts the closing paragraph of `internal/runtime/readiness.go`, which
-reads *"A database that cannot be reached is reported unready rather than
-ready."* That sentence is true exactly once — before the gate has opened. A
-process that has never been probed successfully **does** answer `503` with
-`database schema version is unreadable`.
+The details that matter when you are reading a graph at 3am:
 
-- Held by `.../liveness_stays_up_and_readiness_does_not_reopen`. The test's
-  baseline reads `/readyz` while the database is up, exactly as a kubelet would,
-  which is what makes the assertion the one a deployment actually gets.
-- **Not fixed.** The latch is deliberate and reasoned where it is implemented: a
-  schema rolled backwards under a running pod must not pull the whole fleet out
-  of service during the incident an operator is trying to work. And the
-  operational cost of the divergence is small in the case that matters, because
-  every replica loses the same database at the same instant — unreadiness would
-  empty the Service rather than shed load onto a healthy peer.
-- **What it means for you:** do not use `/readyz` as a database health signal.
-  It answers "may a request routed here be served, as far as the schema gate
-  ever determined", and that is all. Alert on the check tier's staleness metric
-  and on the audit buffer's loss counter instead.
+- **A server that answers an error is a reachable server.** A statement timeout,
+  a constraint violation, a missing column: the gate stays open through all of
+  them, and the surfaces report them as failures. Only a statement that never
+  got to a server counts — a connection that could not be made, or one reset
+  mid-statement.
+- **One failure is not enough, and that is deliberate.** A single pooled
+  connection can be reset by an idle timeout, a proxy or a failover, and every
+  replica shares one database — so a fleet that left its Service on one blip
+  would empty the Service in unison rather than shed onto a healthy peer. Three
+  consecutive, with any success clearing the count, is a pool that cannot
+  produce a working connection rather than one connection that died.
+- **A partially degraded database keeps the pod serving.** If some statements
+  still get answers, the count keeps clearing and the pod keeps serving the
+  requests it can serve.
+- **It recovers by itself.** While the gate is closed, the probe reads the
+  schema, exactly as it does before the gate has ever opened — which is the only
+  thing left that can reach the database once Kubernetes has stopped routing to
+  the pod. Measured back at `200` within 2ms of the first probe after the
+  database returned. While the gate is open, the probe touches nothing: a
+  readiness probe that queried a struggling database would add load to the thing
+  that is already failing.
+- **`/healthz` is unchanged and stays `200` throughout.** If liveness followed
+  the database, the kubelet would restart pods that were going to recover.
+- **The schema latch is unchanged.** A schema rolled *backwards* under a running
+  pod still leaves it ready: a down migration is a manual act, and a gate that
+  reopened on one would pull the fleet out of service during the incident an
+  operator is trying to work.
+
+- Held by `.../liveness_stays_up_and_readiness_closes` (503 with no database,
+  `/healthz` still 200), `.../every_surface_recovers` (back to 200 when the
+  database returns), `TestTheGateClosesOnObservedFailuresAndOpensOnTheNextGoodRead`
+  and `TestTheSchemaGateStopsAskingOnceTheSchemaHasArrived` (`internal/runtime`,
+  the threshold, the re-read and the fact that a healthy gate still asks
+  nothing), and `TestReachabilityDistinguishesAnUnreachableServerFromAnAngryOne`
+  (`internal/store`, the classification the whole thing rests on).
+- **What it means for you:** `/readyz` is now a usable signal for *this pod
+  cannot reach its database*, and it is not a general database health signal —
+  it says nothing about a database that is reachable and unhappy. For those,
+  alert on the check tier's staleness metric and on the audit buffer's loss
+  counter. And expect a total database outage to take every pod out of every
+  Service at once, because it will: that is the honest answer, and the traffic
+  had nowhere healthy to go regardless.
 
 ---
 
@@ -147,8 +221,9 @@ the instance no longer knows what the effective policy set is, and any answer it
 gave would be a guess.
 
 What makes this safe in a shipped deployment is that it is not the only gate:
-the served surface in front of it refuses on `audit_unavailable` long before the
-staleness deadline expires, as the table at the top shows. A deployment that
+the served surface in front of it refuses on `audit_unavailable` about a second
+into the outage — one audit flush interval, as the section above measures —
+which is far short of the staleness deadline. A deployment that
 sets `STAMP_AUDIT_FAIL_CLOSED=false` gives that up and keeps only the staleness
 deadline — which is the operator's stated choice between a gap in the audit and
 an outage, and it is worth knowing that the choice also buys up to a minute of
