@@ -43,15 +43,29 @@ package runtime
 //	GET  /decisions/{id}                     500 internal_error
 //	GET  /audit/decisions                    500 internal_error
 //	GET  /healthz                            200 ok
-//	GET  /readyz                             200 ready                     (!)
+//	GET  /readyz                             503 not ready                 (!)
 //
 // The two marked lines are the findings. Both are asserted below, at
 // [TestTheSurfacesAnswerWhenTheDatabaseIsGone]'s "the check surface refuses"
 // and "readiness" subtests, with the reasoning at each.
 //
-// Nothing in this file changes behaviour. It is a description, and the point of
-// writing a description down as assertions is that the next change to any of
-// these paths has to say out loud that it moved one.
+// The `/readyz` line is the one this file has changed, and how it changed is
+// worth recording. It was written as `200 ready`, because that is what the
+// process did: the schema gate latched on the first successful probe and never
+// looked again, so a pod that had lost its database entirely stayed in its
+// Service. The line was a measurement, and it disagreed with what
+// readiness.go's own closing paragraph claimed the process did. The code was
+// then changed to match the claim rather than the other way round — the gate
+// closes again on database failures the process observes while serving — and
+// the assertion below went from recording that behaviour to requiring it. The
+// old assertion failing was the evidence the change worked:
+//
+//	GET /readyz on pep = 503 not ready: database schema version is
+//	unreadable: ... connection reset by peer with no database, want 200.
+//
+// Everything else in this file is still a description. The point of writing a
+// description down as assertions is that the next change to any of these paths
+// has to say out loud that it moved one.
 
 import (
 	"context"
@@ -546,52 +560,53 @@ func TestTheSurfacesAnswerWhenTheDatabaseIsGone(t *testing.T) {
 		}
 	})
 
-	t.Run("liveness stays up and readiness does not reopen", func(t *testing.T) {
-		// FINDING, and the one the plan expected to go the other way.
+	t.Run("liveness stays up and readiness closes", func(t *testing.T) {
+		// The two probes have to disagree here, and the disagreement is the
+		// whole point of having two of them.
 		//
-		// /healthz answering 200 is right: liveness asks whether the process is
-		// alive, and killing a pod because its database went away turns one
-		// outage into two.
+		// /healthz answers 200: liveness asks whether the process is wedged,
+		// and killing a pod because its database went away turns one outage
+		// into two. Every pod in the fleet lost the same database at the same
+		// instant, so a liveness probe that followed the database would restart
+		// the entire fleet during an incident nobody's restart can fix.
 		//
-		// /readyz answering 200 is what a deployed process does, and it is not
-		// what readiness.go's closing paragraph says. That comment reads "A
-		// database that cannot be reached is reported unready rather than
-		// ready", and it is true exactly once — before the gate has opened.
-		// [schemaVersionGate.ready] latches on its first success and every later
-		// probe is answered without touching the database, so an unreachable
-		// database is reported unready only by a process that has never yet been
-		// found ready. A pod is probed every few seconds from the moment it
-		// binds, so in a real deployment the gate is open seconds after boot and
-		// the sentence stops holding for the rest of the process's life.
+		// /readyz answers 503: readiness asks whether a request routed here can
+		// be served, and it cannot. A pod that answers ready while every
+		// statement it issues fails to reach Postgres stays in its Service and
+		// keeps receiving the traffic it is going to fail.
 		//
-		// The order of this test is what makes that visible: the baseline
-		// subtest reads /readyz while the database is up, exactly as a kubelet
-		// would, and that read is why the assertion here is 200. Written
-		// without it — which is how it was written first — the same assertion
-		// fails with 503 "database schema version is unreadable", because the
-		// gate had never opened. Both answers are this build's; which one an
-		// operator gets is decided by whether their probe ran before the outage.
+		// The order of this test is what makes the second assertion meaningful.
+		// The baseline subtest reads /readyz while the database is up, exactly
+		// as a kubelet would, so the schema gate has latched open before the
+		// kill. Without that read, a 503 here would only prove that a gate
+		// which had never opened stays shut — which was already true and is not
+		// the interesting case. With it, the 503 is the gate *closing again* on
+		// what the process observed while serving. This assertion previously
+		// required 200 and failed when the gate learned to close; see the note
+		// at the top of this file.
 		//
-		// The latch itself is deliberate and reasoned in readiness.go: a schema
-		// rolled backwards under a running pod must not pull the fleet out of
-		// service. Nothing is changed here — this round proves rather than
-		// changes — and the operational consequence is smaller than it first
-		// looks, because every replica loses the same database at the same
-		// instant, so unreadiness would empty the Service rather than shed load
-		// onto a healthy peer. It is pinned so that the divergence between the
-		// comment and the behaviour is something a reader trips over instead of
-		// something they trust.
+		// What closes it is described at [databaseReachability]: the transport
+		// failures this process was already collecting from its own queries. No
+		// probe here queries the database on the gate's behalf while it is
+		// open, which is the constraint that keeps a readiness probe from
+		// adding load to a database that is already failing.
 		for _, surface := range []api.Surface{api.SurfacePEP, api.SurfaceConsole} {
 			if status, body := h.probe(surface, "/healthz"); status != http.StatusOK {
 				t.Errorf("GET /healthz on %v = %d %s with no database, want 200: liveness is not "+
 					"a database probe", surface, status, body)
 			}
-			if status, body := h.probe(surface, "/readyz"); status != http.StatusOK {
-				t.Errorf("GET /readyz on %v = %d %s with no database, want 200. unready is arguably "+
-					"the better answer, but it is not the one a gate that has already opened gives. "+
-					"if this changed on purpose, update the table at the top of this file, "+
-					"readiness.go's closing paragraph, and docs/operations/failure-modes.md with it",
-					surface, status, body)
+			status, body := h.probe(surface, "/readyz")
+			if status != http.StatusServiceUnavailable {
+				t.Errorf("GET /readyz on %v = %d %s with no database, want 503: a pod that cannot "+
+					"reach its database must leave its Service instead of staying in it and "+
+					"failing the traffic it is sent", surface, status, body)
+			}
+			// The body says which failure it is, because a pod out of service
+			// with no reason in `kubectl describe` is an outage an operator has
+			// to guess at.
+			if !strings.Contains(body, "unreadable") {
+				t.Errorf("GET /readyz on %v = %q, want a body naming the unreachable database",
+					surface, body)
 			}
 		}
 	})
@@ -632,6 +647,29 @@ func TestTheSurfacesAnswerWhenTheDatabaseIsGone(t *testing.T) {
 			status, _ := h.do(http.MethodPost, api.SurfaceConsole, approvalPath, alice, "", nil)
 			return status == http.StatusOK
 		})
+		// Readiness is half of what makes the subtest above safe to have
+		// written. A gate that closes on a database failure and never opens
+		// again would have turned a database blip into a Deployment with no
+		// endpoints, which is a larger outage than the fail-open it replaced,
+		// and it would look exactly like a fix in every test that only killed
+		// the database. What reopens it is the probe's own schema read, which
+		// is the only thing left that can reach the database once Kubernetes
+		// has stopped routing to this pod: see [schemaVersionGate.ready].
+		for _, surface := range []api.Surface{api.SurfacePEP, api.SurfaceConsole} {
+			started := time.Now()
+			waitFor(fmt.Sprintf("readiness on %v", surface), func() bool {
+				status, _ := h.probe(surface, "/readyz")
+				return status == http.StatusOK
+			})
+			t.Logf("/readyz on %v returned to 200 within %s of the database coming back",
+				surface, time.Since(started).Round(time.Millisecond))
+			// And liveness never moved, in either direction. A /healthz that
+			// went 503 at any point in this test would have restarted a pod
+			// that recovered on its own.
+			if status, body := h.probe(surface, "/healthz"); status != http.StatusOK {
+				t.Errorf("GET /healthz on %v = %d %s after recovery, want 200", surface, status, body)
+			}
+		}
 
 		// The check surface's recovered answer has to be the policy's verdict
 		// and not a residual refusal wearing a 200.

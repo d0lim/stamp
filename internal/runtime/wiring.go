@@ -59,7 +59,10 @@ type App struct {
 	roles  Set
 	logger *slog.Logger
 
-	store      *store.Store
+	store *store.Store
+	// reach is what the pool has noticed about the database. It is the
+	// readiness gate's evidence; see readiness.go.
+	reach      *databaseReachability
 	writer     *store.AuditWriter
 	checkpoint *checkpointPlane
 	facts      *fact.Registry
@@ -110,7 +113,16 @@ func (a *App) build(ctx context.Context) error {
 	cfg := a.cfg
 
 	// --- persistence -------------------------------------------------------
-	s, err := store.Open(ctx, store.Config{DSN: cfg.DSN, MaxConns: cfg.MaxConns, Roles: cfg.DBRoles})
+	//
+	// The reachability observer is built before the pool because it is fed by
+	// the pool's own tracer: it is how this process finds out its database is
+	// gone without asking, and the readiness gate below is its only reader.
+	// See [databaseReachability].
+	a.reach = &databaseReachability{}
+	s, err := store.Open(ctx, store.Config{
+		DSN: cfg.DSN, MaxConns: cfg.MaxConns, Roles: cfg.DBRoles,
+		OnReachability: a.reach.observe,
+	})
 	if err != nil {
 		return err
 	}
@@ -744,7 +756,7 @@ func (a *App) build(ctx context.Context) error {
 	// configured not to migrate is exactly the one that has to wait. Which
 	// tiers those are is deployment configuration, so the gate is not
 	// conditional on it.
-	readiness, gerr := newSchemaVersionGate(a.store, a.logger)
+	readiness, gerr := newSchemaVersionGate(a.store, a.reach, a.logger)
 	if gerr != nil {
 		return gerr
 	}
