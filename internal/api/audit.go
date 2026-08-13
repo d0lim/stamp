@@ -149,6 +149,53 @@ type AuditConfig struct {
 	// FailClosed makes the check surface deny while the alert is up. It is the
 	// operator's choice between a gap in the audit and an outage, and R32
 	// requires it to be a choice rather than a default.
+	//
+	// What it guarantees, exactly: once this buffer has *detected* that the
+	// chain is unreachable, the surface refuses, and it keeps refusing until
+	// the loss has been written into the chain as a gap marker. Detection is a
+	// flush that fails. That is the whole promise.
+	//
+	// What it does not guarantee, and this is the part its name reads as
+	// promising: that no allow is ever served outside the chain. The buffer is
+	// asynchronous — see [AuditBuffer] for why, and it is R32's trade rather
+	// than an accident — so nothing tells the surface the chain has gone away.
+	// It finds out at the next flush, and every judgment between the chain
+	// going and that flush is answered from the policy set the surface is
+	// holding, then dropped when the flush that would have chained it fails.
+	//
+	// The window is therefore one flush interval wide, and it is not
+	// theoretical. Measured by internal/runtime's failure test, which stops a
+	// real Postgres under a running process: 2 to 56 allows over 6 to 48ms at a
+	// 50ms interval, and 276 to 364 allows over 769 to 826ms at
+	// [DefaultAuditFlushInterval]'s one second. Every one of them is counted
+	// and covered by a gap marker naming the window and the number of records
+	// missing from it, so the chain reports a hole rather than reading clean —
+	// that is what R32 asks for in exchange for the asynchrony, and it is all
+	// it asks for.
+	//
+	// The one number here that this repository controls is "one flush", and it
+	// is pinned by TestFailClosedEngagesOnTheFirstFailedFlush and
+	// TestTheUnauditedWindowIsBoundedByTheFlushInterval. A detection that came
+	// to need two flushes would double the window while every document
+	// describing it kept saying one; those tests are what makes that a build
+	// failure instead of a surprise during an incident.
+	//
+	// An operator who needs the window smaller shortens
+	// STAMP_AUDIT_FLUSH_INTERVAL and pays one chain write per interval per
+	// instance whether or not there is traffic. An operator who needs it gone
+	// is asking for a synchronous append per judgment, which is the trade R32
+	// made in the other direction and is not something this switch can undo.
+	//
+	// The name was left as it is. `STAMP_AUDIT_FAIL_CLOSED` is not wrong about
+	// direction — the surface does fail closed — it is silent about when, and
+	// "when" is a property of the buffer rather than of the switch. Renaming an
+	// environment variable breaks every values file, sealed secret and runbook
+	// that sets it, and buys a deployment either a flag day or a period of
+	// reading both names that someone has to remember to end; and no name short
+	// enough to be an environment variable states the size of the window
+	// anyway, so the documentation has to say it either way. Given that the
+	// documentation is doing the work regardless, the compatibility break buys
+	// nothing.
 	FailClosed bool
 	// Now overrides the clock, for tests.
 	Now func() time.Time
@@ -195,6 +242,14 @@ type AuditStats struct {
 // hole instead of a clean chain that quietly skipped a minute of traffic. The
 // loss counter and the alert threshold are the operator's warning that this is
 // happening, and FailClosed is their option to stop judging instead.
+//
+// Read that as the precise claim it is: nothing is lost *silently*, which is
+// not the same as nothing is lost. Asynchrony means this buffer learns the
+// chain is unreachable one flush after it became unreachable, and the
+// judgments served in between are answered and then dropped into the gap
+// marker. [AuditConfig.FailClosed] states the size of that window, what is and
+// is not promised about it, and the tests that keep the size from growing
+// without anyone noticing.
 type AuditBuffer struct {
 	writer    ChainWriter
 	capacity  int
