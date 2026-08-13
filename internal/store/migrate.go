@@ -384,7 +384,7 @@ func newPgxMigrationDriver(ctx context.Context, pool *pgxpool.Pool) (*pgxMigrati
 		return nil, fmt.Errorf("store: acquire migration connection: %w", err)
 	}
 	d := &pgxMigrationDriver{conn: conn, ctx: ctx, lockKey: advisoryKey("stamp:migrations")}
-	if err := d.ensureVersionTable(); err != nil {
+	if _, err := d.ensureVersionTable(); err != nil {
 		conn.Release()
 		return nil, err
 	}
@@ -445,44 +445,97 @@ var versionTableLockKey = advisoryKey("stamp:migrations:version-table")
 // because golang-migrate abandons an over-budget Driver.Lock goroutine while the
 // caller releases the pooled connection underneath it. Nothing abandons this
 // call — it is our own code, synchronous, inside the constructor.
-func (d *pgxMigrationDriver) ensureVersionTable() error {
+// The wait is bounded by lock_timeout rather than left to the boot context,
+// which carries no deadline of its own. Advisory locks need no privilege, so any
+// session that can connect can hold this key — and an unbounded wait would turn
+// that into every replica hanging before it binds a listener, with nothing
+// logged. Bounded, the same situation ends in 55P03 wrapped by the message
+// below, which is the shape Lock already chose for the migration key. (The
+// chart's liveness probe kills a pre-Listen container well before this fires;
+// the timeout is what makes the failure nameable when a probe is not watching.)
+//
+// The lock is transaction-scoped and blocking for the reasons ApplyGrants gives
+// at length above — it releases at commit with no bookkeeping and no way to leak
+// a held lock back into the pool, and both boots are meant to succeed. The
+// polling try-lock in Lock is not the pattern to copy here: that shape exists
+// because golang-migrate abandons an over-budget Driver.Lock goroutine while the
+// caller releases the pooled connection underneath it. Nothing abandons this
+// call — it is our own code, synchronous, inside the constructor.
+//
+// The bool reports whether a peer's create was tolerated. Only tests read it;
+// the constructor discards it. It exists because that branch is otherwise
+// unobservable, and a branch nothing can observe is a branch nothing can test —
+// which is how this defect survived two rounds.
+func (d *pgxMigrationDriver) ensureVersionTable() (toleratedDuplicate bool, err error) {
 	const stmt = `CREATE TABLE IF NOT EXISTS ` + migrationsTableName + ` (
 		version bigint NOT NULL PRIMARY KEY,
 		dirty   boolean NOT NULL
 	)`
 	tx, err := d.conn.Begin(d.ctx)
 	if err != nil {
-		return fmt.Errorf("store: begin %s create: %w", migrationsTableName, err)
+		return false, fmt.Errorf("store: begin %s create: %w", migrationsTableName, err)
 	}
 	defer func() { _ = tx.Rollback(d.ctx) }()
 
+	if _, err := tx.Exec(d.ctx, `SET LOCAL lock_timeout = `+quoteLockTimeout(migrationLockWait)); err != nil {
+		return false, fmt.Errorf("store: bound %s create wait: %w", migrationsTableName, err)
+	}
 	if _, err := tx.Exec(d.ctx, `SELECT pg_advisory_xact_lock($1)`, versionTableLockKey); err != nil {
-		return fmt.Errorf("store: lock %s create: %w", migrationsTableName, err)
+		return false, fmt.Errorf("store: lock %s create: %w", migrationsTableName, err)
 	}
 	if _, err := tx.Exec(d.ctx, stmt); err != nil {
 		if !isDuplicateObject(err) {
-			return fmt.Errorf("store: create %s: %w", migrationsTableName, err)
+			return false, fmt.Errorf("store: create %s: %w", migrationsTableName, err)
 		}
 		// A peer committed the table between this transaction's lock and its
 		// create. Under the lock that cannot happen between two processes
 		// running this code, so what is left is the rollout that introduces the
 		// lock: pods still on the previous build create without taking it.
 		//
-		// Returning here rather than falling through to Commit is not tidiness.
-		// The failed statement put the transaction in an aborted state, so
-		// Postgres answers COMMIT with a ROLLBACK tag — and pgx reports that as
-		// ErrTxCommitRollback (pgx/v5 tx.go, dbTx.Commit). Committing here would
-		// turn "a peer already made the table" into a failed boot, on exactly
-		// the deploy this tolerance exists for. The deferred rollback closes the
-		// transaction; the table is there either way, which is all the caller
-		// needs. TestCommitAfterAFailedStatementReportsRollback pins the pgx
-		// behaviour this depends on.
-		return nil
+		// This branch must never reach Commit. The failed statement put the
+		// transaction in an aborted state, and an aborted transaction cannot be
+		// committed: Postgres answers COMMIT with a ROLLBACK tag, which pgx
+		// surfaces as ErrTxCommitRollback (pgx/v5 tx.go, dbTx.Commit; pinned by
+		// TestCommitAfterAFailedStatementReportsRollback). Committing would turn
+		// "a peer already made the table" into a failed boot, on exactly the
+		// deploy this tolerance exists for.
+		// TestVersionTableToleratesAPeerThatDidNotTakeTheLock drives this branch
+		// and fails if a Commit is reintroduced anywhere below.
+		//
+		// The rollback is explicit rather than left to the defer because the
+		// next statement has to run on a transaction that is no longer aborted.
+		// That statement is the point: a duplicate error is not by itself proof
+		// that the relation exists. 42710 comes from the pg_type pre-check, and
+		// pg_type holds enums, domains and composites too — a leftover object of
+		// this name would satisfy the tolerance forever while no table existed.
+		// The code this replaced re-ran the create for exactly this reason
+		// ("it verifies rather than assumes"); dropping that check would have
+		// traded a named failure here for a confusing 42P01 from Version later.
+		_ = tx.Rollback(d.ctx)
+		var exists bool
+		if verr := d.conn.QueryRow(d.ctx,
+			`SELECT to_regclass($1) IS NOT NULL`, migrationsTableName).Scan(&exists); verr != nil {
+			return true, fmt.Errorf("store: verify %s after a tolerated duplicate: %w", migrationsTableName, verr)
+		}
+		if !exists {
+			return true, fmt.Errorf(
+				"store: %s was reported as already existing but no such relation is present — "+
+					"an object of that name that is not a table? (original error: %w)", migrationsTableName, err)
+		}
+		return true, nil
 	}
 	if err := tx.Commit(d.ctx); err != nil {
-		return fmt.Errorf("store: commit %s create: %w", migrationsTableName, err)
+		return false, fmt.Errorf("store: commit %s create: %w", migrationsTableName, err)
 	}
-	return nil
+	return false, nil
+}
+
+// quoteLockTimeout renders d as a SQL string literal for SET LOCAL, which does
+// not accept a bind parameter. The value is derived from a constant in this
+// file, never from input, and milliseconds are the unit lock_timeout reads when
+// given a bare number — the explicit unit here is for the reader.
+func quoteLockTimeout(d time.Duration) string {
+	return fmt.Sprintf("'%dms'", d.Milliseconds())
 }
 
 // isDuplicateObject reports whether err is Postgres refusing to create something

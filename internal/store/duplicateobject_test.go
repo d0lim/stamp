@@ -78,8 +78,15 @@ func TestIsDuplicateObjectRefusesNonPostgresErrors(t *testing.T) {
 	if isDuplicateObject(nil) {
 		t.Error("isDuplicateObject reported nil as a duplicate")
 	}
-	// The predicate has to see through wrapping: ensureVersionTable receives what
-	// pgx returns, and every layer between here and the wire may wrap it.
+}
+
+// TestIsDuplicateObjectSeesThroughWrapping is separate from the refusal test
+// because it is a positive case: bundling it there made a failed unwrap report
+// itself as "refuses non-Postgres errors", which names the wrong defect.
+//
+// It matters because nothing guarantees the error arrives bare — ensureVersionTable
+// passes on what pgx returns, and any layer between here and the wire may wrap it.
+func TestIsDuplicateObjectSeesThroughWrapping(t *testing.T) {
 	if !isDuplicateObject(fmt.Errorf("exec create: %w", pgErr("42710"))) {
 		t.Error("isDuplicateObject did not unwrap a wrapped PgError")
 	}
