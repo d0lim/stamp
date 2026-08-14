@@ -112,9 +112,16 @@ with the chart it was supposed to catch. That is why `mounted-routes.json` and
 maintained alongside it.
 
 **A measured example:** a hand count of this project's error-code vocabulary came
-to 28. The real number is 48. The 18 that were missed are returned by four error
-tables and never appear as literals at any call site — exactly the codes a human
-reading call sites cannot see.
+to 29, arrived at by reading the literals at `writeError` call sites. The real
+number is 48. The 19 that were missed are returned as *values* by five helper
+functions — `approvalError`, `auditReadError`, `decisionError`, `noSuchDecision`,
+`mfaError` — so they appear as a literal at no call site at all. They are exactly
+the codes a human reading call sites cannot see, which is why
+`console/contract/error-codes.json` is derived from the code and compared rather
+than maintained.
+
+This paragraph had the wrong numbers in it until they were checked against the
+derived artifact — it said 28 and four. Fitting, for the section it is in.
 
 ---
 
