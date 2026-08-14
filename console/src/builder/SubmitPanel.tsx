@@ -44,8 +44,9 @@ export function draftDelta(draft: Draft): Delta {
 }
 
 const MODE_LABELS: Readonly<Record<ApplicationMode, string>> = {
-  revaluate: '재평가 — 미결 결정을 새 정책으로 다시 판정합니다 (기본)',
-  grandfather: '유예 — 미결 결정은 만들어질 때의 버전으로 끝냅니다',
+  revaluate: 'revalidation — pending decisions are judged again against the new policy (default)',
+  grandfather:
+    'grandfathering — pending decisions finish under the version in force when they were created',
 }
 
 export function SubmitPanel({
@@ -103,10 +104,10 @@ export function SubmitPanel({
   return (
     <div className="submit">
       <fieldset className="group">
-        <legend className="group__legend">적용 방식</legend>
+        <legend className="group__legend">Application mode</legend>
         <p className="field__hint" data-testid="affected-decisions">
-          이 개정이 영향을 줄 미결 결정:{' '}
-          {preview === null ? '프리플라이트 전에는 알 수 없습니다' : `${preview.affected_decisions}건`}
+          Pending decisions this revision would affect:{' '}
+          {preview === null ? 'unknown before the preflight' : preview.affected_decisions}
         </p>
         {(['revaluate', 'grandfather'] as const).map((value) => (
           <div className="field field--inline" key={value}>
@@ -128,14 +129,15 @@ export function SubmitPanel({
 
       {hasNoDeclarations(draft.schema) ? null : (
         <p className="notice notice--warning" data-testid="schema-submission-warning">
-          이 개정에는 선언(schema)도 함께 실립니다. 콘솔은 현재 발효 중인 선언을 읽을 수단이 없어
-          이전 선언을 함께 보내지 못하므로, fact source 실패 동작이 deny에서 allow로 바뀌는 완화는
-          자동 분류에 잡히지 않습니다. 승인자가 직접 확인해야 합니다.
+          This revision carries the declarations (schema) as well. The console has no way to read
+          the declarations currently in force, so it cannot send the previous ones alongside them,
+          and a weakening that turns a fact source's failure behaviour from deny into allow is not
+          caught by the automatic classification. An approver has to check it directly.
         </p>
       )}
 
       <button type="button" className="button" onClick={runPreview} disabled={busy}>
-        제출 전 확인 (프리플라이트)
+        Check before submitting (preflight)
       </button>
 
       {failure === null ? null : (
@@ -146,7 +148,7 @@ export function SubmitPanel({
 
       {preview === null ? null : (
         <div className="preview" data-testid="revision-preview">
-          <h3>제출하면 무슨 일이 일어나는가</h3>
+          <h3>What happens if you submit</h3>
 
           {/*
             R23 asks for the change diff beside the classification. It is drawn
@@ -155,19 +157,21 @@ export function SubmitPanel({
             approving are the same rendering of the same delta rather than two
             components that happen to agree today.
           */}
-          <h4>변경 내용</h4>
+          <h4>Changes</h4>
           <DocumentDiff idPrefix="submit-diff" after={serializePolicy(draft.policy)} />
 
           <dl className="summary-list">
-            <dt>거버넌스</dt>
-            <dd>{preview.mode === 'quorum' ? '잠김 (quorum)' : '미잠금 (solo_admin)'}</dd>
-            <dt>완화 분류</dt>
+            <dt>Governance</dt>
+            <dd>{preview.mode === 'quorum' ? 'locked (quorum)' : 'unlocked (solo_admin)'}</dd>
+            <dt>Weakening classification</dt>
             <dd>
-              {preview.weakening ? '완화로 분류됨' : '완화 아님'}
-              {preview.findings.length === 0 ? '' : ` · ${preview.findings.length}건`}
+              {preview.weakening ? 'classified as a weakening' : 'not a weakening'}
+              {preview.findings.length === 0
+                ? ''
+                : ` · ${preview.findings.length} finding${preview.findings.length === 1 ? '' : 's'}`}
             </dd>
-            <dt>영향받는 미결 결정</dt>
-            <dd>{preview.affected_decisions}건</dd>
+            <dt>Pending decisions affected</dt>
+            <dd>{preview.affected_decisions}</dd>
           </dl>
 
           {preview.findings.length === 0 ? null : (
@@ -182,26 +186,27 @@ export function SubmitPanel({
 
           {preview.mode === 'quorum' ? (
             <p className="notice notice--warning" data-testid="quorum-notice">
-              제출해도 바로 발효되지 않습니다. 이 개정은 승인자 {preview.threshold}명의 정족수를
-              채워야 발효되며,
+              Submitting does not put this in force. The revision takes effect only once a quorum of{' '}
+              {preview.threshold} approvers is reached, and
               {preview.exclude_proposer
-                ? ' 제안자 본인의 승인은 정족수에 포함되지 않습니다.'
-                : ' 제안자 본인의 승인도 정족수에 포함됩니다.'}
+                ? " the proposer's own approval does not count toward the quorum."
+                : " the proposer's own approval counts toward the quorum as well."}
               {preview.approvers === undefined || preview.approvers.length === 0
                 ? ''
-                : ` 해석된 승인자: ${preview.approvers.join(', ')}.`}
+                : ` Resolved approvers: ${preview.approvers.join(', ')}.`}
             </p>
           ) : (
             <p className="notice notice--warning" data-testid="unlocked-notice">
-              이 설치는 아직 거버넌스가 잠기지 않았습니다 (solo_admin). 개정이 정족수 없이 발효되며,
-              이는 잠금 전까지의 상태입니다.
+              This installation's governance is not locked yet (solo_admin). A revision takes effect
+              without a quorum, and that holds until the installation is locked.
             </p>
           )}
 
           {blocked ? (
             <div className="notice notice--warning" data-testid="floor-violations">
               <p className="notice__text">
-                운영자 하한을 위반해 제출할 수 없습니다. 아래 항목을 해소해야 제출이 열립니다.
+                This cannot be submitted because it violates an operator floor. Submission opens
+                once the items below are resolved.
               </p>
               <ul>
                 {violations.map((violation) => (
@@ -215,10 +220,10 @@ export function SubmitPanel({
 
       <p id="submit-gate" className="field__hint">
         {preview === null
-          ? '먼저 프리플라이트를 실행해야 제출할 수 있습니다 — 무엇을 요구하는 개정인지 보기 전에는 제출이 열리지 않습니다.'
+          ? 'The preflight has to run before this can be submitted — submission does not open until you have been shown what the revision demands.'
           : blocked
-            ? '운영자 하한을 위반하는 개정은 제출할 수 없습니다.'
-            : '프리플라이트 결과를 확인했습니다. 제출하면 개정 제안이 만들어집니다.'}
+            ? 'A revision that violates an operator floor cannot be submitted.'
+            : 'You have seen the preflight result. Submitting creates a revision proposal.'}
       </p>
       <button
         type="button"
@@ -227,24 +232,24 @@ export function SubmitPanel({
         disabled={!submittable || busy}
         aria-describedby="submit-gate"
       >
-        개정 제출
+        Submit revision
       </button>
 
       {proposal === null ? null : (
         <div className="proposal" role="status" data-testid="proposal-result">
-          <h3>개정 제안이 접수되었습니다</h3>
+          <h3>Revision proposal received</h3>
           <dl className="summary-list">
-            <dt>제안 식별자</dt>
+            <dt>Proposal identifier</dt>
             <dd>{proposal.id}</dd>
-            <dt>상태</dt>
-            <dd>{proposal.state === 'pending' ? '미결 — 아직 발효되지 않았습니다' : proposal.state}</dd>
-            <dt>필요한 승인 수</dt>
+            <dt>State</dt>
+            <dd>{proposal.state === 'pending' ? 'pending — not in force yet' : proposal.state}</dd>
+            <dt>Approvals required</dt>
             <dd>{proposal.threshold}</dd>
           </dl>
           <p>
             {proposal.state === 'pending'
-              ? '승인자가 정족수를 채우면 발효됩니다. 그 전까지 발효 중인 정책은 바뀌지 않습니다.'
-              : '이 제안은 이미 종결되었습니다.'}
+              ? 'It takes effect once approvers reach the quorum. Until then the policies in force do not change.'
+              : 'This proposal is already closed.'}
           </p>
         </div>
       )}
@@ -266,7 +271,7 @@ function explain(error: unknown, onPendingRevision: () => void): string {
   }
   if (errorCodeOf(error) === 'revision_pending') {
     onPendingRevision()
-    return '이미 열려 있는 개정 제안이 있습니다. 위 배너에서 확인하십시오.'
+    return 'A revision proposal is already open. See the banner above.'
   }
   return errorMessageOf(error) ?? error.message
 }

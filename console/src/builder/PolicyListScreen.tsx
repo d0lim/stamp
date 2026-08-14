@@ -25,8 +25,8 @@ import type { PolicyListResponse, PolicyView } from './api-types'
 import { GovernanceBanner, useGovernance } from './GovernanceBanner'
 
 const ORIGIN_LABELS: Readonly<Record<string, string>> = {
-  form: '콘솔 저작',
-  file: '파일 저작',
+  form: 'console authoring',
+  file: 'file authoring',
 }
 
 function usePolicies(api: ApiClient) {
@@ -62,8 +62,8 @@ export function PolicyListScreen() {
 
   return (
     <div className="panel">
-      <RouteAnnouncer title="정책" />
-      <h1>정책</h1>
+      <RouteAnnouncer title="Policies" />
+      <h1>Policies</h1>
 
       <GovernanceBanner
         api={api}
@@ -72,20 +72,20 @@ export function PolicyListScreen() {
       />
 
       <p>
-        <Link to="/policies/new">새 정책 저작 시작</Link>
+        <Link to="/policies/new">Start authoring a new policy</Link>
       </p>
 
       {error === null ? null : (
         <p className="notice notice--warning" data-testid="policy-list-error">
-          정책 목록을 읽지 못했습니다: {error}
+          Could not read the policy list: {error}
         </p>
       )}
 
       {policies === null ? (
-        <p>정책 목록을 읽는 중입니다…</p>
+        <p>Reading the policy list…</p>
       ) : policies.length === 0 ? (
         <p data-testid="policy-list-empty">
-          발효 중인 정책이 없습니다. 새 정책 저작을 시작하십시오.
+          No policy is in force. Start authoring a new one.
         </p>
       ) : (
         <ul className="policy-list">
@@ -93,13 +93,14 @@ export function PolicyListScreen() {
             <li key={policy.id}>
               <Disclosure
                 summary={`${policy.id} · v${policy.version} · ${ORIGIN_LABELS[policy.origin] ?? policy.origin}${
-                  policy.reserved ? ' · 예약된 정책' : ''
+                  policy.reserved ? ' · reserved policy' : ''
                 }`}
               >
                 {policy.origin === 'file' ? (
                   <p className="field__hint" data-testid={`file-origin-${policy.id}`}>
-                    파일 저작이 소유한 정책입니다. 콘솔에서 편집하려면 소유 경로를 파일에서 콘솔로
-                    넘기는 인수 절차를 거쳐야 하며, 폼에서 바로 저장할 수 없습니다.
+                    This policy is owned by file authoring. Editing it in the console requires the
+                    adoption procedure that hands the owning path from file to console; it cannot
+                    be saved straight from the form.
                   </p>
                 ) : null}
                 <pre className="document">{policy.document}</pre>

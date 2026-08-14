@@ -31,8 +31,8 @@ challenges:
   - type: mfa
 `
 
-describe('문서 필드 읽기', () => {
-  it('중첩 맵과 시퀀스를 포인터로 읽는다', () => {
+describe('reading a document\'s fields', () => {
+  it('reads nested maps and sequences by pointer', () => {
     const byPointer = new Map(readDocumentFields(CANONICAL).map((f) => [f.pointer, f.value]))
 
     expect(byPointer.get('/id')).toBe('high-value-transfer')
@@ -44,7 +44,7 @@ describe('문서 필드 읽기', () => {
     expect(byPointer.get('/challenges/1/type')).toBe('mfa')
   })
 
-  it('스칼라 시퀀스 항목은 항목 자체가 값이다', () => {
+  it('a scalar sequence item is its own value', () => {
     const fields = readDocumentFields('actions:\n  - approve\n  - reject\n')
     expect(fields.map((f) => [f.pointer, f.value])).toEqual([
       ['/actions/0', 'approve'],
@@ -52,20 +52,20 @@ describe('문서 필드 읽기', () => {
     ])
   })
 
-  it('문서 구분자 뒤의 두 번째 문서는 포인터가 겹치지 않는다', () => {
+  it('a second document after the separator gets pointers that do not collide', () => {
     const fields = readDocumentFields('id: a\n---\nid: b\n')
     expect(fields.map((f) => f.pointer)).toEqual(['/id', '/1/id'])
   })
 
-  it('포인터를 사람이 읽는 이름으로 옮긴다', () => {
+  it('turns a pointer into a name a person reads', () => {
     expect(labelFor('/challenges/0/threshold')).toBe('challenges[0].threshold')
     expect(labelFor('/id')).toBe('id')
-    expect(labelFor('')).toBe('(문서)')
+    expect(labelFor('')).toBe('(document)')
   })
 })
 
-describe('문서 diff', () => {
-  it('바뀐 필드만 수정으로 분류하고 나머지는 동일로 남긴다', () => {
+describe('the document diff', () => {
+  it('classifies only the changed field as changed and leaves the rest unchanged', () => {
     const after = CANONICAL.replace('threshold: 2', 'threshold: 3')
     const changes = diffDocuments(CANONICAL, after)
 
@@ -82,7 +82,7 @@ describe('문서 diff', () => {
     expect(changes.length).toBeGreaterThan(1)
   })
 
-  it('한쪽이 없으면 문서 전체가 추가이거나 삭제다', () => {
+  it('the whole document is added or removed when one side is missing', () => {
     const added = diffDocuments(undefined, CANONICAL)
     expect(added.every((c) => c.kind === 'added')).toBe(true)
     expect(countChanged(added)).toBe(added.length)
@@ -91,8 +91,8 @@ describe('문서 diff', () => {
     expect(removed.every((c) => c.kind === 'removed')).toBe(true)
   })
 
-  it('추가된 필드와 삭제된 필드를 구분한다', () => {
-    const before = 'id: a\ndescription: 설명\n'
+  it('tells an added field from a removed one', () => {
+    const before = 'id: a\ndescription: text\n'
     const after = 'id: a\nsubject: user\n'
     const changes = diffDocuments(before, after)
     const byPointer = new Map(changes.map((c) => [c.pointer, c.kind]))
@@ -101,17 +101,17 @@ describe('문서 diff', () => {
     expect(byPointer.get('/subject')).toBe('added')
   })
 
-  it('삭제된 필드가 있던 자리에 남아 문서 순서가 보존된다', () => {
+  it('a removed field stays where it was, so document order survives', () => {
     const before = 'a: 1\nb: 2\nc: 3\n'
     const after = 'a: 1\nc: 3\n'
     expect(diffDocuments(before, after).map((c) => c.pointer)).toEqual(['/a', '/b', '/c'])
   })
 
-  it('이해하지 못하는 줄도 버리지 않는다', () => {
+  it('does not drop a line it cannot parse', () => {
     // A document written by something other than the two canonical writers
     // still has to be shown. Dropping a line an approver was meant to read is
     // the failure direction this must not take.
-    const fields = readDocumentFields('id: a\n>>> 알 수 없는 줄\n')
-    expect(fields.some((f) => f.value === '>>> 알 수 없는 줄')).toBe(true)
+    const fields = readDocumentFields('id: a\n>>> unparsable line\n')
+    expect(fields.some((f) => f.value === '>>> unparsable line')).toBe(true)
   })
 })

@@ -13,18 +13,18 @@ import { expectAccessible } from './axe'
 const DECISION = '3f1b0f2a-0000-4000-8000-000000000001'
 const APPROVAL = `/inbox/${DECISION}/0`
 
-test.describe('승인 왕복', () => {
-  test('승인함에서 상세로 들어가 모두 펼치고 승인한다', async ({ page }) => {
+test.describe('the approval round trip', () => {
+  test('enters the detail from the approval inbox, expands everything and approves', async ({ page }) => {
     await page.goto('/inbox')
-    await expect(page.getByRole('heading', { level: 1, name: '승인함' })).toBeVisible()
-    await expect(page.getByTestId('inbox-remaining-' + DECISION)).toContainText('시간')
+    await expect(page.getByRole('heading', { level: 1, name: 'Approval inbox' })).toBeVisible()
+    await expect(page.getByTestId('inbox-remaining-' + DECISION)).toContainText('hour')
 
     await page.getByRole('link', { name: /policy\.revise/ }).click()
-    await expect(page.getByRole('heading', { level: 1, name: '승인 상세' })).toBeVisible()
+    await expect(page.getByRole('heading', { level: 1, name: 'Approval detail' })).toBeVisible()
 
     // R31: the hash, and what it covers.
     await expect(page.getByTestId('binding-hash')).toContainText('f00dbabe')
-    await expect(page.getByTestId('binding-not-covered')).toContainText('정족수 임계값')
+    await expect(page.getByTestId('binding-not-covered')).toContainText('Quorum threshold')
 
     // The list arrives in two pieces — the material with the review, the policy
     // entries with the delta.
@@ -34,7 +34,7 @@ test.describe('승인 왕복', () => {
     // R55: the gate is shut, and the button cannot be pressed.
     const approve = page.getByTestId('approve')
     await expect(approve).toBeDisabled()
-    await expect(page.getByTestId('approve-gate')).toContainText('아직 펼치지 않은 항목이 16건')
+    await expect(page.getByTestId('approve-gate')).toContainText('16 entries have not been expanded')
 
     await page.getByTestId('expand-all').click()
     await expect(approve).toBeEnabled()
@@ -43,7 +43,7 @@ test.describe('승인 왕복', () => {
     await expect(page.getByTestId('submit-result')).toBeVisible()
   })
 
-  test('접힌 항목이 페이지 내 검색과 스크린 리더에 잡힌다', async ({ page }) => {
+  test('collapsed entries are reachable by find-in-page and by a screen reader', async ({ page }) => {
     await page.goto(APPROVAL)
     await expect(page.getByTestId('entry-list').getByRole('button')).toHaveCount(17)
 
@@ -56,7 +56,7 @@ test.describe('승인 왕복', () => {
     const region = page.getByTestId('diff-policy-5-fields')
     await expect(region).toBeVisible()
     await expect(region).toContainText('description')
-    await expect(region).toContainText('개정 5')
+    await expect(region).toContainText('revision 5')
     const box = await region.boundingBox()
     expect(box?.height ?? 0).toBeGreaterThan(0)
 
@@ -65,7 +65,7 @@ test.describe('승인 왕복', () => {
     await expect(page.getByTestId('diff-policy-0-fields')).toContainText('challenges[0].threshold')
   })
 
-  test('펼침·접힘이 키보드만으로 조작된다', async ({ page }) => {
+  test('expanding and collapsing works from the keyboard alone', async ({ page }) => {
     await page.goto(APPROVAL)
     await expect(page.getByTestId('entry-list').getByRole('button')).toHaveCount(17)
 
@@ -78,42 +78,42 @@ test.describe('승인 왕복', () => {
   })
 })
 
-test.describe('빌더 왕복', () => {
-  test('정책 목록에서 저작을 시작해 프리플라이트하고 제출한다', async ({ page }) => {
+test.describe('the builder round trip', () => {
+  test('starts authoring from the policy list, previews, and submits', async ({ page }) => {
     await page.goto('/policies')
-    await expect(page.getByRole('heading', { level: 1, name: '정책' })).toBeVisible()
+    await expect(page.getByRole('heading', { level: 1, name: 'Policies' })).toBeVisible()
 
-    await page.getByRole('link', { name: '새 정책 저작 시작' }).click()
-    await page.getByRole('button', { name: '2. 발동 조건' }).click()
-    await page.getByLabel('정책 식별자').fill('e2e.policy')
+    await page.getByRole('link', { name: 'Start authoring a new policy' }).click()
+    await page.getByRole('button', { name: '2. Trigger conditions' }).click()
+    await page.getByLabel('Policy identifier').fill('e2e.policy')
 
-    await page.getByRole('button', { name: '7. 제출' }).click()
+    await page.getByRole('button', { name: '7. Submit' }).click()
     // R23: the change diff is drawn by the same renderer the approval uses.
-    await page.getByRole('button', { name: /프리플라이트/ }).click()
+    await page.getByRole('button', { name: /preflight/ }).click()
     await expect(page.getByTestId('revision-preview')).toBeVisible()
     await expect(page.getByTestId('submit-diff-fields')).toContainText('id')
 
-    await page.getByRole('button', { name: '개정 제출' }).click()
-    await expect(page.getByTestId('proposal-result')).toContainText('미결')
+    await page.getByRole('button', { name: 'Submit revision' }).click()
+    await expect(page.getByTestId('proposal-result')).toContainText('Pending')
   })
 })
 
-test.describe('axe — 실제 브라우저, 대비 포함', () => {
-  test('승인함 목록', async ({ page }) => {
+test.describe('axe — a real browser, contrast included', () => {
+  test('the approval inbox list', async ({ page }) => {
     await expectAccessible(page, async () => {
       await page.goto('/inbox')
       await expect(page.getByTestId('inbox-list')).toBeVisible()
     })
   })
 
-  test('승인 상세 — 접힌 상태', async ({ page }) => {
+  test('the approval detail — collapsed', async ({ page }) => {
     await expectAccessible(page, async () => {
       await page.goto(APPROVAL)
       await expect(page.getByTestId('entry-list').getByRole('button')).toHaveCount(17)
     })
   })
 
-  test('승인 상세 — 모두 펼친 상태', async ({ page }) => {
+  test('the approval detail — fully expanded', async ({ page }) => {
     await expectAccessible(page, async () => {
       await page.goto(APPROVAL)
       await expect(page.getByTestId('entry-list').getByRole('button')).toHaveCount(17)
@@ -122,24 +122,24 @@ test.describe('axe — 실제 브라우저, 대비 포함', () => {
     })
   })
 
-  test('감사 목록', async ({ page }) => {
+  test('the audit list', async ({ page }) => {
     await expectAccessible(page, async () => {
       await page.goto('/audit')
       await expect(page.getByTestId('audit-table')).toBeVisible()
     })
   })
 
-  test('감사 결정 상세', async ({ page }) => {
+  test('the audit decision detail', async ({ page }) => {
     await expectAccessible(page, async () => {
       await page.goto(`/audit/${DECISION}`)
       await expect(page.getByTestId('policy-version')).toBeVisible()
     })
   })
 
-  test('정책 빌더', async ({ page }) => {
+  test('the policy builder', async ({ page }) => {
     await expectAccessible(page, async () => {
       await page.goto('/policies/new')
-      await expect(page.getByRole('button', { name: '1. 선언' })).toBeVisible()
+      await expect(page.getByRole('button', { name: '1. Declarations' })).toBeVisible()
     })
   })
 })

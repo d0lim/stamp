@@ -51,8 +51,8 @@ const GO_DIAGNOSTICS: readonly Diagnostic[] = [
   },
 ]
 
-describe('진단 포인터 착지', () => {
-  it('validator가 실제로 낸 다섯 포인터가 모두 필드에 착지한다', () => {
+describe('where a diagnostic pointer lands', () => {
+  it('all five pointers the validator actually emitted land on a field', () => {
     const placed = placeDiagnostics(GO_DIAGNOSTICS, brokenDraft())
     expect(placed.unplaced).toEqual([])
     expect([...placed.byPointer.keys()]).toEqual([
@@ -66,7 +66,7 @@ describe('진단 포인터 착지', () => {
     ])
   })
 
-  it('요약은 응답 순서가 아니라 폼 순서로 나열된다', () => {
+  it('lists the summary in form order rather than in response order', () => {
     const placed = placeDiagnostics(GO_DIAGNOSTICS, brokenDraft())
     expect(placed.summary.map((entry) => entry.fieldId)).toEqual([
       'bf.policies.0.resource',
@@ -77,14 +77,14 @@ describe('진단 포인터 착지', () => {
     ])
   })
 
-  it('요약의 링크와 필드의 id가 같은 함수에서 나온다', () => {
+  it("takes the summary's link and the field's id from the same function", () => {
     const placed = placeDiagnostics(GO_DIAGNOSTICS, brokenDraft())
     for (const entry of placed.summary) {
       expect(entry.fieldId).toBe(fieldId(entry.fieldId.slice(2).replace(/\./g, '/')))
     }
   })
 
-  it('조상이 없는 포인터는 조용히 사라지지 않는다', () => {
+  it('does not let a pointer with no ancestor disappear quietly', () => {
     const rendered = new Set(renderedPointers(brokenDraft()))
     expect(placementFor('/policies/0/challenges/0/threshold', rendered)).toBe(
       '/policies/0/challenges/0/threshold',
@@ -92,7 +92,7 @@ describe('진단 포인터 착지', () => {
     expect(placementFor('/nowhere/at/all', rendered)).toBeNull()
 
     const placed = placeDiagnostics(
-      [{ pointer: '/nowhere/at/all', code: 'invalid_value', message: '어디에도 없음' }],
+      [{ pointer: '/nowhere/at/all', code: 'invalid_value', message: 'nowhere at all' }],
       brokenDraft(),
     )
     expect(placed.unplaced).toHaveLength(1)
@@ -100,8 +100,8 @@ describe('진단 포인터 착지', () => {
   })
 })
 
-describe('포인터 표기', () => {
-  it('RFC 6901 이스케이프가 validator의 jptr와 같다', () => {
+describe('pointer notation', () => {
+  it("escapes per RFC 6901 exactly as the validator's own jptr does", () => {
     expect(jptr('policies', 0, 'condition')).toBe('/policies/0/condition')
     expect(jptr('schema', 'entities', 0, 'attributes', 'a/b')).toBe(
       '/schema/entities/0/attributes/a~1b',
@@ -113,12 +113,12 @@ describe('포인터 표기', () => {
     expect(jptr('/policies/0', 'id')).toBe('/policies/0/id')
   })
 
-  it('서로 다른 포인터는 서로 다른 id가 된다', () => {
+  it('turns distinct pointers into distinct ids', () => {
     const pointers = renderedPointers(brokenDraft())
     expect(new Set(pointers.map(fieldId)).size).toBe(new Set(pointers).size)
   })
 
-  it('trace 포인터는 정책 뿌리로 옮겨지고 두 번 옮겨지지 않는다', () => {
+  it('moves a trace pointer to the policy root, and never moves it twice', () => {
     expect(fromTracePointer('/condition/all/0')).toBe('/policies/0/condition/all/0')
     expect(fromTracePointer('/policies/0/condition/all/0')).toBe('/policies/0/condition/all/0')
     expect(fromTracePointer('')).toBe('')

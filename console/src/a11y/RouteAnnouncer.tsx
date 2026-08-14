@@ -27,7 +27,7 @@ export function RouteAnnouncer({ title, focusTargetId = 'main' }: RouteAnnouncer
   const liveRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    document.title = `${title} · STAMP 콘솔`
+    document.title = `${title} · STAMP Console`
     // A page load is already announced by the browser, and moving focus on one
     // would fight the fragment a deep link may carry. React Router gives the
     // location a fresh key on every navigation and the literal key "default"
@@ -40,7 +40,7 @@ export function RouteAnnouncer({ title, focusTargetId = 'main' }: RouteAnnouncer
     document.getElementById(focusTargetId)?.focus()
     // The live region is written after focus moves, so the announcement is not
     // interrupted by the focus change.
-    if (liveRef.current) liveRef.current.textContent = `${title} 화면으로 이동했습니다.`
+    if (liveRef.current) liveRef.current.textContent = `Navigated to the ${title} screen.`
   }, [location.key, title, focusTargetId])
 
   return (

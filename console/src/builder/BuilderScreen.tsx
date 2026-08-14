@@ -2,7 +2,7 @@
  * The guided authoring flow.
  *
  * R19 fixes the order — trigger, source binding, rule, challenge — and this adds
- * declarations before it and trial evaluation and submission after it, because
+ * declarations before it and the dry run and submission after it, because
  * the first is what the form renders from and the last two are what an author
  * needs before a quorum spends attention on the result.
  *
@@ -52,13 +52,13 @@ import { jptr, policyPointer } from './pointer'
 import { serializeDraft } from './serialize'
 
 const STEPS = [
-  { key: 'declarations', title: '선언' },
-  { key: 'binding', title: '발동 조건' },
-  { key: 'sources', title: 'source 바인딩' },
-  { key: 'rule', title: '규칙' },
+  { key: 'declarations', title: 'Declarations' },
+  { key: 'binding', title: 'Trigger conditions' },
+  { key: 'sources', title: 'source binding' },
+  { key: 'rule', title: 'Rule' },
   { key: 'challenges', title: 'challenge' },
-  { key: 'dry-run', title: '시험 평가' },
-  { key: 'submit', title: '제출' },
+  { key: 'dry-run', title: 'Dry run' },
+  { key: 'submit', title: 'Submit' },
 ] as const
 
 /**
@@ -140,8 +140,8 @@ export function BuilderScreen() {
 
   return (
     <div className="panel builder">
-      <RouteAnnouncer title="정책 저작" />
-      <h1>정책 저작</h1>
+      <RouteAnnouncer title="Policy authoring" />
+      <h1>Policy authoring</h1>
 
       <GovernanceBanner
         api={api}
@@ -152,11 +152,11 @@ export function BuilderScreen() {
       <ErrorSummary errors={placed.summary} />
       <p id={UNPLACED_ANCHOR_ID} tabIndex={-1} className="field__hint">
         {placed.unplaced.length === 0
-          ? '서버가 보고한 오류는 각 필드에 붙습니다.'
+          ? 'Errors the server reports attach to the field that caused them.'
           : placed.unplaced.map(describe).join(' · ')}
       </p>
 
-      <nav aria-label="저작 단계">
+      <nav aria-label="Authoring steps">
         <ol className="steps">
           {STEPS.map((entry, index) => (
             <li key={entry.key}>
@@ -188,8 +188,8 @@ export function BuilderScreen() {
           <>
             <Field
               pointer={jptr(policy, 'id')}
-              label="정책 식별자"
-              hint="정책의 정체성은 이 값이며 파일 이름이 아닙니다."
+              label="Policy identifier"
+              hint="This value is the policy's identity, not the file name."
               placed={placed}
             >
               {(props) => (
@@ -204,7 +204,7 @@ export function BuilderScreen() {
                 />
               )}
             </Field>
-            <Field pointer={jptr(policy, 'description')} label="설명" placed={placed}>
+            <Field pointer={jptr(policy, 'description')} label="Description" placed={placed}>
               {(props) => (
                 <input
                   {...props}
@@ -223,8 +223,8 @@ export function BuilderScreen() {
 
             {hasNoDeclarations(draft.schema) ? (
               <p className="notice notice--warning" data-testid="binding-needs-declarations">
-                선언된 entity가 없어 바인딩할 대상이 없습니다. 1단계 선언에서 entity를 먼저
-                선언하십시오.
+                No entity is declared, so there is nothing to bind to. Declare an entity first, in
+                step 1, Declarations.
               </p>
             ) : null}
 
@@ -248,7 +248,7 @@ export function BuilderScreen() {
                     }
                     onChange={(event) => setDraft(bindRole(draft, role, event.target.value))}
                   >
-                    <option value="">{role === 'context' ? '바인딩하지 않음' : '선택하십시오'}</option>
+                    <option value="">{role === 'context' ? 'Do not bind' : 'Select one'}</option>
                     {draft.schema.entities.map((entity) => (
                       <option key={entity.name} value={entity.name}>
                         {entity.name}
@@ -259,9 +259,9 @@ export function BuilderScreen() {
               </Field>
             ))}
 
-            <FieldGroup pointer={jptr(policy, 'actions')} legend="적용 action" placed={placed}>
+            <FieldGroup pointer={jptr(policy, 'actions')} legend="Applicable actions" placed={placed}>
               {draft.schema.actions.length === 0 ? (
-                <p>선언된 action이 없습니다. 1단계 선언에서 action을 선언하십시오.</p>
+                <p>No action is declared. Declare an action in step 1, Declarations.</p>
               ) : null}
               {draft.schema.actions.map((action) => (
                 <div className="field field--inline" key={action.name}>
@@ -287,26 +287,27 @@ export function BuilderScreen() {
         {current.key === 'sources' ? (
           <div className="sources">
             <p>
-              조건이 부르는 fact source의 서명과 실패 동작을 확인합니다. 호출 대상·TTL·스트림 정의는
-              선언이 아니라 배포의 fact plane 설정이므로 여기서 편집하지 않습니다.
+              Review the signature and failure behaviour of each fact source the condition calls.
+              The call target, the TTL and the stream definition are the deployment's fact plane
+              configuration rather than declarations, so they are not edited here.
             </p>
             {draft.schema.sources.length === 0 ? (
               <p data-testid="sources-empty">
-                선언된 fact source가 없습니다. 조건이 외부 사실을 읽어야 한다면 1단계 선언에서 source를
-                선언하십시오.
+                No fact source is declared. If the condition has to read an external fact, declare a
+                source in step 1, Declarations.
               </p>
             ) : null}
             <ul className="source-list">
               {draft.schema.sources.map((source) => (
                 <li key={source.name}>
                   <strong>{source.name}</strong> · {source.kind} ·{' '}
-                  {source.params.map((p) => `${p.name}: ${p.type}`).join(', ') || '인자 없음'} →{' '}
-                  {source.returns} · 실패 시 {source.onError}
+                  {source.params.map((p) => `${p.name}: ${p.type}`).join(', ') || 'no parameters'} →{' '}
+                  {source.returns} · on failure {source.onError}
                   <p className="field__hint">{KIND_NOTES[source.kind]}</p>
                   <p className="field__hint">
                     {referenced.has(source.name)
-                      ? '이 정책의 조건이 호출합니다.'
-                      : '이 정책의 조건은 호출하지 않습니다.'}
+                      ? "This policy's condition calls it."
+                      : "This policy's condition does not call it."}
                   </p>
                 </li>
               ))}
@@ -349,11 +350,11 @@ export function BuilderScreen() {
         ) : null}
       </section>
 
-      <section aria-label="교환 포맷 미리보기">
-        <h2>교환 포맷</h2>
+      <section aria-label="Exchange format preview">
+        <h2>Exchange format</h2>
         <p className="field__hint">
-          폼이 만들어 내는 문서입니다. 파일 저작이 읽고 쓰는 것과 같은 포맷이며, 제출도 시험 평가도
-          이 문서를 보냅니다.
+          This is the document the form produces. It is the same format file authoring reads and
+          writes, and both submission and the dry run send this document.
         </p>
         <pre className="document" data-testid="document-preview">
           {serializeDraft(draft)}

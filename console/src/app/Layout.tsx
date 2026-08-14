@@ -20,9 +20,9 @@ interface NavItem {
 }
 
 const NAV: readonly NavItem[] = [
-  { to: '/policies', label: '정책', role: 'author' },
-  { to: '/inbox', label: '승인함', role: 'approver' },
-  { to: '/audit', label: '감사', role: 'auditor' },
+  { to: '/policies', label: 'Policies', role: 'author' },
+  { to: '/inbox', label: 'Approval inbox', role: 'approver' },
+  { to: '/audit', label: 'Audit', role: 'auditor' },
 ]
 
 export function Layout() {
@@ -37,9 +37,9 @@ export function Layout() {
       <header className="shell__header">
         <div className="shell__brand">
           <span className="shell__wordmark">STAMP</span>
-          <span className="shell__tagline">정책 콘솔</span>
+          <span className="shell__tagline">Policy console</span>
         </div>
-        <nav className="shell__nav" aria-label="주요">
+        <nav className="shell__nav" aria-label="Primary">
           <ul className="shell__nav-list">
             {visible.map((item) => (
               <li key={item.to}>
@@ -64,12 +64,12 @@ export function Layout() {
           </span>
           <span className="shell__roles" data-testid="role-list">
             {visible.length === 0
-              ? '권한 없음'
+              ? 'No roles'
               : visible.map((item) => ROLE_LABELS[item.role]).join(' · ')}
           </span>
           {session ? (
             <button type="button" className="button button--quiet" onClick={signOut}>
-              로그아웃
+              Sign out
             </button>
           ) : null}
         </div>
@@ -83,7 +83,7 @@ export function Layout() {
 
       <footer className="shell__footer">
         <p>
-          API 대상: <code data-testid="api-base">{api.baseUrl}</code>
+          API target: <code data-testid="api-base">{api.baseUrl}</code>
         </p>
       </footer>
     </div>

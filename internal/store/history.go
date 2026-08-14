@@ -3,9 +3,10 @@ package store
 // history.go is the read side of the decision record: the audit console's
 // timeline (R22) and the approver's inbox (R21).
 //
-// The plan left the query axes open until this unit ("감사 콘솔의 조회 축…과 정렬·
-// 페이지네이션, 대응 인덱스"), so they are settled here and the migration that
-// indexes them names this file. Four axes, one order, one pagination scheme:
+// The requirements left the query axes open ("the audit console's query axes …
+// with their ordering, pagination, and the indexes that serve them"), so they
+// are settled here and the migration that indexes them names this file. Four
+// axes, one order, one pagination scheme:
 //
 //	period   [From, To) on created_at. Half-open, so adjacent windows tile
 //	         without double-counting a decision that landed on the boundary —

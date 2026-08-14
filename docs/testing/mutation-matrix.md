@@ -1,41 +1,41 @@
-# 뮤테이션 행렬 — 테스트가 자기가 테스트임을 증명한 기록
+# Mutation matrix — the record of the tests proving they are tests
 
-계획: `docs/plans/2026-08-12-001-fix-stamp-completion-round-plan.md` (U3, KTD5).
-대상: PR #51이 들여온 1500줄 남짓의 새 테스트와, 같은 브랜치의 U1·U2가 더한 것.
+Origin: the completion round that added this discipline (U3, KTD5).
+Subject: the fifteen hundred or so lines of new tests PR #51 brought in, and what U1 and U2 added on the same branch.
 
-## 이 문서가 있는 이유
+## Why this document exists
 
-PR #51의 코드 리뷰에서 여덟 렌즈 중 일곱이 결과를 잃었고, **testing 렌즈만 회수되지도 재실행되지도 않았다.** 그 라운드가 들여온 테스트를 아무도 보지 않았다는 뜻이다.
+In PR #51's code review, seven of the eight lenses lost their results, and **the testing lens alone was neither recovered nor re-run.** Which means nobody looked at the tests that round brought in.
 
-같은 렌즈를 다시 돌리는 것은 같은 실패 양식에 다시 거는 일이다. 그리고 이 프로젝트의 상습 결함은 리뷰가 잘 못 잡는 종류다 — **지키는 대상이 무너져도 초록인 테스트.** 지난 라운드에만 두 번 나왔다: 콘솔이 서버가 보내지 않는 코드를 스텁으로 시험하며 초록이었고(`not_an_approver`), 차트의 손으로 쓴 기대 map은 차트와 함께 틀렸다(#46).
+Running the same lens again is betting on the same failure mode a second time. And this project's habitual defect is the kind review is bad at catching — **a test that stays green while the thing it guards collapses.** The last round produced two of them: the console was green while exercising a code the server does not send (`not_an_approver`), and the chart's hand-written expectation map was wrong in the same direction the chart was (#46).
 
-그래서 리뷰 대신 **결함을 심고 빨개지는지 본다.** 산출물은 사람이 읽는 보고가 아니라 이 표이고, 다음 라운드가 같은 방식으로 이어 쓸 수 있다.
+So instead of a review, **we plant defects and watch for red.** The output is not a report for a human to read, it is this table, and the next round can keep writing in it the same way.
 
-## 읽는 법과 이어 쓰는 법
+## How to read it, and how to add to it
 
-- **행 하나 = 뮤테이션 하나.** "이 프로덕션 코드를 한 줄 바꾸면 이 테스트가 여전히 초록인가"에 대한 답이다.
-- **관찰된 결과는 실제 출력을 인용한다.** 요약하지 않는다 — 요약된 실패는 다음 사람이 재현했는지 확인할 수 없다.
-- **살아남은 뮤테이션이 이 문서의 산출물이다.** 초록으로 남은 테스트는 그것이 지킨다고 주장하는 것을 지키지 않는다. 고쳤으면 어떻게 고쳤는지, 안 고쳤으면 무엇을 덮지 않는지 적는다.
-- **뜻이 없는 뮤테이션은 만들어 채우지 않는다.** 관찰 가능한 것이 아무것도 바뀌지 않는 변형은 테스트에 대해 어느 쪽으로도 말하지 않는다. 그런 자리는 표를 채우는 대신 §6에 이유와 함께 적는다.
-- **트리는 매 뮤테이션 뒤에 복원한다.** 이 라운드는 각 행 뒤에 `git checkout --`로 되돌리고 `git status --porcelain`으로 확인했다. 감사가 남긴 잔해는 감사를 안 한 것보다 나쁘다.
-- 이어 쓸 때는 절을 늘리지 말고 해당 위험 부류의 표에 행을 더한다. 새 부류가 생기면 절을 하나 더한다.
+- **One row = one mutation.** It answers "if I change this one line of production code, is this test still green?"
+- **Observed results quote the actual output.** No summaries — a summarized failure gives the next person no way to check whether they reproduced it.
+- **The surviving mutations are this document's output.** A test that stayed green does not guard what it claims to guard. If it was fixed, write how; if it was not, write what it leaves uncovered.
+- **Meaningless mutations are not invented to fill the table.** A change that alters nothing observable says nothing about the test in either direction. Those places go in §6 with the reason, instead of into a row.
+- **The tree is restored after every mutation.** This round reverted each row with `git checkout --` and confirmed with `git status --porcelain`. Wreckage left behind by an audit is worse than not auditing.
+- When you add to this, do not add sections — add rows to the table for that risk class. Add a section only when a new class appears.
 
-전부 2026-08-12, `fix/stamp-completion-round` (`6d647e3` 기준) 에서 실행했다.
+Everything here was run on 2026-08-12, on `fix/stamp-completion-round`.
 
 ---
 
-## 1. 인가 판정 — 틀리면 오라클이 열린다
+## 1. Authorization judgment — get this wrong and an oracle opens
 
-R40이 막으려는 것은 "식별자 하나로 두 번 물어 그것이 무엇을 가리키는지 알아내는" 일이다. 이 부류가 조용히 위험한 이유는 **응답이 전부 거부이기 때문**이다. 403과 404 중 어느 쪽이 오든 호출자는 거부당하고, 다른 것은 상태 코드뿐이다.
+What R40 stops is asking twice about one identifier to learn what it points at. This class is quietly dangerous **because every response is a refusal.** Whether 403 or 404 comes back, the caller is refused; the only thing that differs is the status code.
 
-| # | 테스트 | 심은 결함 | 결과 |
+| # | Test | Defect planted | Result |
 |---|---|---|---|
-| 1.1 | `internal/runtime/oracle_test.go` `TestAStrangerReadsOneAnswerWhateverTheDecisionIsDoing` | `internal/api/approvals.go` `approvalError`가 `ErrNotTarget`·`ErrNotAuthorized`를 다시 403 `not_an_approver`로 가른다 (#38 이전 상태) | **red** |
-| 1.2 | `internal/api/cancel_test.go` `TestCancellationByANonAuthorityIsIndistinguishableFromAMissingDecision` | 위와 같음 | **red** |
-| 1.3 | `internal/decision/service_test.go` `TestStandingIsSettledBeforeStateOnTheSubmitPath` | `decision.Service.Submit`에서 `stillCollecting`을 `mayActOn` **앞으로** 옮긴다 | **red** |
-| 1.4 | `internal/runtime/oracle_test.go` (같은 테스트, 1.3의 결함으로) | 위와 같음 | **red** |
+| 1.1 | `internal/runtime/oracle_test.go` `TestAStrangerReadsOneAnswerWhateverTheDecisionIsDoing` | `internal/api/approvals.go` `approvalError` splits `ErrNotTarget` and `ErrNotAuthorized` apart again, back to 403 `not_an_approver` (the pre-#38 state) | **red** |
+| 1.2 | `internal/api/cancel_test.go` `TestCancellationByANonAuthorityIsIndistinguishableFromAMissingDecision` | same as above | **red** |
+| 1.3 | `internal/decision/service_test.go` `TestStandingIsSettledBeforeStateOnTheSubmitPath` | in `decision.Service.Submit`, move `stillCollecting` **ahead of** `mayActOn` | **red** |
+| 1.4 | `internal/runtime/oracle_test.go` (same test, under 1.3's defect) | same as above | **red** |
 
-**1.1 / 1.2 관찰된 출력**
+**1.1 / 1.2 observed output**
 
 ```
 --- FAIL: TestAStrangerReadsOneAnswerWhateverTheDecisionIsDoing/the_submission
@@ -51,9 +51,9 @@ R40이 막으려는 것은 "식별자 하나로 두 번 물어 그것이 무엇�
         want "{\"error\":\"not_found\",\"message\":\"no such decision or challenge\"}"
 ```
 
-세 라우트(제출·승인 화면·취소) 모두에서 red였다. `approvalError`가 한 곳이므로 표면 수만큼 red가 난다는 것 자체가 그 표가 공유되고 있다는 증거다.
+All three routes — submit, the approval screen, cancel — went red. `approvalError` is one place, so red appearing once per surface is itself evidence that the mapping is shared.
 
-**1.3 / 1.4 관찰된 출력** — 이 결함은 표를 건드리지 않는다. 표는 그대로 `ErrNotTarget → 404`인데, **자격 없는 호출자가 애초에 `ErrNotTarget`에 닿지 못하게** 만든다. 그래서 1.1의 뮤테이션과 다른 층이고, 두 테스트가 각각 자기 층에서 잡는다.
+**1.3 / 1.4 observed output** — this defect does not touch the mapping. The mapping still reads `ErrNotTarget → 404`; what changes is that **a caller with no standing never reaches `ErrNotTarget` in the first place.** That makes it a different layer from 1.1's mutation, and the two tests each catch it at their own layer.
 
 ```
 --- FAIL: TestStandingIsSettledBeforeStateOnTheSubmitPath
@@ -67,28 +67,28 @@ R40이 막으려는 것은 "식별자 하나로 두 번 물어 그것이 무엇�
     oracle_test.go:162: the submission answers 404 {...} for a decision that does not exist and 409 {"error":"expired",...} for an expired decision.
 ```
 
-`approvals.go`의 주석은 "Moving either check back behind a state check reopens it; internal/runtime/oracle_test.go is what notices"라고 적어 두었다. 그 문장이 참임을 확인한 것이 1.4다.
+The comment in `approvals.go` says "Moving either check back behind a state check reopens it; internal/runtime/oracle_test.go is what notices". 1.4 is the confirmation that the sentence is true.
 
 ---
 
-## 2. 속도 제한 — 틀리면 한도가 있는 척한다
+## 2. Rate limits — get them wrong and the limit is a pretence
 
-R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조용하다**: 한도가 안 걸려도 응답은 정상이고, 초록인 테스트가 "한도가 있다"고 말한다. 특히 위험한 것은 **한도가 걸리기는 하는데 늦게 걸리는 것** — 보호하려던 비용을 이미 다 치른 뒤다.
+All five of R43's surfaces are here. A rate limit fails **quietly**: when the limit does not bind the response is still normal, and a green test says "there is a limit". The particularly dangerous case is **a limit that does bind, but late** — after the cost it was there to prevent has already been paid in full.
 
-| # | 테스트 | 심은 결함 | 결과 |
+| # | Test | Defect planted | Result |
 |---|---|---|---|
-| 2.1 | `internal/api/cancel_test.go` `TestACancellationOverTheBudgetNeverReachesTheLifecycle` | `cancel.go`의 예산 부과를 `decisions.Submit` **뒤로** 옮긴다 | **red** |
-| 2.2 | 같은 테스트 | 부과를 `challengeRef` **뒤로**(Submit 앞) 옮긴다 | **살아남음 → 고침** (§5 고침 A) |
-| 2.3 | `internal/api/cancel_test.go` `TestARefusedCancellationIsAuditedUnderItsOwnGround` | `CancellationRateLimitedReason`을 `"approval_rate_limited"`로 바꾼다 | **red** |
-| 2.4 | `internal/api/cancel_test.go` `TestTheCancellationBudgetIsPerAuthorityAndRefills` | 제한기 키에서 호출자 식별자를 뺀다 (`"canceller"` 고정) | **red** |
-| 2.5 | `internal/api/approvals_test.go` `TestSubmissionsAreRefusedOverTheApproverBudget` | `approvals.go`의 예산 부과를 `decisions.Submit` **뒤로** 옮긴다 | **red** |
-| 2.6 | 같은 테스트 | 부과를 `challengeRef`·`readApprovalBody` **뒤로**(Submit 앞) 옮긴다 | **살아남음 → 고침** (§5 고침 B) |
-| 2.7 | `internal/api/ratelimit_test.go` `TestDecideSubjectPressureDoesNotCrowdOutCallers`, `TestDecideRateLimiterTablesAreBounded` | `newDecideLimiter`가 호출자 표와 주체 표를 다시 하나로 합치고 주체 키에 `\x1f` 접두사를 붙인다 (#47 이전 상태) | **red** |
-| 2.8 | `internal/api/ratelimit_test.go` `TestTheCallerBudgetRefusalCarriesItsOwnInterval` | `refuseRate`의 `Retry-After`가 언제나 주체 예산의 간격을 싣는다 | **red** |
-| 2.9 | `internal/api/ratelimit_test.go` `TestARateLimitedDecideEvaluatesNothing` | 주체 예산 부과를 `d.schemas.Schema()` **뒤로** 옮긴다 | **red** |
-| 2.10 | `internal/challenge/mfa/delegated_test.go` `TestOneCallerCannotSpendAnotherCallersShareOfASubject` | `allowIssue`의 단락(short circuit)을 없애고 per-caller 예산이 거부해도 천장을 부과한다 | **red** |
+| 2.1 | `internal/api/cancel_test.go` `TestACancellationOverTheBudgetNeverReachesTheLifecycle` | move `cancel.go`'s budget charge **behind** `decisions.Submit` | **red** |
+| 2.2 | same test | move the charge **behind** `challengeRef` (still ahead of Submit) | **survived → fixed** (§5 fix A) |
+| 2.3 | `internal/api/cancel_test.go` `TestARefusedCancellationIsAuditedUnderItsOwnGround` | change `CancellationRateLimitedReason` to `"approval_rate_limited"` | **red** |
+| 2.4 | `internal/api/cancel_test.go` `TestTheCancellationBudgetIsPerAuthorityAndRefills` | drop the caller identifier from the limiter key (fixed `"canceller"`) | **red** |
+| 2.5 | `internal/api/approvals_test.go` `TestSubmissionsAreRefusedOverTheApproverBudget` | move `approvals.go`'s budget charge **behind** `decisions.Submit` | **red** |
+| 2.6 | same test | move the charge **behind** `challengeRef` and `readApprovalBody` (still ahead of Submit) | **survived → fixed** (§5 fix B) |
+| 2.7 | `internal/api/ratelimit_test.go` `TestDecideSubjectPressureDoesNotCrowdOutCallers`, `TestDecideRateLimiterTablesAreBounded` | have `newDecideLimiter` merge the caller table and the subject table back into one and prefix subject keys with `\x1f` (the pre-#47 state) | **red** |
+| 2.8 | `internal/api/ratelimit_test.go` `TestTheCallerBudgetRefusalCarriesItsOwnInterval` | have `refuseRate`'s `Retry-After` always carry the subject budget's interval | **red** |
+| 2.9 | `internal/api/ratelimit_test.go` `TestARateLimitedDecideEvaluatesNothing` | move the subject budget charge **behind** `d.schemas.Schema()` | **red** |
+| 2.10 | `internal/challenge/mfa/delegated_test.go` `TestOneCallerCannotSpendAnotherCallersShareOfASubject` | remove `allowIssue`'s short circuit, so the ceiling is charged even when the per-caller budget refuses | **red** |
 
-**2.1 관찰된 출력** — 이 유닛(U1)의 red를 그대로 재현한다.
+**2.1 observed output** — reproduces this unit's (U1's) red exactly.
 
 ```
 --- FAIL: TestACancellationOverTheBudgetNeverReachesTheLifecycle
@@ -116,7 +116,7 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
     approvals_test.go:526: 4 submissions reached the lifecycle, want 3: the refusal happened behind the row lock
 ```
 
-**2.7** — #47이 고친 것이 정확히 이 모양이다. 두 예산이 한 표를 나눠 쓰면 지어낸 주체로 표를 채워 **자기 예산을 한 톨도 쓰지 않은 호출자**를 거부시킬 수 있다.
+**2.7** — this is exactly the shape #47 fixed. When two budgets share one table, you can fill the table with invented subjects and get **a caller that has spent none of its own budget** refused.
 
 ```
 --- FAIL: TestDecideSubjectPressureDoesNotCrowdOutCallers
@@ -133,14 +133,14 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
     ratelimit_test.go:627: Retry-After = "1", want "4" — the caller budget's interval, not the subject's
 ```
 
-**2.9** — 호출자 예산 쪽은 이 결함으로 움직이지 않으므로 하위 테스트 하나만 red다. 그것이 맞다: 두 부과 지점은 서로 다른 것을 지킨다.
+**2.9** — the caller budget side does not move under this defect, so only one subtest goes red. That is correct: the two charge points guard different things.
 
 ```
 --- FAIL: TestARateLimitedDecideEvaluatesNothing/the_subject's_budget
         ratelimit_test.go:319: the policy schema was read 1 times over the limit, want none
 ```
 
-**2.10** — `allowIssue`의 주석이 "The order is load-bearing and the short circuit is the fix"라고 적은 그 자리다. 단락을 없애면 자기 예산을 다 쓴 호출자가 **거부당한 요청으로** 남의 천장을 계속 비운다.
+**2.10** — this is the place `allowIssue`'s comment calls out with "The order is load-bearing and the short circuit is the fix". Remove the short circuit and a caller that has spent its own budget goes on emptying somebody else's ceiling **with requests that are refused.**
 
 ```
 --- FAIL: TestOneCallerCannotSpendAnotherCallersShareOfASubject
@@ -149,24 +149,24 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
 
 ---
 
-## 3. 멱등성 — 틀리면 평가하지 않은 인가를 허용으로 답한다
+## 3. Idempotency — get it wrong and an authorization nobody evaluated answers allow
 
-이 부류가 이 표에서 가장 조용하다. 잘못된 멱등성은 **에러를 내지 않는다** — `201 allowed`를 낸다. `decision.Result`에는 주체도 자원도 행위도 없으므로 PEP가 바꿔치기를 알아챌 필드가 없다.
+This is the quietest class in the table. Wrong idempotency **does not produce an error** — it produces `201 allowed`. `decision.Result` carries no subject, no resource and no action, so there is no field in which a PEP could notice the substitution.
 
-| # | 테스트 | 심은 결함 | 결과 |
+| # | Test | Defect planted | Result |
 |---|---|---|---|
-| 3.1 | `internal/decision/service_test.go` `TestAKeyReusedForADifferentRequestIsRefused` | `sameRequest`가 지문을 비교하지 않고 언제나 `true` | **red** |
-| 3.2 | `internal/decision/service_test.go` `TestTheSameKeyFromADifferentCallerIsADifferentDecision` | 멱등성 조회의 `WHERE`에서 `caller_id` 제약을 없앤다 | **red** |
-| 3.3 | `internal/decision/service_test.go` `TestConcurrentDecidesUnderOneKeyConvergeOnOneDecision`, `TestASecondDecisionUnderOneKeyIsAConflict` | 마이그레이션 `000009`의 `CREATE UNIQUE INDEX`를 `CREATE INDEX`로 바꾼다 | **red** |
+| 3.1 | `internal/decision/service_test.go` `TestAKeyReusedForADifferentRequestIsRefused` | `sameRequest` returns `true` unconditionally instead of comparing fingerprints | **red** |
+| 3.2 | `internal/decision/service_test.go` `TestTheSameKeyFromADifferentCallerIsADifferentDecision` | drop the `caller_id` predicate from the idempotency lookup's `WHERE` | **red** |
+| 3.3 | `internal/decision/service_test.go` `TestConcurrentDecidesUnderOneKeyConvergeOnOneDecision`, `TestASecondDecisionUnderOneKeyIsAConflict` | change migration `000009`'s `CREATE UNIQUE INDEX` to `CREATE INDEX` | **red** |
 
-**3.1** — `ErrIdempotencyKeyReused` 주석이 서술한 실제 사고를 그대로 재현한다: `job-91`을 다른 사람에 대해 재사용한 PEP가 첫 결정을 돌려받는다.
+**3.1** — reproduces the actual incident the `ErrIdempotencyKeyReused` comment describes: a PEP that reused `job-91` for a different person gets the first decision back.
 
 ```
 --- FAIL: TestAKeyReusedForADifferentRequestIsRefused
     service_test.go:1163: a key reused for a different subject returned ({ID:dfaa9e32-... State:pending Outcome:challenge Reason:challenge_required ...}, <nil>), want decision.ErrIdempotencyKeyReused
 ```
 
-**3.2** — 호출자 사이로 키가 새는 모양. 두 PEP가 우연히 같은 키 문자열을 쓰면 한쪽이 다른 쪽의 결정을 받는다.
+**3.2** — the shape where a key leaks between callers. If two PEPs happen to use the same key string, one receives the other's decision.
 
 ```
 --- FAIL: TestTheSameKeyFromADifferentCallerIsADifferentDecision
@@ -175,7 +175,7 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
     service_test.go:1246: the decisions table holds 1 rows, want 2
 ```
 
-**3.3** — 애플리케이션 층의 조회는 경합을 막지 못한다. 막는 것은 인덱스이고, 그 사실이 실제로 테스트되는지를 스키마를 변형해 확인했다.
+**3.3** — the application-layer lookup does not stop the race. The index does, and mutating the schema is how we checked that this is actually tested.
 
 ```
 --- FAIL: TestConcurrentDecidesUnderOneKeyConvergeOnOneDecision
@@ -186,21 +186,21 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
 
 ---
 
-## 4. 드리프트 검사 — 틀리면 "일치한다"는 말만 남는다
+## 4. Drift checks — get them wrong and all that is left is the word "they agree"
 
-드리프트 검사는 **언제나 초록인 것이 정상 상태**라서 자기 무결성을 증명할 기회가 없다. #46이 그렇게 지나갔다: 손으로 쓴 기대 map이 차트와 함께 틀렸고, 검사는 초록이었다. 그래서 여기서는 **실물 문서와 실물 차트를 변형**한다.
+A drift check's **normal state is always-green**, so it never gets an opportunity to prove its own integrity. That is how #46 got through: the hand-written expectation map was wrong in the same direction the chart was, and the check was green. So here we **mutate the real documents and the real chart.**
 
-| # | 테스트 | 심은 결함 | 결과 |
+| # | Test | Defect planted | Result |
 |---|---|---|---|
-| 4.1 | `internal/release/routes_test.go` `TestTheContractDocumentAndTheMountedRoutesAreTheSameSet` | `docs/contracts/decision-api.md`에서 취소 엔드포인트 행을 지운다 | **red** |
-| 4.2 | 같은 테스트 | 같은 행의 표면·인증을 `pep`/`workload`로 바꾼다 (엔드포인트는 그대로) | **red** |
-| 4.3 | `internal/runtime/wiring_test.go` `TestTheMountTableFileIsUpToDate` + 4.1의 테스트 | `CancellationPattern`의 경로를 `/cancellation` → `/cancel`로 바꾼다 | **red** (양쪽 다) |
-| 4.4 | `internal/release/chart_test.go` `TestSplitIsNotAllInOneUnderFiveNames` | `_helpers.tpl`에서 `decide` 역할의 표면 목록에서 `pep`을 뺀 뒤 스냅샷을 다시 렌더한다 (#46 재현) | **red** |
-| 4.5 | `internal/api/contract_test.go` `TestConsoleContractFileIsUpToDate` | `console/contract/public-endpoints.json`에서 `delay-cancel`을 지운다 | **red** |
-| 4.6 | `internal/runtime/config_test.go` `TestAFeatureThatCompletesOnTheCallbackSurfaceNeedsItBound` 외 2건 | `Config.surfaceRequirements`에서 인제스트 자격증명 조건을 무력화한다 | **red** |
-| 4.7 | `internal/runtime/config_test.go` `TestARoleThatMountsNoCallbackRouteIsNotRefused` | 같은 함수의 `roles.Has(RoleDecide)` 게이팅을 없앤다 | **red** |
+| 4.1 | `internal/release/routes_test.go` `TestTheContractDocumentAndTheMountedRoutesAreTheSameSet` | delete the cancellation endpoint's row from `docs/contracts/decision-api.md` | **red** |
+| 4.2 | same test | change that row's surface and authentication to `pep`/`workload` (endpoint unchanged) | **red** |
+| 4.3 | `internal/runtime/wiring_test.go` `TestTheMountTableFileIsUpToDate` + 4.1's test | change `CancellationPattern`'s path from `/cancellation` to `/cancel` | **red** (both) |
+| 4.4 | `internal/release/chart_test.go` `TestSplitIsNotAllInOneUnderFiveNames` | remove `pep` from the `decide` role's surface list in `_helpers.tpl`, then re-render the snapshot (#46 reproduced) | **red** |
+| 4.5 | `internal/api/contract_test.go` `TestConsoleContractFileIsUpToDate` | delete `delay-cancel` from `console/contract/public-endpoints.json` | **red** |
+| 4.6 | `internal/runtime/config_test.go` `TestAFeatureThatCompletesOnTheCallbackSurfaceNeedsItBound` and 2 others | disable the ingest-credentials condition in `Config.surfaceRequirements` | **red** |
+| 4.7 | `internal/runtime/config_test.go` `TestARoleThatMountsNoCallbackRouteIsNotRefused` | remove the `roles.Has(RoleDecide)` gating from the same function | **red** |
 
-**4.1 / 4.2** — 두 방향을 각각 잡는다. 행이 사라지면 "mounted and undocumented", 행이 틀리면 "drifted". 검사가 집합 비교이지 문자열 비교가 아니라는 것이 여기서 보인다.
+**4.1 / 4.2** — these catch the two directions separately. A row that disappears is "mounted and undocumented"; a row that is wrong is "drifted". This is where you can see that the check is a set comparison and not a string comparison.
 
 ```
 --- FAIL: TestTheContractDocumentAndTheMountedRoutesAreTheSameSet
@@ -213,7 +213,7 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
           drifted: POST /decisions/{id}/challenges/{ordinal}/cancellation is documented as pep / workload / decide and mounted as console / user / decide
 ```
 
-**4.3** — 코드가 먼저 바뀌는 방향. `mounted-routes.json`은 코드에서 유도되므로 먼저 stale이 되고, 그것을 갱신하면 계약 문서와 어긋난다. **두 단계가 다 걸리는 것**이 이 배치의 요점이다.
+**4.3** — the direction where the code moves first. `mounted-routes.json` is derived from the code, so it goes stale first, and updating it then puts it at odds with the contract document. **Both stages catching** is the point of this arrangement.
 
 ```
 --- FAIL: TestTheMountTableFileIsUpToDate
@@ -227,14 +227,14 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
           mounted and undocumented: POST /decisions/{id}/challenges/{ordinal}/cancel (console / user / decide) is served and the contract document does not list it
 ```
 
-**4.4** — #46 그 자체다. 실물 차트를 고치고 `deploy/helm/render.sh`로 스냅샷을 다시 만든 뒤 실행했다. 즉 스냅샷을 손으로 건드린 것이 아니라 **차트가 실제로 그렇게 렌더되게** 했다.
+**4.4** — this is #46 itself. We edited the real chart, rebuilt the snapshot with `deploy/helm/render.sh`, and then ran. That is, the snapshot was not touched by hand — **the chart was made to actually render that way.**
 
 ```
 --- FAIL: TestSplitIsNotAllInOneUnderFiveNames/each_tier_binds_exactly_the_surfaces_its_role's_routes_are_on
         chart_test.go:381: stamp-decide: the decide role mounts [GET /decisions/{id} POST /decisions] on the pep surface and this tier does not bind it: those routes are not refused there, they are unreachable
 ```
 
-**4.6** — U2가 더한 축. 세 조건 중 하나만 빼도 세 테스트가 각각 다른 각도에서 red다. 마지막 것이 특히 중요하다 — **차트의 거부와 바이너리의 거부가 같은 설정을 잡는지**를 보는 오라클이라, 한쪽만 잡는 상태를 만들면 그것이 드러난다.
+**4.6** — the axis U2 added. Removing any one of the three conditions turns three tests red, each from a different angle. The last one matters most — it is the oracle for **whether the chart's refusal and the binary's refusal catch the same configuration**, so a state where only one of them catches it is exposed.
 
 ```
 --- FAIL: TestAFeatureThatCompletesOnTheCallbackSurfaceNeedsItBound/http_velocity_ingest
@@ -246,7 +246,7 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
     config_test.go:833: the binary's refusal does not name /ingest/v1/events, which is mounted on the callback surface and is therefore one of the things this process would have lost: ...
 ```
 
-**4.7** — 반대 방향. 게이팅을 없애면 콜백 라우트를 마운트하지 않는 역할까지 거부되어, 검사가 **과하게 잡는 쪽으로** 틀렸을 때도 red가 난다.
+**4.7** — the opposite direction. Remove the gating and even roles that mount no callback route get refused, so red also appears when the check is wrong **in the over-catching direction.**
 
 ```
 --- FAIL: TestARoleThatMountsNoCallbackRouteIsNotRefused/console
@@ -257,17 +257,28 @@ R43의 다섯 표면 전부가 여기 있다. 속도 제한의 실패는 **조�
 
 ---
 
-## 5. 콘솔 — 스텁이 진실을 대신하는 자리
+## 5. The console — where a stub stands in for the truth
 
-지난 라운드의 실제 사고가 여기서 났다. 콘솔 테스트가 **서버가 보내지 않는 코드**(`not_an_approver`, 그리고 409)를 스텁으로 시험하며 초록이었다. 픽스처가 서버를 대신하면 서버가 바뀌어도 테스트는 아무 말도 하지 않는다.
+The last round's actual incident happened here. A console test was green while exercising against a stub **a code the server does not send** (`not_an_approver`, and a 409 alongside it). When a fixture stands in for the server, the server can change and the test says nothing.
 
-| # | 테스트 | 심은 결함 | 결과 |
+| # | Test | Defect planted | Result |
 |---|---|---|---|
-| 5.1 | `console/src/inbox/inbox.test.tsx` 429 두 건 | `ApprovalScreen.failureOf`에서 `cause.isRateLimited \|\|`를 뺀다 (본문 코드로만 판정) | **살아남음 → 고침** (§5 고침 C) |
-| 5.2 | 같은 두 건 | `\|\| body?.error === RATE_LIMITED`를 뺀다 (상태로만 판정) | **살아남음 → 뜻 있는 변형이 아님** (§6.2) |
-| 5.3 | `console/src/inbox/inbox.test.tsx` `Retry-After` 두 건 | `client.ts`의 `retryAfterOf`가 언제나 `undefined` | **red** |
-| 5.4 | `console/src/audit/audit.test.tsx` 감사자 거부 2건 | `AuditScreen`의 `setRefused(... isForbidden)`를 `setRefused(false)`로 | **red** |
-| 5.5 | `internal/api/contract_test.go` (4.5와 같은 행) | 콘솔 계약 JSON에서 엔드포인트 하나를 지운다 | **red** |
+| 5.1 | `console/src/inbox/inbox.test.tsx`, the two 429 cases | remove `cause.isRateLimited \|\|` from `ApprovalScreen.failureOf` (decide on the body code alone) | **survived → fixed** (§5 fix C) |
+| 5.2 | the same two cases | remove `\|\| body?.error === RATE_LIMITED` (decide on the status alone) | **survived → not a meaningful mutation** (§6.2) |
+| 5.3 | `console/src/inbox/inbox.test.tsx`, the two `Retry-After` cases | make `client.ts`'s `retryAfterOf` always return `undefined` | **red** |
+| 5.4 | `console/src/audit/audit.test.tsx`, the two auditor-refusal cases | change `AuditScreen`'s `setRefused(... isForbidden)` to `setRefused(false)` | **red** |
+| 5.5 | `internal/api/contract_test.go` (the same row as 4.5) | delete one endpoint from the console contract JSON | **red** |
+
+**The console output below is quoted unchanged from the run, and its test names
+and rendered strings are Korean because the console was Korean when this audit
+was performed.** It was translated to English afterwards, so these names no
+longer exist — grepping for them finds nothing, and the strings the assertions
+compare are now their English equivalents. The observation is kept verbatim
+rather than retro-translated: writing English into a block labelled "observed
+output" would be inventing output no run ever produced, which is the failure
+this whole document exists to catch. Read them as a dated record; the tests they
+name are still there under English names, in the same files and asserting the
+same things.
 
 **5.3**
 
@@ -288,31 +299,31 @@ Received:
   → Unable to find an element by: [data-testid="audit-refused"]
 ```
 
-### 콘솔 스텁과 서버의 대조 — 2026-08-12 시점
+### The console stubs against the server — as of 2026-08-12
 
-뮤테이션과 별개로, 콘솔이 스텁하는 모양이 **지금의 Go 핸들러가 실제로 내는 것**과 같은지 손으로 대조했다. 결과:
+Separately from the mutations, we checked by hand whether the shapes the console stubs are the same as **what today's Go handlers actually emit**. The result:
 
-- **응답 필드는 일치한다.** `challenge.InboxItem`·`api.InboxResponse`·`challenge.QuorumReview`·`challenge.QuorumReviewDecision`·`decision.Result`·`decision.ChallengeView`·`api.AuditDecisionRow`/`Detail`/`ListResponse`/`AuditQueryEcho`/`AuditChallenge`/`AuditApproval`의 JSON 태그를 `console/src/inbox/api-types.ts`·`console/src/audit/api-types.ts`와 하나씩 맞췄고 어긋난 이름은 없다. `DECISION_STATES`도 `store.DecisionState` 다섯과 같다.
-- **오류 코드도 일치한다.** 콘솔이 분기하거나 스텁하는 코드는 `not_found`·`expired`·`not_collecting`·`material_changed`·`rate_limited`·`not_an_auditor`·`invalid_policy`·`revision_pending`이고, 전부 오늘의 Go 핸들러가 내는 코드다(`approvals.go` `approvalError`, `auditconsole.go`, `dryrun.go`, `policies.go`). 지난 라운드가 죽인 `not_an_approver`는 콘솔에도 남아 있지 않다. `oidc.test.ts`의 `access_denied`는 서버 코드가 아니라 OAuth 오류 응답이므로 이 대조의 대상이 아니다.
-- **콘솔이 아예 부르지 않는 표면이 하나 있다 — 취소.** `delay-cancel`은 `console/contract/public-endpoints.json`에 있지만 `src/` 어디에서도 `api.request('delay-cancel')`를 부르지 않는다. **U1이 이 표면에 429를 더했는데 콘솔에는 그것을 렌더할 화면이 없다.** 스텁이 서버와 어긋난 것은 아니다 — 화면이 없다. 이것은 이 유닛의 발견이지 결함 수정 대상이 아니므로 §7에 남긴다.
-- **자동으로 지켜지는 것과 손으로 지켜지는 것을 구분해 둔다.** 엔드포인트의 **이름·메서드·경로**는 기계가 지킨다(`internal/api` → `console/contract/public-endpoints.json` 생성 + `check-contract.mjs`의 경계 검사, 4.5가 확인). **필드 이름과 오류 코드 어휘는 지키는 기계가 없다** — 위 대조는 사람이 한 것이고 오늘 날짜의 사실이다. 그것이 §7의 첫 항목이다.
+- **The response fields agree.** The JSON tags of `challenge.InboxItem`, `api.InboxResponse`, `challenge.QuorumReview`, `challenge.QuorumReviewDecision`, `decision.Result`, `decision.ChallengeView`, `api.AuditDecisionRow`/`Detail`/`ListResponse`/`AuditQueryEcho`/`AuditChallenge`/`AuditApproval` were matched one by one against `console/src/inbox/api-types.ts` and `console/src/audit/api-types.ts`, and no name disagrees. `DECISION_STATES` is also the same five as `store.DecisionState`.
+- **The error codes agree too.** The codes the console branches on or stubs are `not_found`, `expired`, `not_collecting`, `material_changed`, `rate_limited`, `not_an_auditor`, `invalid_policy` and `revision_pending`, and every one of them is a code today's Go handlers emit (`approvals.go` `approvalError`, `auditconsole.go`, `dryrun.go`, `policies.go`). The `not_an_approver` the last round killed is not left in the console either. `oidc.test.ts`'s `access_denied` is an OAuth error response rather than a server code, so it is not in scope for this comparison.
+- **There is one surface the console never calls at all — cancellation.** `delay-cancel` is in `console/contract/public-endpoints.json`, but nowhere in `src/` calls `api.request('delay-cancel')`. **U1 added a 429 on that surface and the console has no screen to render it on.** This is not a stub disagreeing with the server — there is no screen. It is a finding of this unit rather than a defect to fix, so it is recorded in §7.
+- **Keep straight what is held automatically and what is held by hand.** An endpoint's **name, method and path** are held by machine (generation from `internal/api` into `console/contract/public-endpoints.json`, plus `check-contract.mjs`'s boundary check, confirmed by 4.5). **There is no machine holding the field names and the error-code vocabulary** — the comparison above was done by a person and is a fact of today's date. That is the first item in §7.
 
-### 살아남은 셋을 어떻게 고쳤는가
+### How the three survivors were fixed
 
-**고침 A — 취소 표면 (행 2.2)** — `internal/api/cancel_test.go`의 `TestACancellationOverTheBudgetNeverReachesTheLifecycle`에 단언을 하나 더했다. 파싱할 수 없는 ordinal을 예산 초과 상태에서 보내면 400이 아니라 429여야 한다. 부과가 `challengeRef` 뒤로 내려가면 이 요청만 답이 달라진다.
+**Fix A — the cancellation surface (row 2.2)** — added one more assertion to `TestACancellationOverTheBudgetNeverReachesTheLifecycle` in `internal/api/cancel_test.go`. An unparseable ordinal sent while over the budget must answer 429, not 400. If the charge slides behind `challengeRef`, that request and only that request answers differently.
 
-> U1의 보고는 이 자리를 "관찰 가능한 것이 바뀌지 않아 뜻 있는 변형이 아니다"로 적었다. 그것은 절반만 맞다 — 리프사이클에 닿는 횟수는 실제로 그대로다. 하지만 `challengeRef`는 실패할 수 있고(정수가 아닌 ordinal), 그때 예산 초과 호출자가 받는 답이 400과 429로 갈린다. 핸들러 주석이 약속한 것이 그 답이므로, 약속을 단언으로 옮겼다.
+> U1's report recorded this place as "not a meaningful mutation, nothing observable changes". That is half right — the number of times the lifecycle is reached really is unchanged. But `challengeRef` can fail (a non-integer ordinal), and when it does, the answer a caller over its budget gets splits into 400 versus 429. The handler's comment promises that answer, so the promise was moved into an assertion.
 
-고친 뒤 같은 뮤테이션:
+The same mutation after the fix:
 
 ```
 --- FAIL: TestACancellationOverTheBudgetNeverReachesTheLifecycle
     cancel_test.go:371: an unparseable path from an authority over its budget answered 400, want 429: the budget is charged before the path is parsed, so nothing about the request can buy a different answer
 ```
 
-**고침 B — 승인 제출 (행 2.6)** — `internal/api/approvals_test.go`의 `TestSubmissionsAreRefusedOverTheApproverBudget`에 두 단언을 더했다. 파싱 불가 경로는 400이 아니라 429, `DefaultMaxApprovalBytes`를 넘는 본문은 413이 아니라 429. 핸들러 주석의 "before the path is parsed and before the body is read"가 이제 각각 하나씩 대응한다. 승인 제출은 취소와 달리 본문을 읽으므로 후자가 실재하는 비용이다.
+**Fix B — approval submission (row 2.6)** — added two assertions to `TestSubmissionsAreRefusedOverTheApproverBudget` in `internal/api/approvals_test.go`. An unparseable path answers 429 rather than 400, and a body over `DefaultMaxApprovalBytes` answers 429 rather than 413. The handler comment's "before the path is parsed and before the body is read" now has one assertion for each half. Unlike cancellation, approval submission reads a body, so the latter is a real cost.
 
-고친 뒤 같은 뮤테이션:
+The same mutation after the fix:
 
 ```
 --- FAIL: TestSubmissionsAreRefusedOverTheApproverBudget
@@ -320,9 +331,9 @@ Received:
     approvals_test.go:601: an oversized body from an approver over its budget answered 413, want 429: the budget is charged before the body is read, so the surface never reads 8193 bytes for a caller it has already refused
 ```
 
-**고침 C — 콘솔의 429 (행 5.1)** — 기존 429 테스트 두 건은 **상태와 본문 코드를 동시에** 스텁한다. 그래서 `cause.isRateLimited || body?.error === RATE_LIMITED`의 어느 한쪽만 남겨도 초록이었다. 상태 쪽이 실제로 필요한 경우 — **콘솔과 엔진 사이의 중간자가 낸 429** — 를 시험하는 테스트가 없었다. `inbox.test.tsx`에 그 경우를 더했다: 본문이 이 API의 오류 어휘가 아닌 HTML인 429.
+**Fix C — the console's 429 (row 5.1)** — the two existing 429 tests stub **the status and the body code at the same time.** That is why leaving either half of `cause.isRateLimited || body?.error === RATE_LIMITED` was still green. There was no test for the case where the status side is actually needed — **a 429 emitted by a middlebox between the console and the engine.** That case was added to `inbox.test.tsx`: a 429 whose body is HTML rather than this API's error vocabulary.
 
-고친 뒤 같은 뮤테이션:
+The same mutation after the fix:
 
 ```
 FAIL  src/inbox/inbox.test.tsx > 제출 실패 > 코드를 읽을 수 없는 429도 기다림으로 읽힌다 — 중간자가 흘린 경우
@@ -332,84 +343,85 @@ Received:
   요청이 429로 실패했습니다.문제가 계속되면 운영자에게 이 화면의 결정 식별자를 전달하십시오.
 ```
 
-받은 문자열이 이 분기가 존재하는 이유 그 자체다: 시간이 지나면 풀리는 한도 앞에서 승인자를 운영자에게 보내는 문구.
+The string that came back is the whole reason this branch exists: copy that sends an approver to an operator in the face of a limit that clears on its own.
 
 ---
 
-## 6. 뜻 있는 변형을 만들 수 없었던 자리
+## 6. Where no meaningful mutation could be constructed
 
-여기 적는 것은 "테스트가 약하다"가 아니라 **"이 자리에서는 뮤테이션이 어느 쪽으로도 말하지 않는다"**이다. 표를 채우려고 약한 변형을 지어내면 그 행은 다음 사람을 속인다.
+What is recorded here is not "the test is weak" — it is **"a mutation at this place says nothing in either direction".** Inventing a weak mutation to fill the table produces a row that misleads the next person.
 
-### 6.1 취소 제한기 키의 접두사
+### 6.1 The prefix on the cancellation limiter key
 
-`cancel.go`는 `"canceller\x1f"+caller.CallerID()`로 부과한다. 접두사를 `"k:"`로 바꿔 `go test ./internal/api/`를 돌리면 **초록이다.**
+`cancel.go` charges under `"canceller\x1f"+caller.CallerID()`. Change the prefix to `"k:"` and run `go test ./internal/api/` and it is **green.**
 
-그것이 결함이 아닌 이유: 이 제한기는 취소 전용이고 표에 다른 이름 공간이 들어오지 않는다. 접두사는 미래에 이 표를 공유하게 될 때를 위한 것이지 오늘 무엇을 막고 있지 않다. 오늘의 동작에 아무 차이가 없으므로 **테스트가 잡지 못하는 것이 맞다.** (`decide` 경로의 `\x1f`는 다르다 — 거기서는 두 이름 공간이 실제로 한 표에 있었고, 2.7이 그 자리를 잡는다.)
+Why that is not a defect: this limiter is cancellation-only and no other namespace enters its table. The prefix is for a future in which the table is shared; it is not stopping anything today. Since it makes no difference to today's behaviour, **it is correct that no test catches it.** (The `\x1f` on the `decide` path is different — there, two namespaces really were in one table, and 2.7 catches that place.)
 
-### 6.2 콘솔의 `body?.error === RATE_LIMITED` 절반 (5.2)
+### 6.2 The console's `body?.error === RATE_LIMITED` half (5.2)
 
-이 절반만 빼도 콘솔 스위트는 초록이고, **정직하게 red로 만들 수 없다.** 그러려면 429가 아닌 상태에 `rate_limited` 본문을 실은 응답을 스텁해야 하는데, 오늘의 서버는 그런 응답을 보내지 않는다(`approvals.go`·`cancel.go`·`ingest.go`·`authoring.go` 모두 429와 함께 낸다). 그 스텁을 쓰는 것은 **서버가 내지 않는 모양을 시험하는 일** — 이 유닛이 존재하는 이유인 바로 그 실패 양식이다.
+Remove this half alone and the console suite is green, and **it cannot honestly be made red.** Doing so would require stubbing a response that carries a `rate_limited` body on a status other than 429, and today's server sends no such response (`approvals.go`, `cancel.go`, `ingest.go` and `authoring.go` all emit it with a 429). Writing that stub would be **exercising a shape the server does not emit** — precisely the failure mode this unit exists because of.
 
-그래서 그 분기는 남기되(중간자가 코드를 실어 보낼 가능성에 대한 방어이고 비용이 없다) 테스트로 고정하지 않는다. 덮지 않는 것을 여기 적는 편이 낫다.
+So the branch stays (it is a defence against a middlebox forwarding the code, and it costs nothing) and is not pinned by a test. Better to record here what is not covered.
 
-### 6.3 `retryAfterSecondsFor`의 `d <= 0` 가지
+### 6.3 The `d <= 0` branch in `retryAfterSecondsFor`
 
-`ratelimit.go`가 주석으로 "Not reachable from a refusal — an unlimited budget refuses nothing"이라고 이미 적었다. 도달할 수 없는 가지를 바꾸면 아무 테스트도 움직이지 않는다. 그것이 정상이다.
+`ratelimit.go` already says it in a comment: "Not reachable from a refusal — an unlimited budget refuses nothing". Change an unreachable branch and no test moves. That is correct.
 
-### 6.4 U4(CI 진단)와 U5(`CIBA.Poll` 삭제)
+### 6.4 U4 (CI diagnostics) and U5 (deleting `CIBA.Poll`)
 
-U4는 `.github/workflows/ci.yml`만 만진다. 유닛 테스트가 없는 층이라 여기서 심을 결함이 없다 — 그 유닛의 검증은 계획대로 **일부러 깨뜨린 실행을 한 번 보는 것**이다. U5는 코드를 지운 것이라 심을 자리가 없고, `go build`/`go vet`이 남은 참조를 잡는다.
+U4 touches only `.github/workflows/ci.yml`. It is a layer with no unit tests, so there is no defect to plant here — that unit's verification is, as planned, **watching one deliberately broken run.** U5 deleted code, so there is nothing to plant in, and `go build` / `go vet` catch any remaining reference.
 
 ---
 
-## 7. 부팅 경합 — 확률적인 가드를 결정적인 가드로 바꾼 기록
+## 7. The boot race — the record of turning a probabilistic guard into a deterministic one
 
-이 절은 **두 번 쓰였다.** 첫 판은 확률적인 가드를 뮤테이션으로 재고 "red 확인"이라고 적었다. 코드 리뷰가 그 기록이 **거짓 확신**임을 보였다. 첫 판을 지우지 않고 남기는 이유는, 이 표가 있는 이유가 정확히 그런 일이기 때문이다.
+This section **has been written twice.** The first draft measured a probabilistic guard by mutation and recorded "red confirmed". Code review showed that record to be **false confidence.** The first draft is kept rather than deleted, because that is exactly the kind of thing this table exists for.
 
-### 7.1 첫 판이 틀렸던 자리 (남겨 두는 기록)
+### 7.1 Where the first draft was wrong (kept on the record)
 
-첫 판은 `TestMigrateSurvivesConcurrentBoot`에 배리어를 붙여 **동시에 `Migrate` 안에 있던 부트 수**의 최고치를 재고, 1이면 실패하게 했다. 그리고 "직렬화된 실행이 조용히 통과하던 것을 닫았다"고 적었다.
+The first draft attached a barrier to `TestMigrateSurvivesConcurrentBoot`, measured the peak **number of boots simultaneously inside `Migrate`**, and failed if it was 1. Then it recorded that this "closed the case of a serialized run passing silently".
 
-**닫지 않았다.** `Lock()`이 최대 90초 폴링하므로 마이그레이션 락에서 진 부트들은 **구조적으로** 승자의 마이그레이션이 끝날 때까지 `Migrate` 안에 머문다. 피크는 사실상 언제나 `concurrentBoots`다 — **미수정 코드에서 초록이었던 143회에서도 그랬다.** 즉 그 단언은 자기가 잡겠다던 실행에서 **한 번도 발동하지 않았을 것이다.**
+**It did not close it.** `Lock()` polls for up to 90 seconds, so the boots that lose the migration lock **structurally** stay inside `Migrate` until the winner's migration finishes. The peak is effectively always `concurrentBoots` — **including across the 143 runs that were green on unmodified code.** So that assertion **would never once have fired** on the runs it claimed to catch.
 
-경합이 일어나는 창은 `Migrate` 전체가 아니라 `CREATE TABLE IF NOT EXISTS` 안의 마이크로초다. 그 창 밖에서 잰 겹침은 겹침이지 경합이 아니다.
+The window in which the race happens is not the whole of `Migrate` — it is the microseconds inside `CREATE TABLE IF NOT EXISTS`. Overlap measured outside that window is overlap, not a race.
 
-**그리고 짝지은 뮤테이션의 회수가 이미 그것을 말하고 있었다**: 130회 중 1회 red는 "CI 한 번이 이중으로 망가진 코드를 약 1%로 잡는다"는 뜻이다. 그 숫자를 적어 놓고 결론을 "red 확인"으로 냈다. **회수를 기록하는 것만으로는 부족하고, 회수가 뜻하는 바를 읽어야 한다.**
+**And the run counts of the paired mutation were already saying so**: 1 red in 130 runs means "one CI run catches doubly broken code about 1% of the time". That number was written down and the conclusion was still recorded as "red confirmed". **Recording the run count is not enough; you have to read what the run count means.**
 
-### 7.2 지금의 가드 — 경합을 재지 말고 **락과 분기를 직접 잡아라**
+### 7.2 The guard as it stands — stop measuring the race and **catch the lock and the branch directly**
 
-경합을 재려 하지 않는다. 경합을 없애는 장치가 **거기 있는지**를 잰다.
+It does not try to measure the race. It measures whether the machinery that removes the race **is there.**
 
-| 심은 곳 | 변형 | 잡는 테스트 | 결과 | 회수 |
+| Where planted | Mutation | Test that catches it | Result | Runs |
 |---|---|---|---|---|
-| `migrate.go` (실물) | `pg_advisory_xact_lock` 줄 삭제 | `TestVersionTableCreateWaitsForTheAdvisoryLock` | **red** | **1회 중 1회** (0.05s) |
-| `migrate.go` (실물) | 중복 관용 분기가 `Commit`으로 흘러가게 | `TestVersionTableToleratesAPeerThatDidNotTakeTheLock` | **red** | **1회 중 1회** (0.07s) |
-| `migrate.go` (실물) | `isDuplicateObject`에서 `42710` 제거 | `TestIsDuplicateObjectAcceptsEveryConcurrentCreateCode/42710` | **red** | **1회 중 1회** (즉시) |
+| `migrate.go` (real) | delete the `pg_advisory_xact_lock` line | `TestVersionTableCreateWaitsForTheAdvisoryLock` | **red** | **1 of 1** (0.05s) |
+| `migrate.go` (real) | let the duplicate-tolerance branch fall through to `Commit` | `TestVersionTableToleratesAPeerThatDidNotTakeTheLock` | **red** | **1 of 1** (0.07s) |
+| `migrate.go` (real) | remove `42710` from `isDuplicateObject` | `TestIsDuplicateObjectAcceptsEveryConcurrentCreateCode/42710` | **red** | **1 of 1** (immediate) |
 
-셋 다 **결정적**이다. 운이 없다.
+All three are **deterministic.** There is no luck in them.
 
-어떻게: 락은 다른 세션이 같은 키를 쥔 채 생성이 **기다리는지**로 잰다. 관용 분기는 커밋되지 않은 peer의 생성 뒤에 줄을 서게 만들고, `pg_stat_activity`로 **실제로 줄을 섰는지 확인한 뒤** peer를 커밋시켜 잰다. 순서를 sleep으로 바라지 않고 관측한다.
+How: the lock is measured by whether the create **waits** while another session holds the same key. The tolerance branch is measured by queueing behind an uncommitted peer's create, **confirming through `pg_stat_activity` that it actually queued**, and only then committing the peer. The ordering is observed rather than hoped for with a sleep.
 
-`docs/plans/2026-08-14-001-...`의 U2가 요구한 것은 "가드가 운에 기대지 않는 것"이었다. 첫 판은 운을 **측정**하려 했고, 지금 판은 운을 **제거**한다.
+What that round asked for was "a guard that does not lean on luck". The first draft tried to **measure** the luck; this one **removes** it.
 
-### 7.3 확률적인 테스트는 남지만, 무엇인지 이름을 붙여 둔다
+### 7.3 The probabilistic test stays, but it is named for what it is
 
-`TestMigrateSurvivesConcurrentBoot`은 남는다. 미수정 코드로 **145회에 2회**(약 1.4%) 실패했으므로, **그 초록은 약 98.6%의 경우 아무 말도 하지 않는다.** 그래서 이제 그 테스트의 주석이 자기를 end-to-end smoke라고 적고, 결정적 가드가 어디 있는지 가리킨다.
+`TestMigrateSurvivesConcurrentBoot` stays. On unmodified code it failed **2 times in 145** (about 1.4%), so **its green says nothing about 98.6% of cases.** Its comment now records that it is an end-to-end smoke test, and points at where the deterministic guards are.
 
-라운드 하나가 이 초록을 근거로 "부팅 경합 해결"을 선언했다. 확률적인 테스트를 지우는 것이 답이 아니라, **그것이 증명하지 않는 것을 문서가 말하게 하는 것**이 답이다.
+One round declared the boot race solved on the strength of that green. The answer is not to delete the probabilistic test — the answer is **to make the document say what it does not prove.**
 
-### 7.4 `42501`을 거짓으로 답하는 것이 왜 이 표에 있나
+### 7.4 Why answering falsely on `42501` is in this table
 
-`isDuplicateObject`를 SQLSTATE **클래스** 매칭으로 "단순화"하는 것은 diff로 보면 개선처럼 보인다. 클래스 42에는 `42501 insufficient_privilege`가 있으므로, 그 변경은 **최소 권한 배포에서 권한 거부를 "이미 있다"로 읽고 부팅을 성공시킨다.**
+"Simplifying" `isDuplicateObject` into a SQLSTATE **class** match looks like an improvement in a diff. Class 42 contains `42501 insufficient_privilege`, so that change would **read a permission denial as "already exists" and let the boot succeed on a least-privilege deployment.**
 
-`TestIsDuplicateObjectRefusesCodes`가 그 변경에서 red가 된다. 결함을 잡은 기록이 아니라 **앞으로 올 그럴듯한 변경을 막는 기록**이다.
+`TestIsDuplicateObjectRefusesCodes` goes red on that change. It is not a record of catching a defect — it is **a record of blocking a plausible change still to come.**
 
 ---
 
-## 8. 이 표가 덮지 않는 것
+## 8. What this table does not cover
 
-- **콘솔의 응답 타입과 오류 어휘를 서버에 묶는 기계가 없다.** §5의 대조는 사람이 2026-08-12에 한 것이다. 엔드포인트 이름·메서드·경로는 생성과 경계 검사로 지켜지지만, `api-types.ts`의 필드 이름과 화면이 분기하는 `error` 코드는 손으로 맞춰 둔 거울이다. 지난 라운드의 사고가 정확히 이 층에서 났으므로 **다음 라운드가 가장 먼저 볼 자리다.**
-- **취소 표면에 콘솔 화면이 없다.** `delay-cancel`은 공개 계약에 있고 서버는 429·`Retry-After`·감사까지 갖췄는데 부르는 화면이 없다. 콘솔이 그 표면을 열 때 429 렌더링을 함께 가져와야 하고, 그때 `failureOf`의 문구가 승인 제출과 같아도 되는지가 판단할 거리다(취소는 "이 승인은 기록되지 않았습니다"가 맞는 문장이 아니다).
-- ~~**뮤테이션은 한 번에 하나다.**~~ §7이 이 공백을 메웠다 — 두 변경이 서로를 가리는 경우가 **실재한다**(락 제거를 넓힌 `isDuplicateObject`가 흡수했다). 나머지 절(§1–§6)은 여전히 한 번에 하나이므로, 거기서도 짝이 서로를 가리는지는 아직 모른다.\n- **뮤테이션이 red가 된 것만으로는 부족하다.** §7.1이 그 교훈이다. 확률적인 테스트는 회수와 함께 적어야 하고, 그 회수가 "CI 한 번이 이것을 잡을 확률"로 읽혀야 한다. 1/130은 red가 아니라 **거의 초록**이다.
-- **성능·경합은 대상이 아니다.** 예산이 *늦게* 걸리는 것은 2.1·2.5·2.9가 잡지만, 그 비용이 실제로 얼마인지는 이 표가 말하지 않는다.
-- **`internal/api` 밖의 감사 체인 자체**(gap marker, 체크포인트 서명)는 이번 대상에 넣지 않았다. PR #51이 크게 건드린 곳이 아니다.
+- **There is no machine binding the console's response types and error vocabulary to the server.** The comparison in §5 was done by a person on 2026-08-12. Endpoint names, methods and paths are held by generation and a boundary check, but the field names in `api-types.ts` and the `error` codes the screens branch on are a mirror aligned by hand. The last round's incident happened at exactly this layer, so **it is the first place the next round should look.**
+- **The cancellation surface has no console screen.** `delay-cancel` is in the public contract and the server has the 429, the `Retry-After` and the audit, and no screen calls it. When the console opens that surface it has to bring the 429 rendering with it, and at that point whether `failureOf`'s copy may be the same as approval submission's is a judgement call (for a cancellation, "this approval was not recorded" is not the right sentence).
+- ~~**One mutation at a time.**~~ §7 filled this gap — the case of two changes masking each other **is real** (the widened `isDuplicateObject` absorbed the lock removal). The remaining sections (§1–§6) are still one at a time, so whether pairs mask each other there is still unknown.
+- **A mutation going red is not enough on its own.** §7.1 is that lesson. A probabilistic test has to be recorded with its run count, and that count has to be read as "the probability that one CI run catches this". 1/130 is not red — it is **very nearly green.**
+- **Performance and contention are out of scope.** A budget that binds *late* is caught by 2.1, 2.5 and 2.9, but this table says nothing about what that cost actually is.
+- **The audit chain itself outside `internal/api`** (gap markers, checkpoint signatures) was left out of this round. It is not somewhere PR #51 touched heavily.

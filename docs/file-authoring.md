@@ -1,124 +1,124 @@
-# 파일 저작 경로
+# The file authoring path
 
-정책을 디렉터리로 저작하고 `stamp policy apply`로 제출하는 경로다. 폼 저작과 **동등한 1급 경로**이며, 둘은 같은 개정 파이프라인으로 들어간다(D10, D22).
+The path for authoring policy as a directory and submitting it with `stamp policy apply`. It is **a first-class path equal to** form authoring — both feed the same revision pipeline (D10, D22).
 
-**git은 원하는 상태를 들고, 엔진은 발효 상태를 든다.** git이 진리 원천이 아니라는 것이 이 경로의 전제다 — merge 권한이 정책 변경 권한이 되지 않고, 개정 발효가 미결 결정 재평가와 같은 트랜잭션에 들어가며, 폼 빌더가 git 자격증명을 갖지 않는다.
+**git holds the desired state; the engine holds the effective state.** That git is not the source of truth is this path's premise — merge permission does not become policy-change permission, a revision taking effect enters the same transaction as pending-decision re-evaluation, and the form builder holds no git credentials.
 
-## 디렉터리가 단위다
+## The directory is the unit
 
-`apply`는 디렉터리 하나를 정책 집합의 원하는 상태로 읽는다. `.yaml`과 `.yml` 파일을 하위 디렉터리까지 모두 모으고, 그 밖의 파일은 무시한다.
+`apply` reads one directory as the desired state of a policy set. It collects `.yaml` and `.yml` files recursively through subdirectories, and ignores everything else.
 
-**정책의 식별자는 문서 안의 `id`이고 파일 이름이 아니다.** 파일을 옮기거나 이름을 바꾸거나 한 파일을 열 개로 쪼개는 것은 비교에 아무 영향이 없다 — 이름 변경은 삭제 후 생성이 아니라 변경 없음이다.
+**A policy's identifier is the `id` inside the document, not the file name.** Moving a file, renaming it, or splitting one file into ten has no effect on the comparison — a rename is no change, not a delete followed by a create.
 
 ```
 policies/
-  schema.yaml                # kind: Schema — 정책들이 쓰여진 스키마
+  schema.yaml                # kind: Schema — the schema the policies are written against
   policies/high-value.yaml   # kind: Policy
   policies/offshore.yaml
 ```
 
-## 비교 대상은 파일 출처 정책뿐이다
+## Only file-origin policies are compared
 
-모든 정책은 생성 시점에 저작 출처(`form` 또는 `file`)를 갖는다(R54, D23). `apply`의 원하는-상태 비교는 **파일 출처 정책으로만** 한정된다.
+Every policy gets an authoring origin (`form` or `file`) at creation (R54, D23). `apply`'s desired-state comparison is scoped **to file-origin policies only**.
 
-- 디렉터리에 없는 **파일 출처** 정책 → 삭제 제안
-- 디렉터리에 없는 **콘솔 출처** 정책 → 아무 일도 없다
-- 디렉터리에 있고 발효 중이 아닌 정책 → 생성 제안
+- A **file-origin** policy missing from the directory → proposed for deletion
+- A **console-origin** policy missing from the directory → nothing happens
+- A policy present in the directory and not currently in effect → proposed for creation
 
-이 한정이 없으면 기본 설정에서 제품이 성립하지 않는다. 콘솔로 만든 정책은 파일 디렉터리에 없으므로, CI의 다음 apply가 그것을 삭제로 계산해 매 실행마다 콘솔 정책을 지우자는 제안을 올린다.
+Without this scoping, the product doesn't work in its default configuration. A policy made through the console isn't in the file directory, so CI's next apply would compute it as a deletion and propose wiping the console policy on every run.
 
-### 콘솔 출처 정책을 인수하기
+### Adopting a console-origin policy
 
-콘솔 출처 정책과 같은 식별자의 문서를 디렉터리에 두면 세 가지 중 하나가 된다.
+Placing a document with the same identifier as a console-origin policy in the directory produces one of three outcomes.
 
-| 문서 내용 | 결과 |
+| Document content | Result |
 |---|---|
-| 발효 중인 정책과 동일 | 변경 없음 — `export` 산출물을 그대로 `apply` 할 수 있는 이유다 |
-| 다르고, 인수 선언 없음 | `origin_conflict`로 거부 |
-| 다르고, 인수 선언 있음 | 개정 제안에 인수(take-ownership) 항목으로 포함 |
+| Identical to the policy in effect | No change — this is why an `export` artifact can be `apply`'d back as-is |
+| Differs, no adoption declaration | Rejected as `origin_conflict` |
+| Differs, adoption declared | Included in the revision proposal as a take-ownership item |
 
-인수는 **파일 문서의 명시적 선언**으로만 가능하다. 암묵적 이동은 없고, CLI 플래그도 아니다 — 선언이 diff에 남고 리뷰에 걸려야 하기 때문이다.
+Adoption is possible only through **an explicit declaration in a file document**. There is no implicit transfer, and it is not a CLI flag — the declaration has to show up in the diff and go through review.
 
 ```yaml
-# adopt.yaml — 인수 선언은 정책 문서와 같은 파일에 두지 않는다
+# adopt.yaml — an adoption declaration does not live in the same file as the policy document
 apiVersion: stamp/v1
 kind: Adoption
 policies:
   - high-value
 ```
 
-인수 이후 그 정책은 파일 경로 소유가 되며, 콘솔에서는 조회만 가능하다.
+Once adopted, the policy is owned by the file path, and the console can only view it.
 
-## 부분 적용은 없다
+## There is no partial apply
 
-정적 검증은 집합 전체에 대해 수행된다. 문서 하나라도 실패하면 **제안 자체가 만들어지지 않고** 나머지도 적용되지 않는다. 검증에 통과한 넷이 실은 두 쌍의 반쪽일 수 있기 때문이다.
+Static validation runs over the whole set. If even one document fails, **the proposal itself is never created** and nothing else applies either — the documents that passed validation could really be one half each of two dependent pairs.
 
-완화 분류도 집합 단위다 — 하나라도 완화면 개정 전체가 완화로 취급된다.
+Mitigation classification is also set-wide — if even one document is a mitigation, the whole revision is treated as a mitigation.
 
-## 페이로드 상한
+## Payload limits
 
-| 상한 | 기본값 | 확인 시점 | 환경 변수 |
+| Limit | Default | Checked | Environment variable |
 |---|---|---|---|
-| 문서 수 | 1000 | 파싱 이전 | `STAMP_APPLY_MAX_DOCUMENTS` |
-| 문서별 바이트 | 1 MiB | 파싱 이전 | `STAMP_APPLY_MAX_DOCUMENT_BYTES` |
-| 페이로드 합계 바이트 | 32 MiB | 파싱 이전 | `STAMP_APPLY_MAX_TOTAL_BYTES` |
-| 정책 수 | 1000 | 검증 | `STAMP_APPLY_MAX_POLICIES` |
-| 조건 AST 노드 수 | 512 | 검증 | `STAMP_APPLY_MAX_CONDITION_NODES` |
-| 조건 중첩 깊이 | 32 | 검증 | `STAMP_APPLY_MAX_CONDITION_DEPTH` |
+| Document count | 1000 | before parsing | `STAMP_APPLY_MAX_DOCUMENTS` |
+| Bytes per document | 1 MiB | before parsing | `STAMP_APPLY_MAX_DOCUMENT_BYTES` |
+| Total payload bytes | 32 MiB | before parsing | `STAMP_APPLY_MAX_TOTAL_BYTES` |
+| Policy count | 1000 | validation | `STAMP_APPLY_MAX_POLICIES` |
+| Condition AST node count | 512 | validation | `STAMP_APPLY_MAX_CONDITION_NODES` |
+| Condition nesting depth | 32 | validation | `STAMP_APPLY_MAX_CONDITION_DEPTH` |
 
-앞의 셋은 파싱 이전에 판정된다. 조건의 노드 수는 조건을 읽지 않고는 알 수 없으므로 뒤의 셋은 검증 단계이며, 그때 페이로드는 이미 바이트로 제한되어 있다.
+The first three are decided before parsing. A condition's node count can't be known without reading the condition, so the last three are checked at validation, by which point the payload is already bounded in bytes.
 
-## 직렬화 게이트와 해소 경로 넷
+## The serialization gate and its four resolution paths
 
-미결 개정은 한 번에 하나다(D24). 승인자가 항상 현 발효 상태 대비 diff 하나만 검토하게 하기 위해서다. 거부는 진행 중 제안의 식별자와 수집 현황을 함께 반환한다.
+One pending revision at a time (D24) — so an approver always reviews exactly one diff against the current effective state. The rejection returns the identifier of the proposal in progress along with its collection status.
 
 ```
 409 revision_pending
 {"error":"revision_pending","pending_revision":{"id":"...","origin":"form","threshold":3,"collected":1}}
 ```
 
-잠금은 네 경로로 풀린다.
+The lock clears through four paths.
 
-| 상황 | 해소 경로 |
+| Situation | Resolution path |
 |---|---|
-| CI가 잘못된 디렉터리로 apply | 제안자 철회 — 정족수 불필요 |
-| 승인 불가 제안이 점유 | 거버넌스 정족수에 의한 철회 |
-| 승인자가 아무 행동도 하지 않음 | 미결 수명 상한(기본 24h) |
-| CI가 머지마다 apply | **같은 출처의 새 제안이 기존 제안을 대체** |
+| CI applies against the wrong directory | Withdrawal by the proposer — no quorum needed |
+| An unapprovable proposal is holding the slot | Withdrawal by governance quorum |
+| No approver takes action | Pending-lifetime ceiling (24h default) |
+| CI applies on every merge | **A new proposal from the same origin replaces the existing one** |
 
-대체는 파일 경로에 한정된다. 파일 제안은 *집합 전체*에 대한 진술이므로 다음 머지의 제안이 이전 것을 온전히 대체하지만, 콘솔 제안 둘은 서로 다른 사람의 서로 다른 의도이고 뒤엣것이 앞엣것을 지우면 동료의 심사 중 개정을 철회 기록 없이 없앨 수 있다. 콘솔 제안의 교착은 나머지 세 경로가 푼다.
+Replacement is scoped to the file path. A file proposal is a statement about *the whole set*, so the next merge's proposal fully supersedes the previous one — but two console proposals are two different intents from two different people, and letting the later one erase the earlier would wipe out a colleague's in-review revision with no withdrawal record. A console-proposal deadlock is resolved by the other three paths.
 
-대체 시 기수집 승인은 무효화된다 — 승인 결속 해시가 델타 다이제스트를 덮으므로 다른 변경 집합에 대한 승인은 옮겨올 수 없다.
+On replacement, approvals already collected are invalidated — the approval's binding hash covers the delta digest, so an approval for a different change set cannot carry over.
 
-네 경로 모두 속도 제한 대상이다(기본: 출처당 1분에 10건). `STAMP_REVISION_RATE_WINDOW`과 `STAMP_REVISION_RATE_BURST`로 조정하고, 미결 수명 상한은 `STAMP_REVISION_TTL`이다.
+All four paths are rate-limited (default: 10 per minute per origin). Tune it with `STAMP_REVISION_RATE_WINDOW` and `STAMP_REVISION_RATE_BURST`; the pending-lifetime ceiling is `STAMP_REVISION_TTL`.
 
-## 저작 모드
+## Authoring mode
 
-운영자 설정이며 서버 측 API 거부다. UI 숨김이 아니다. `STAMP_AUTHORING_MODE`로 설정한다.
+An operator setting enforced as a server-side API refusal, not a hidden UI element. Set with `STAMP_AUTHORING_MODE`.
 
-| 모드 | 콘솔 정책 저작 | 파일 apply |
+| Mode | Console policy authoring | File apply |
 |---|---|---|
-| `both`(기본) | 허용 | 허용 |
-| `file` | 거부 | 허용 |
-| `console` | 허용 | 거부 |
+| `both` (default) | allowed | allowed |
+| `file` | refused | allowed |
+| `console` | allowed | refused |
 
-**모르는 값은 기동 실패다.** 오타가 조용히 `both`로 떨어지면 운영자가 닫으려고 적어 둔 창구가 그대로 열린 채 아무 말도 없이 돌아간다 — 이 설정이 잘못될 수 있는 방향은 "닫힌 줄 알았는데 열려 있음" 하나뿐이므로 기동을 거부하는 쪽이 유일하게 안전한 실패다.
+**An unrecognized value fails startup.** If a typo silently fell back to `both`, the door the operator meant to close would stay open with no word said about it — the only way this setting can go wrong is "thought it was closed but it's open," so refusing to start is the only safe failure.
 
-**어느 모드에서도 승인함·감사·시험 평가와 잠금 액션은 남는다.** 잠금 화면이 저작 모듈과 함께 꺼지면 설치 시 `file` 모드를 켠 운영자가 단독 관리자 상태에 갇힌다.
+**Approving, auditing, dry-run evaluation, and lock actions stay available in every mode.** If the lock screen went dark along with the authoring module, an operator who turned on `file` mode at install time would be stuck as a sole administrator.
 
-## 내보내기
+## Export
 
-`export`는 발효 정책 집합 전체를 파일 저작 포맷으로 내보낸다. 콘솔로 시작한 배포가 파일 저작으로 전환하는 진입 경로이며, **내보낸 결과를 그대로 apply 하면 개정 없음으로 판정된다.**
+`export` writes the entire effective policy set out in file-authoring format. It's the entry point for a deployment that started on the console to move to file authoring, and **applying the exported result back as-is is judged as no change.**
 
-산출물은 승인자 신원 목록·정족수 임계값·내부 호출 대상을 한 번에 담는다 — 어떤 거래를 어느 임계값 아래로 쪼개면 승인을 피할 수 있는지가 한 문서에 있다는 뜻이다. 그래서 호출자 인증을 요구하고, 정책 저작 자격 또는 감사 자격을 요구하며, 호출자 식별자와 산출 정책 수를 감사에 남긴다. 거부도 감사에 남는다.
+The artifact holds the approver identity list, quorum thresholds, and internal call targets all at once — meaning one document says exactly which transaction split under which threshold would evade approval. So it requires caller authentication, requires either policy-authoring or audit capability, and logs the caller's identity and the number of policies produced to the audit trail. A refusal is audited too.
 
-자격 원천은 배포가 설정한다. 기본 구현은 검증된 토큰 클레임을 읽으며, 클레임 이름은 `STAMP_CAPABILITY_CLAIM`이고 미지정이면 `stamp_capabilities`다. 값은 `policy.author` 또는 `audit.read`를 담은 문자열 목록이다.
+The deployment configures the capability source. The default implementation reads a verified token claim, named by `STAMP_CAPABILITY_CLAIM` and defaulting to `stamp_capabilities` if unset. The value is a string list carrying `policy.author` or `audit.read`.
 
 ```json
 { "sub": "ann", "stamp_capabilities": ["policy.author"] }
 ```
 
-**클레임을 달지 않은 토큰은 아무 자격도 갖지 않는다.** 자격 원천을 설정했다는 것과 누군가에게 자격을 줬다는 것은 다른 이야기이며, 게이트는 호출자 단위로 fail-closed다 — IdP가 발급하지 않는 클레임 이름을 가리키면 모든 export가 거부되는 배포를 설정한 것이고, 그 방향이 안전한 쪽이다. 인증된 콘솔 사용자 누구나 전체 승인자 목록을 받아가는 것이 반대편의 대안이기 때문이다.
+**A token with no claim holds no capability.** Configuring a capability source is a different thing from granting anyone a capability, and the gate is fail-closed per caller — point it at a claim name the IdP never issues and you've configured a deployment where every export is refused, and that's the safe direction to fail in. The alternative is any authenticated console user walking away with the full approver list.
 
 ## CLI
 
@@ -126,22 +126,22 @@ policies:
 export STAMP_API=https://stamp.example.com
 export STAMP_TOKEN="$(get-token)"
 
-stamp policy export --dir policies/          # 발효 집합을 디렉터리로
-stamp policy apply  --dir policies/          # 제안 식별자를 출력하고 즉시 종료
-stamp policy apply  --dir policies/ --wait   # 확정까지 블록
+stamp policy export --dir policies/          # the effective set, as a directory
+stamp policy apply  --dir policies/          # prints the proposal identifier and exits immediately
+stamp policy apply  --dir policies/ --wait   # blocks until it's decided
 stamp policy lock   --threshold 2 --approvers ann,bob,cid
 ```
 
-`apply`는 기본으로 개정 제안 식별자를 반환하고 즉시 종료한다 — 거버넌스가 비동기이므로 "적용됨"을 동기 반환하지 않는다. `--wait`는 확정까지 블록하고 결과를 종료 코드로 구분한다.
+By default, `apply` returns the revision proposal's identifier and exits immediately — governance is asynchronous, so it doesn't synchronously return "applied." `--wait` blocks until the outcome is decided and distinguishes the result by exit code.
 
-| 종료 코드 | 뜻 |
+| Exit code | Meaning |
 |---|---|
-| 0 | 발효됨, 또는 변경 없음, 또는 (`--wait` 없이) 제안 생성됨 |
-| 1 | 거부·사용법 오류·전송 실패 |
-| 3 | 개정이 거부됨(rejected) |
-| 4 | 대기 중 철회되거나 대체됨 |
-| 5 | `--wait` 시간 초과 — 개정은 여전히 미결이다 |
+| 0 | took effect, or no change, or (without `--wait`) proposal created |
+| 1 | refused, usage error, or transport failure |
+| 3 | revision rejected |
+| 4 | withdrawn or replaced while waiting |
+| 5 | `--wait` timed out — the revision is still pending |
 
-잠금 이전에는 부트스트랩 토큰이 필요하다(`--bootstrap-token` 또는 `$STAMP_BOOTSTRAP_TOKEN`).
+Before locking, a bootstrap token is required (`--bootstrap-token` or `$STAMP_BOOTSTRAP_TOKEN`).
 
-`stamp policy lock`은 해석된 승인자 집합과 정족수를 출력하고 명시적 확인을 받은 뒤에 잠근다. 잠금은 실행 중인 시스템 안에서 되돌릴 수 없다.
+`stamp policy lock` prints the resolved approver set and quorum, waits for explicit confirmation, and then locks. Locking cannot be undone from inside the running system.

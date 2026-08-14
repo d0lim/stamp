@@ -24,9 +24,12 @@ export function AuthGate({ children }: { readonly children: ReactNode }) {
   if (!isLoginConfigured(config)) {
     return (
       <div className="panel panel--refusal">
-        <RouteAnnouncer title="로그인 설정 없음" />
-        <h1>콘솔에 로그인 설정이 없습니다</h1>
-        <p>이 배포는 콘솔용 OIDC 클라이언트를 설정하지 않았습니다. 다음 환경 변수를 설정하십시오.</p>
+        <RouteAnnouncer title="Login not configured" />
+        <h1>The console has no login configuration</h1>
+        <p>
+          This deployment did not configure an OIDC client for the console. Set these environment
+          variables.
+        </p>
         <ul>
           {EnvConsoleVariables.map((name) => (
             <li key={name}>
@@ -41,10 +44,11 @@ export function AuthGate({ children }: { readonly children: ReactNode }) {
   const returnTo = `${routerLocation.pathname}${routerLocation.search}`
   return (
     <div className="panel panel--signin">
-      <RouteAnnouncer title="로그인" />
-      <h1>로그인이 필요합니다</h1>
+      <RouteAnnouncer title="Sign in" />
+      <h1>Sign-in required</h1>
       <p>
-        STAMP 콘솔은 <code>{config.oidc.issuer || '설정된 IdP'}</code>의 계정으로 로그인합니다.
+        The STAMP console signs you in with an account from{' '}
+        <code>{config.oidc.issuer || 'the configured IdP'}</code>.
       </p>
       <button
         type="button"
@@ -52,7 +56,7 @@ export function AuthGate({ children }: { readonly children: ReactNode }) {
         onClick={() => void signIn(returnTo)}
         data-testid="sign-in"
       >
-        로그인
+        Sign in
       </button>
     </div>
   )

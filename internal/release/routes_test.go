@@ -33,10 +33,10 @@ import (
 const (
 	decisionAPIDoc = "../../docs/contracts/decision-api.md"
 	mountTableFile = "testdata/mounted-routes.json"
-	// The heading the endpoint table lives under. The document is Korean; the
-	// heading is matched rather than the table's position, so a section added
-	// above it does not silently move the parser onto another table.
-	endpointHeading = "## 엔드포인트"
+	// The heading the endpoint table lives under. The heading is matched rather
+	// than the table's position, so a section added above it does not silently
+	// move the parser onto another table.
+	endpointHeading = "## Endpoints"
 )
 
 // endpoint is one endpoint as both sides state it: the listener it is on, the
@@ -180,7 +180,7 @@ func (m mountTable) patternsOn(role, surface string) []string {
 // parseEndpointTable reads the endpoint table out of a contract document.
 //
 // A cell's first backticked run is its value: the document annotates rows in
-// prose ("(하위 트리)") and the annotation is not part of what is compared.
+// prose ("(subtree)") and the annotation is not part of what is compared.
 func parseEndpointTable(t *testing.T, path string) map[string]endpoint {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Clean(path))

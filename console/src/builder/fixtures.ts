@@ -79,7 +79,7 @@ export function sampleDraft(): Draft {
       ],
       actions: [
         { name: 'can_update_todo', description: '' },
-        { name: 'can_delete_todo', description: '할 일을 지운다' },
+        { name: 'can_delete_todo', description: 'Deletes a todo.' },
       ],
       sources: [
         {
@@ -100,7 +100,7 @@ export function sampleDraft(): Draft {
     },
     policy: {
       id: 'todo.owner-write',
-      description: '편집자는 자기 소유의 할 일을 고칠 수 있다',
+      description: 'An editor may update or delete a todo they own.',
       subject: 'user',
       resource: 'todo',
       context: '',

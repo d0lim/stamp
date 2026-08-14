@@ -35,7 +35,7 @@ const (
 	// than located by position for the reason routes_test.go matches its own:
 	// a section added above it must not silently move the parser onto another
 	// table.
-	unimplementedHeading = "## 콘솔이 부르지 않는 표면"
+	unimplementedHeading = "## Surfaces the console does not call"
 )
 
 // errorCodeDocumentVersion is the shape the console's check knows how to read.

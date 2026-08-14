@@ -759,6 +759,14 @@ func (g *generator) literal(t Type) Literal {
 		}
 		return Double(g.rng.Float64() * 1e6)
 	case TypeString:
+		// Every entry is a string some layer between here and YAML has a
+		// special reading of: the empty string, values that look like numbers
+		// or booleans, YAML's null and "~", a colon-space that starts a
+		// mapping, surrounding whitespace, a multi-byte string, an embedded
+		// newline, and a leading "#". The multi-byte one is not decoration —
+		// it is the only entry that exercises a non-ASCII round trip, and
+		// replacing it with plain ASCII would delete that coverage while
+		// leaving every assertion green.
 		pool := []string{"", "finance", "10", "true", "yes", "null", "~", "a: b", "  padded  ",
 			"멀티바이트", "line\nbreak", "#hash"}
 		return String(pool[g.rng.IntN(len(pool))])

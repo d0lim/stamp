@@ -134,6 +134,11 @@ func TestCIBARefusesABindingMessageTheIdPWouldRefuse(t *testing.T) {
 	op := newMockOP(t)
 	c := op.client(t)
 
+	// The "non-ascii" case is deliberately non-ASCII and must stay that way:
+	// the binding message goes to an IdP that may render it to a human, and
+	// this is the only case proving the rule refuses on the character class
+	// rather than accidentally passing anything the ASCII checks let through.
+	// Rewriting it in ASCII would leave the test green and prove less.
 	for name, reference := range map[string]string{
 		"with a space": "TXN 4417",
 		"too long":     strings.Repeat("A", MaxBindingMessageLength+1),

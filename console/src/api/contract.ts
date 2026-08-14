@@ -28,8 +28,8 @@ const BY_NAME = new Map(ENDPOINTS.map((e) => [e.name, e]))
 export class UnknownEndpointError extends Error {
   constructor(name: string) {
     super(
-      `"${name}"은(는) 공개 계약에 없는 엔드포인트입니다. ` +
-        `internal/api/contract.go에 선언한 뒤 contract/public-endpoints.json을 다시 생성하십시오.`,
+      `"${name}" is not an endpoint in the public contract. ` +
+        `Declare it in internal/api/contract.go, then regenerate contract/public-endpoints.json.`,
     )
     this.name = 'UnknownEndpointError'
   }
@@ -60,7 +60,7 @@ export function fillPath(template: string, params: Readonly<Record<string, strin
     return encodeURIComponent(value)
   })
   if (missing.length > 0) {
-    throw new Error(`경로 ${template}에 필요한 인자가 없습니다: ${missing.join(', ')}`)
+    throw new Error(`Path ${template} is missing required arguments: ${missing.join(', ')}`)
   }
   return filled
 }

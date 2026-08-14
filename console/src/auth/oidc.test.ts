@@ -14,7 +14,7 @@ import { testConfig } from '../test/harness'
 const config = testConfig()
 
 describe('authorization code + PKCE', () => {
-  it('S256 challenge를 붙여 IdP로 보낸다', async () => {
+  it('sends the visitor to the IdP with an S256 challenge attached', async () => {
     const navigate = vi.fn()
     await beginLogin(config, '/inbox', navigate)
 
@@ -28,14 +28,14 @@ describe('authorization code + PKCE', () => {
     expect(url.searchParams.get('redirect_uri')).toBe(redirectUri(config))
   })
 
-  it('verifier는 sessionStorage에, 토큰은 어디에도 저장하지 않는다', async () => {
+  it('keeps the verifier in sessionStorage and the tokens nowhere', async () => {
     await beginLogin(config, '/inbox', vi.fn())
     const stored = JSON.stringify(window.sessionStorage)
     expect(stored).toContain('verifier')
     expect(window.localStorage.length).toBe(0)
   })
 
-  it('challenge는 verifier의 SHA-256이다', async () => {
+  it('the challenge is the SHA-256 of the verifier', async () => {
     const pair = await createPKCEPair()
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pair.verifier))
     const expected = btoa(String.fromCharCode(...new Uint8Array(digest)))
@@ -45,7 +45,7 @@ describe('authorization code + PKCE', () => {
     expect(pair.challenge).toBe(expected)
   })
 
-  it('state가 다르면 토큰 교환을 하지 않는다', async () => {
+  it('does not exchange the token when the state differs', async () => {
     await beginLogin(config, '/inbox', vi.fn())
     const fetchImpl = vi.fn()
 
@@ -55,17 +55,17 @@ describe('authorization code + PKCE', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 
-  it('이 브라우저에서 시작하지 않은 콜백을 거부한다', async () => {
+  it('refuses a callback that did not start in this browser', async () => {
     await expect(completeLogin(config, { code: 'c', state: 's' })).rejects.toThrow(AuthError)
   })
 
-  it('IdP가 오류를 돌려주면 사유를 전한다', async () => {
+  it('carries the reason through when the IdP returns an error', async () => {
     await expect(
-      completeLogin(config, { error: 'access_denied', errorDescription: '사용자가 취소함' }),
-    ).rejects.toThrow(/완료되지 않았습니다/)
+      completeLogin(config, { error: 'access_denied', errorDescription: 'the user cancelled' }),
+    ).rejects.toThrow(/did not complete/)
   })
 
-  it('코드를 교환하고 원래 화면으로 돌아간다', async () => {
+  it('exchanges the code and returns to the original screen', async () => {
     const navigate = vi.fn()
     await beginLogin(config, '/console/inbox/d-1', navigate)
     const authorizeUrl = new URL(navigate.mock.calls[0]?.[0] as string)
@@ -93,23 +93,23 @@ describe('authorization code + PKCE', () => {
     expect(takeFlow()).toBeNull()
   })
 
-  it('authorization url은 설정된 scope를 그대로 요청한다', () => {
+  it('the authorization url requests exactly the configured scopes', () => {
     const url = new URL(buildAuthorizationUrl(config, 'st', 'ch'))
     expect(url.searchParams.get('scope')).toBe('openid profile')
   })
 })
 
-describe('복귀 경로 검증', () => {
+describe('validating the return path', () => {
   it.each([
     ['https://attacker.example/', '/'],
     ['//attacker.example/', '/'],
     ['/\\attacker.example', '/'],
     ['javascript:alert(1)', '/'],
-  ])('오리진 밖 복귀 경로 %s를 거부한다', (candidate, expected) => {
+  ])('refuses the off-origin return path %s', (candidate, expected) => {
     expect(safeReturnTo(candidate, config)).toBe(expected)
   })
 
-  it('콘솔 안의 경로는 그대로 쓴다', () => {
+  it('uses a path inside the console as given', () => {
     expect(safeReturnTo('/console/policies', config)).toBe('/policies')
     expect(safeReturnTo('/inbox', config)).toBe('/inbox')
   })

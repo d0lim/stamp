@@ -20,13 +20,13 @@ export function NoAccessScreen() {
   const { userLabel, config } = useAuth()
   return (
     <div className="panel panel--refusal">
-      <RouteAnnouncer title="사용 가능한 화면 없음" />
-      <h1>사용할 수 있는 화면이 없습니다</h1>
+      <RouteAnnouncer title="No access" />
+      <h1>No screen is available to you</h1>
       <p>
-        <strong>{userLabel}</strong> 계정의 토큰에는 콘솔 역할이 없습니다. 콘솔은{' '}
-        <code>{config.oidc.roleClaim}</code> claim에서 역할을 읽습니다.
+        The token for <strong>{userLabel}</strong> carries no console role. The console reads
+        roles from the <code>{config.oidc.roleClaim}</code> claim.
       </p>
-      <p>관리자에게 정책 저작·승인·감사 중 필요한 역할 부여를 요청하십시오.</p>
+      <p>Ask an administrator to grant the role you need: policy authoring, approval, or audit.</p>
     </div>
   )
 }
@@ -35,11 +35,11 @@ export function NotFoundScreen() {
   const { landing } = useAuth()
   return (
     <div className="panel panel--refusal">
-      <RouteAnnouncer title="화면을 찾을 수 없음" />
-      <h1>화면을 찾을 수 없습니다</h1>
-      <p>주소를 확인하십시오.</p>
+      <RouteAnnouncer title="Not found" />
+      <h1>Screen not found</h1>
+      <p>Check the address.</p>
       <p>
-        <Link to={landing}>처음 화면으로 이동</Link>
+        <Link to={landing}>Go to your landing screen</Link>
       </p>
     </div>
   )

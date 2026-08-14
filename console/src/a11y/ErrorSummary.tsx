@@ -27,7 +27,7 @@ export interface ErrorSummaryProps {
   readonly title?: string
 }
 
-export function ErrorSummary({ errors, title = '입력을 확인해 주십시오' }: ErrorSummaryProps) {
+export function ErrorSummary({ errors, title = 'Check your input' }: ErrorSummaryProps) {
   const ref = useRef<HTMLDivElement>(null)
   const count = errors.length
 

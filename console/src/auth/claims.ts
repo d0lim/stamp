@@ -41,13 +41,13 @@ export function decodeClaims(jwt: string): TokenClaims | null {
 }
 
 export function displayName(claims: TokenClaims | null): string {
-  if (!claims) return '알 수 없는 사용자'
+  if (!claims) return 'Unknown user'
   return (
     (typeof claims.name === 'string' && claims.name) ||
     (typeof claims.preferred_username === 'string' && claims.preferred_username) ||
     (typeof claims.email === 'string' && claims.email) ||
     (typeof claims.sub === 'string' && claims.sub) ||
-    '알 수 없는 사용자'
+    'Unknown user'
   )
 }
 

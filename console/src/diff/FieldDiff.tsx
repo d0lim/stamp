@@ -14,12 +14,12 @@
  */
 import { diffDocuments, countChanged, type ChangeKind, type FieldChange } from './document'
 
-/** The three words the console uses for a change, everywhere. */
+/** The words the console uses for a change, everywhere. */
 export const CHANGE_LABELS: Readonly<Record<ChangeKind, string>> = {
-  added: '추가',
-  removed: '삭제',
-  changed: '수정',
-  unchanged: '동일',
+  added: 'Added',
+  removed: 'Removed',
+  changed: 'Changed',
+  unchanged: 'Unchanged',
 }
 
 /** A shape as well as a colour, so the distinction survives greyscale. */
@@ -43,7 +43,7 @@ export function FieldDiff({ changes, showUnchanged = false, idPrefix }: FieldDif
   if (rows.length === 0) {
     return (
       <p className="field__hint" data-testid={`${idPrefix}-empty`}>
-        이 정책의 필드 중 달라진 것이 없습니다.
+        No field of this policy changed.
       </p>
     )
   }
@@ -62,7 +62,7 @@ export function FieldDiff({ changes, showUnchanged = false, idPrefix }: FieldDif
           </p>
           {change.before === undefined ? null : (
             <p className="fielddiff__value">
-              <span className="fielddiff__side">이전</span>
+              <span className="fielddiff__side">Before</span>
               {/* Rendered as text. A policy document is authored content and
                   there is no HTML interpretation path on this screen (R22). */}
               <code>{change.before}</code>
@@ -70,7 +70,7 @@ export function FieldDiff({ changes, showUnchanged = false, idPrefix }: FieldDif
           )}
           {change.after === undefined ? null : (
             <p className="fielddiff__value">
-              <span className="fielddiff__side">이후</span>
+              <span className="fielddiff__side">After</span>
               <code>{change.after}</code>
             </p>
           )}

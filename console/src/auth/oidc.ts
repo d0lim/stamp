@@ -113,19 +113,19 @@ export async function completeLogin(
 ): Promise<CompletedLogin> {
   const flow = takeFlow()
   if (params.error) {
-    throw new AuthError('로그인이 완료되지 않았습니다.', params.errorDescription ?? params.error)
+    throw new AuthError('Sign-in did not complete.', params.errorDescription ?? params.error)
   }
   if (!params.code || !params.state) {
-    throw new AuthError('로그인 응답에 코드나 state가 없습니다.')
+    throw new AuthError('The sign-in response carries no code and no state.')
   }
   if (!flow) {
     throw new AuthError(
-      '이 브라우저에서 시작한 로그인이 아닙니다.',
-      '로그인을 다시 시작하십시오.',
+      'This sign-in did not start in this browser.',
+      'Start the sign-in again.',
     )
   }
   if (!constantTimeEquals(flow.state, params.state)) {
-    throw new AuthError('로그인 응답의 state가 일치하지 않습니다.')
+    throw new AuthError('The state in the sign-in response does not match.')
   }
 
   const body = new URLSearchParams({
@@ -146,15 +146,15 @@ export async function completeLogin(
       cache: 'no-store',
     })
   } catch (cause) {
-    throw new AuthError('토큰 엔드포인트에 연결하지 못했습니다.', String(cause))
+    throw new AuthError('Could not reach the token endpoint.', String(cause))
   }
   if (!response.ok) {
-    throw new AuthError('토큰 교환이 거부되었습니다.', `HTTP ${response.status}`)
+    throw new AuthError('The token exchange was refused.', `HTTP ${response.status}`)
   }
   const payload = (await response.json()) as Record<string, unknown>
   const accessToken = typeof payload.access_token === 'string' ? payload.access_token : ''
   if (accessToken === '') {
-    throw new AuthError('토큰 응답에 access_token이 없습니다.')
+    throw new AuthError('The token response carries no access_token.')
   }
   const expiresIn = typeof payload.expires_in === 'number' ? payload.expires_in : null
 

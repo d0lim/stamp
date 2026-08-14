@@ -35,10 +35,10 @@ import type { PlacedDiagnostics } from './diagnostics'
 import { fieldId, jptr } from './pointer'
 
 const KIND_NOTES: Readonly<Record<SourceKind, string>> = {
-  static: '배포 설정에 고정된 값을 돌려줍니다. 호출이 없습니다.',
-  http: '동기 HTTP 호출입니다. 호출 대상과 캐시 TTL은 운영자의 fact plane 설정이며 선언에 담기지 않습니다.',
-  event: '비동기 이벤트 집계를 읽습니다. 스트림과 윈도 정의는 운영자 설정입니다.',
-  idp_group: 'IdP 그룹 조회입니다. 승인자 집합 해석에도 같은 선언을 씁니다.',
+  static: 'Returns a value fixed in the deployment configuration. There is no call.',
+  http: "A synchronous HTTP call. The call target and the cache TTL are the operator's fact plane configuration and are not carried in the declaration.",
+  event: 'Reads an asynchronous event aggregate. The stream and window definitions are operator configuration.',
+  idp_group: 'An IdP group lookup. The same declaration is what resolves an approver set.',
 }
 
 function EntityEditor({
@@ -64,8 +64,8 @@ function EntityEditor({
     >
       <Field
         pointer={jptr(pointer, 'name')}
-        label="이름"
-        hint="소문자로 시작하고 소문자·숫자·밑줄만 씁니다 — CEL 식별자가 됩니다."
+        label="Name"
+        hint="Starts with a lowercase letter and uses only lowercase letters, digits and underscores — it becomes a CEL identifier."
         placed={placed}
       >
         {(props) => (
@@ -81,7 +81,7 @@ function EntityEditor({
       {entity.attributes.map((attribute, i) => (
         <div className="field field--inline" key={i}>
           <label className="field__label" htmlFor={`${fieldId(pointer)}--attr-${i}`}>
-            속성 {i + 1} 이름
+            Attribute {i + 1} name
           </label>
           <input
             id={`${fieldId(pointer)}--attr-${i}`}
@@ -101,7 +101,7 @@ function EntityEditor({
             className="field__label"
             htmlFor={fieldId(jptr(pointer, 'attributes', attribute.name))}
           >
-            속성 {i + 1} 타입
+            Attribute {i + 1} type
           </label>
           <select
             id={fieldId(jptr(pointer, 'attributes', attribute.name))}
@@ -129,7 +129,7 @@ function EntityEditor({
               onChange({ ...entity, attributes: entity.attributes.filter((_, j) => j !== i) })
             }
           >
-            속성 {i + 1} 삭제
+            Delete attribute {i + 1}
           </button>
         </div>
       ))}
@@ -140,10 +140,10 @@ function EntityEditor({
           onChange({ ...entity, attributes: [...entity.attributes, { name: '', type: 'string' }] })
         }
       >
-        속성 추가
+        Add attribute
       </button>
       <button type="button" className="button button--quiet" onClick={onRemove}>
-        entity {index + 1} 삭제
+        Delete entity {index + 1}
       </button>
     </FieldGroup>
   )
@@ -170,7 +170,7 @@ function ActionEditor({
       placed={placed}
       className="node"
     >
-      <Field pointer={jptr(pointer, 'name')} label="이름" placed={placed}>
+      <Field pointer={jptr(pointer, 'name')} label="Name" placed={placed}>
         {(props) => (
           <input
             {...props}
@@ -183,7 +183,7 @@ function ActionEditor({
       </Field>
       <div className="field">
         <label className="field__label" htmlFor={`${fieldId(pointer)}--description`}>
-          설명
+          Description
         </label>
         <input
           id={`${fieldId(pointer)}--description`}
@@ -194,7 +194,7 @@ function ActionEditor({
         />
       </div>
       <button type="button" className="button button--quiet" onClick={onRemove}>
-        action {index + 1} 삭제
+        Delete action {index + 1}
       </button>
     </FieldGroup>
   )
@@ -221,7 +221,7 @@ function SourceEditor({
       placed={placed}
       className="node"
     >
-      <Field pointer={jptr(pointer, 'name')} label="이름" placed={placed}>
+      <Field pointer={jptr(pointer, 'name')} label="Name" placed={placed}>
         {(props) => (
           <input
             {...props}
@@ -234,7 +234,7 @@ function SourceEditor({
       </Field>
       <Field
         pointer={jptr(pointer, 'kind')}
-        label="종류"
+        label="Kind"
         hint={KIND_NOTES[source.kind]}
         placed={placed}
       >
@@ -256,7 +256,7 @@ function SourceEditor({
       {source.params.map((param, i) => (
         <div className="field field--inline" key={i}>
           <label className="field__label" htmlFor={`${fieldId(pointer)}--param-name-${i}`}>
-            인자 {i + 1} 이름
+            Parameter {i + 1} name
           </label>
           <input
             id={`${fieldId(pointer)}--param-name-${i}`}
@@ -273,7 +273,7 @@ function SourceEditor({
             }
           />
           <label className="field__label" htmlFor={fieldId(jptr(pointer, 'params', i))}>
-            인자 {i + 1} 타입
+            Parameter {i + 1} type
           </label>
           <select
             id={fieldId(jptr(pointer, 'params', i))}
@@ -303,9 +303,9 @@ function SourceEditor({
           onChange({ ...source, params: [...source.params, { name: '', type: 'string' }] })
         }
       >
-        인자 추가
+        Add parameter
       </button>
-      <Field pointer={jptr(pointer, 'returns')} label="반환 타입" placed={placed}>
+      <Field pointer={jptr(pointer, 'returns')} label="Return type" placed={placed}>
         {(props) => (
           <select
             {...props}
@@ -323,8 +323,8 @@ function SourceEditor({
       </Field>
       <Field
         pointer={jptr(pointer, 'on_error')}
-        label="실패 동작"
-        hint="allow는 배포 단위로도 켜져 있어야 실제로 허용됩니다. 선언만으로는 열리지 않습니다."
+        label="Failure behaviour"
+        hint="allow only permits anything if the deployment enables it as well. The declaration alone does not open it."
         placed={placed}
       >
         {(props) => (
@@ -343,7 +343,7 @@ function SourceEditor({
         )}
       </Field>
       <button type="button" className="button button--quiet" onClick={onRemove}>
-        source {index + 1} 삭제
+        Delete source {index + 1}
       </button>
     </FieldGroup>
   )
@@ -362,8 +362,8 @@ export function DeclarationsEditor({
     <div className="declarations">
       {hasNoDeclarations(schema) ? (
         <p data-testid="declarations-empty">
-          이 저작 세션에는 선언이 하나도 없습니다. 정책 폼은 선언에서 렌더링되므로, 먼저 entity를
-          하나 선언해야 조건을 쓸 수 있습니다.
+          This authoring session has no declarations at all. The policy form is rendered from the
+          declarations, so an entity has to be declared before a condition can be written.
         </p>
       ) : null}
 
@@ -390,7 +390,7 @@ export function DeclarationsEditor({
         className="button button--primary"
         onClick={() => onChange({ ...schema, entities: [...schema.entities, { name: '', attributes: [] }] })}
       >
-        entity 선언 추가
+        Add entity declaration
       </button>
 
       <h3>action</h3>
@@ -413,7 +413,7 @@ export function DeclarationsEditor({
         className="button"
         onClick={() => onChange({ ...schema, actions: [...schema.actions, { name: '', description: '' }] })}
       >
-        action 선언 추가
+        Add action declaration
       </button>
 
       <h3>fact source</h3>
@@ -444,7 +444,7 @@ export function DeclarationsEditor({
           })
         }
       >
-        source 선언 추가
+        Add source declaration
       </button>
     </div>
   )

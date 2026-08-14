@@ -22,7 +22,7 @@ import { STATE_LABELS, type AuditDecisionDetail } from './api-types'
 
 /** JSON as text, two-space indented. Never markup. */
 export function asText(value: unknown): string {
-  if (value === undefined || value === null) return '(없음)'
+  if (value === undefined || value === null) return '(none)'
   if (typeof value === 'string') return value
   try {
     return JSON.stringify(value, null, 2)
@@ -39,56 +39,56 @@ export function AuditDecisionScreen() {
 
   return (
     <div className="panel">
-      <RouteAnnouncer title="결정 상세" />
-      <h1>결정 상세</h1>
+      <RouteAnnouncer title="Decision detail" />
+      <h1>Decision detail</h1>
       <p>
-        <Link to="/audit">감사 목록으로 돌아가기</Link>
+        <Link to="/audit">Back to the audit list</Link>
       </p>
 
       {unavailable ? (
         <div className="notice notice--warning" role="alert" data-testid="decision-unavailable">
           <p className="notice__text">
-            이 결정을 열람할 수 없습니다 — 존재하지 않거나, 당신에게 열려 있지 않습니다. 서버는 이
-            둘을 구분해 답하지 않습니다.
+            This decision cannot be opened — it does not exist, or it is not open to you. The server
+            does not distinguish between the two.
           </p>
           <p>
-            감사자 자격이 없는 경우 자신이 초기화했거나 자신이 대상인 결정만 열람할 수 있습니다.
-            결정 식별자를 다시 확인하십시오.
+            Without auditor standing you can open only the decisions you initiated or are the
+            subject of. Check the decision identifier again.
           </p>
         </div>
       ) : error === null ? null : (
         <p className="notice notice--warning" role="alert" data-testid="decision-error">
-          결정을 읽지 못했습니다: {error}
+          The decision could not be read: {error}
         </p>
       )}
 
       {detail === null ? (
-        unavailable ? null : <p>결정을 읽는 중입니다…</p>
+        unavailable ? null : <p>Reading the decision…</p>
       ) : (
         <>
           <dl className="summary-list">
-            <dt>결정</dt>
+            <dt>Decision</dt>
             <dd>{detail.id}</dd>
-            <dt>상태</dt>
+            <dt>State</dt>
             <dd>{STATE_LABELS[detail.state] ?? detail.state}</dd>
-            <dt>호출자</dt>
+            <dt>Caller</dt>
             <dd>{detail.caller_id}</dd>
-            <dt>주체 · 리소스 · 액션</dt>
+            <dt>Subject · resource · action</dt>
             <dd>
               {detail.subject_id} · {detail.resource_id} · {detail.action}
             </dd>
-            <dt>적용된 정책 버전</dt>
+            <dt>Policy version applied</dt>
             <dd data-testid="policy-version">
               {detail.policy_id} · v{detail.policy_version}
               {detail.policy_origin === '' ? '' : ` · ${detail.policy_origin}`}
             </dd>
-            <dt>생성 · 만료</dt>
+            <dt>Created · expires</dt>
             <dd>
               {detail.created_at} · {detail.expires_at}
             </dd>
             {detail.resolved_at === undefined ? null : (
               <>
-                <dt>종결</dt>
+                <dt>Resolved</dt>
                 <dd>{detail.resolved_at}</dd>
               </>
             )}
@@ -96,45 +96,48 @@ export function AuditDecisionScreen() {
 
           {detail.via_auditor_standing ? null : (
             <p className="field__hint" data-testid="own-record-notice">
-              감사자 자격이 아니라 “자신이 초기화했거나 대상인 결정” 규칙으로 열람하고 있습니다.
+              You are reading this under the “decisions you initiated or are the subject of” rule,
+              not under auditor standing.
             </p>
           )}
 
-          <h2>고정된 자료</h2>
-          <Disclosure summary="요청 (request)">
+          <h2>Frozen material</h2>
+          <Disclosure summary="Request">
             <pre className="document" data-testid="audit-request">
               {asText(detail.request)}
             </pre>
           </Disclosure>
-          <Disclosure summary="사실 스냅샷 (fact snapshot)">
+          <Disclosure summary="Fact snapshot">
             <pre className="document" data-testid="audit-facts">
               {asText(detail.fact_snapshot)}
             </pre>
           </Disclosure>
-          <Disclosure summary="의무 (obligations)">
+          <Disclosure summary="Obligations">
             <pre className="document" data-testid="audit-obligations">
               {asText(detail.obligations)}
             </pre>
           </Disclosure>
-          <Disclosure summary={`정책 문서 (v${detail.policy_version} 시점)`}>
+          <Disclosure summary={`Policy document (as of v${detail.policy_version})`}>
             <pre className="document" data-testid="audit-policy-document">
-              {detail.policy_document === '' ? '이 버전의 정책 문서를 읽지 못했습니다.' : detail.policy_document}
+              {detail.policy_document === ''
+                ? 'The policy document for this version could not be read.'
+                : detail.policy_document}
             </pre>
           </Disclosure>
 
           <h2>challenge</h2>
           {detail.challenges.length === 0 ? (
-            <p>이 결정에는 challenge가 없습니다.</p>
+            <p>This decision has no challenge.</p>
           ) : (
             <table className="audit-table" data-testid="audit-challenges">
-              <caption>challenge 진행</caption>
+              <caption>challenge progress</caption>
               <thead>
                 <tr>
-                  <th scope="col">순번</th>
-                  <th scope="col">종류</th>
-                  <th scope="col">상태</th>
-                  <th scope="col">기한</th>
-                  <th scope="col">충족</th>
+                  <th scope="col">Ordinal</th>
+                  <th scope="col">Kind</th>
+                  <th scope="col">State</th>
+                  <th scope="col">Deadline</th>
+                  <th scope="col">Satisfied</th>
                 </tr>
               </thead>
               <tbody>
@@ -151,19 +154,19 @@ export function AuditDecisionScreen() {
             </table>
           )}
 
-          <h2>승인</h2>
+          <h2>Approvals</h2>
           {detail.approvals.length === 0 ? (
-            <p data-testid="audit-approvals-empty">기록된 승인이 없습니다.</p>
+            <p data-testid="audit-approvals-empty">No approval was recorded.</p>
           ) : (
             <table className="audit-table" data-testid="audit-approvals">
-              <caption>수집된 승인과 그 바인딩 해시</caption>
+              <caption>The approvals collected and their binding hashes</caption>
               <thead>
                 <tr>
                   <th scope="col">challenge</th>
-                  <th scope="col">승인자</th>
-                  <th scope="col">판정</th>
-                  <th scope="col">바인딩 해시</th>
-                  <th scope="col">제출</th>
+                  <th scope="col">Approver</th>
+                  <th scope="col">Judgment</th>
+                  <th scope="col">Binding hash</th>
+                  <th scope="col">Submitted</th>
                 </tr>
               </thead>
               <tbody>

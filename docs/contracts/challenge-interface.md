@@ -4,22 +4,22 @@ version: 1.4.0
 source: internal/challenge
 ---
 
-# challenge 인터페이스 계약
+# challenge interface contract
 
-결정이 정책 평가만으로 답할 수 없는 부분 — 모아야 할 정족수, 완료해야 할 step-up, 흘러야 할 지연, 답해야 할 외부 시스템 — 의 처리 규약이다. 공개 계약 3종 중 하나이며 semver로 버전 관리한다(R11). 정본은 `internal/challenge/contract.go`이고 그 파일의 `ContractVersion` 상수가 이 문서의 `version`과 같아야 한다 — 릴리즈 워크플로가 대조한다.
+How the part of a decision that policy evaluation alone cannot answer is handled — a quorum to be gathered, a step-up to be completed, a delay to run out, an external system to answer. One of the three public contracts, versioned with semver (R11). The source of truth is `internal/challenge/contract.go`, and that file's `ContractVersion` constant has to equal this document's `version` — the release workflow compares them.
 
-결정 수명주기는 challenge를 **언제** 열고 그 결과가 결정에 **무엇을** 하는지를 소유하고, 이 계약은 둘 사이 대화의 **모양**만 소유한다.
+The decision lifecycle owns **when** a challenge is opened and **what** its outcome does to the decision; this contract owns only the **shape** of the conversation between the two.
 
-## 버전 규칙
+## Version rules
 
-정본의 서술을 그대로 옮긴다.
+Carried over verbatim from the source of truth.
 
-| 변경 | 등급 |
+| Change | Level |
 |---|---|
-| `Handler`에 메서드 추가, 메서드 시그니처 변경, `State` 값의 의미 변경 | major |
-| 요청·결과 구조체에 필드 추가, `Targeter` 같은 선택 인터페이스 추가 | minor |
+| Adding a method to `Handler`, changing a method signature, changing what a `State` value means | major |
+| Adding a field to a request or result struct, adding an optional interface such as `Targeter` | minor |
 
-## 동사는 셋이다
+## There are three verbs
 
 ```go
 type Handler interface {
@@ -30,9 +30,9 @@ type Handler interface {
 }
 ```
 
-네 번째 동사는 없다. 특히 **"마감이 지났다, 이제 어떻게 하나"라는 동사가 없다** — 스위퍼가 현재 시각으로 `Status`를 물으면 지연은 satisfied를, 정족수는 pending을 답한다. 마감 경과의 의미가 종류마다 정반대라 별도 콜백은 반드시 한쪽을 틀린다.
+There is no fourth verb. In particular **there is no verb for "the deadline has passed, now what"** — when the sweeper asks `Status` with the current instant, a delay answers satisfied and a quorum answers pending. A passed deadline means the opposite thing for one kind than for the other, so a separate callback would necessarily be wrong about one of them.
 
-선택 인터페이스는 셋이다. 전부 네 번째 동사를 만들지 않으려고 분리됐고, 전부 구현하지 않은 핸들러가 있어도 조립이 실패하지 않는다.
+There are three optional interfaces. All three exist so that a fourth verb does not have to, and a handler that implements none of them does not fail assembly.
 
 ```go
 type Targeter interface {
@@ -40,7 +40,7 @@ type Targeter interface {
 }
 ```
 
-구현하지 않은 핸들러는 대상이 없는 것으로 취급한다 — 조회 권한은 fail-closed다(R40).
+A handler that does not implement it is treated as having no target — read standing is fail-closed (R40).
 
 ```go
 type Viewer interface {
@@ -48,7 +48,7 @@ type Viewer interface {
 }
 ```
 
-**1.1.0에서 더해졌다**(선택 인터페이스 추가 = minor). 진행 중 challenge에서 **호출자에게 말해도 되는 부분**을 답한다. 지금 `View`가 가진 필드는 `AuthorizationURL` 하나 — 브라우저로 완결되는 challenge가 주체를 보낼 곳이다. 구현하지 않은 핸들러는 아무것도 공개하지 않으며, 그것이 quorum·delay·external 셋이 원하는 답이다.
+**Added in 1.1.0** (adding an optional interface = minor). It answers with the part of an in-progress challenge **that the caller may be told**. The one field `View` currently has is `AuthorizationURL` — where a challenge that completes in a browser sends the subject. A handler that does not implement it discloses nothing, which is the answer quorum, delay and external all want.
 
 ```go
 type Redeemer interface {
@@ -56,50 +56,50 @@ type Redeemer interface {
 }
 ```
 
-**1.2.0에서 더해졌다**(선택 인터페이스 추가 = minor). 자기가 보낸 리다이렉트가 돌아왔을 때, 그것을 제출의 재료로 바꾼다. `Redemption`은 제출이 아니라 **아직 검증되지 않은 자격증명과 함께 갈 본문**이다 — 자격증명을 주체로 바꾸는 일은 `identity` 패키지의 몫이고, challenge 핸들러 안에 두 번째 토큰 검증 경로를 만들지 않기 위해서다. 그래서 왕복은 세 걸음이다: 수명주기가 challenge로 라우팅하고(`Redeem`), 표면이 자격증명을 검증하고, 그 자격증명이 증명한 호출자로 `Submit`한다.
+**Added in 1.2.0** (adding an optional interface = minor). When the redirect it sent comes back, it turns that into the material for a submission. A `Redemption` is not a submission but **the body that will travel alongside a credential that has not been verified yet** — turning a credential into a subject is the `identity` package's job, so that a second token verification path is not created inside a challenge handler. The round trip is therefore three steps: the lifecycle routes to the challenge (`Redeem`), the surface verifies the credential, and `Submit` runs as the caller that credential proved.
 
-구현하지 않은 핸들러는 되돌릴 리다이렉트가 없다 — `ErrNotRedeemable`이며, 기본값을 지어내지 않는다. 거절은 전부 `ErrRedemptionRefused` 하나다: 도착한 쪽은 링크를 따라온 것뿐이고 아직 인증되지 않았으므로, "state가 틀렸다"와 "코드가 소진됐다"의 차이는 운영자에게 필요하고 낯선 사람에게는 필요하지 않다.
+A handler that does not implement it has no redirect to bring back — that is `ErrNotRedeemable`, and no default is invented. Every refusal is the single `ErrRedemptionRefused`: whoever arrived has only followed a link and is not authenticated yet, so the difference between "the state was wrong" and "the code was already spent" is something an operator needs and a stranger does not.
 
-**이것은 `Detail`의 투영이 아니라 화이트리스트다.** `Detail`은 저장용이고 correlator·nonce 같은 비밀을 담는다. 결정 수명주기는 특정 kind를 알지 못하므로 `Detail`에서 URL과 비밀을 구별할 수 없다 — 그래서 핸들러가 **이름으로 고른 필드만** 넘어간다. 새 필드는 "이 값이 배포 밖으로 나가도 되는가"에 누군가 답했다는 뜻이다.
+**This is a whitelist rather than a projection of `Detail`.** `Detail` is for storage and holds secrets such as the correlator and the nonce. The decision lifecycle does not know any particular kind, so it cannot tell a URL from a secret inside `Detail` — which is why only **the fields the handler picked by name** are passed along. A new field means somebody has answered the question "may this value leave the deployment".
 
-## 상태
+## States
 
-`pending`, `satisfied`, `failed`, `cancelled`. 뒤의 셋이 종결 상태다.
+`pending`, `satisfied`, `failed`, `cancelled`. The last three are terminal.
 
-### `Status.Shed`: 답을 받지 못한 실패와 열리지도 않은 실패
+### `Status.Shed`: a failure that got no answer, and a failure that never opened
 
-**1.3.0에서 더해졌다**(결과 구조체에 필드 추가 = minor). `failed`는 두 가지를 한 단어로 덮는다: 물었는데 아니라는 답이 온 challenge와, **애초에 열리지 않은** challenge다. 뒤쪽은 주체별 challenge 발급 한도가 셰딩한 경우이며(R43) — IdP에도 대상 시스템에도 아무것도 가지 않았고 사람은 아무것도 받지 못했다.
+**Added in 1.3.0** (adding a field to a result struct = minor). `failed` covers two things with one word: a challenge that was asked and came back no, and a challenge that **was never opened at all**. The second is the case the per-subject challenge issuance limit shed (R43) — nothing reached the IdP or the target system, and the person received nothing.
 
-`Shed`는 그 구분을 **한 비트**로 나른다. 핸들러의 실패 단어(`issue_rate_limited`, `rate_limited`)가 아니라 비트인 이유는, 결정 수명주기가 어떤 kind의 어휘도 알아서는 안 되기 때문이다 — 두 문자열을 아는 결정 레이어는 kind가 늘 때마다 고쳐야 한다.
+`Shed` carries that distinction as **one bit**. It is a bit rather than the handler's failure word (`issue_rate_limited`, `rate_limited`) because the decision lifecycle must not know any kind's vocabulary — a decision layer that knows two such strings has to be edited every time a kind is added.
 
-`Status`에 실리는 이유는 결정의 근거가 **읽을 때마다 다시 계산되기** 때문이다. 수명주기는 challenge를 저장한 뒤 `Status`를 묻고, 재검증(R31)이 이미 존재하는 결정에 셰딩된 발급을 쓸 수도 있다 — 발급 반환값에만 있는 비트는 그 뒤로 아무도 읽지 못한다.
+It rides on `Status` because a decision's ground is **recomputed on every read**. The lifecycle stores the challenge and then asks `Status`, and re-evaluation (R31) may write a shed issuance onto a decision that already exists — a bit that exists only in the issue return value is one nobody reads afterwards.
 
-`State`가 `failed`가 아닐 때 이 값은 의미가 없다. 구현하지 않은 핸들러는 `false`이고, 그것이 셰딩 한도를 갖지 않는 kind가 원하는 답이다.
+When `State` is not `failed` this value means nothing. A handler that does not implement it answers `false`, and that is the answer a kind with no shedding limit wants.
 
-### `IssueResult.Shed`와 `IssueResult.RetryAfter`: 너무 늦게 오는 비트
+### `IssueResult.Shed` and `IssueResult.RetryAfter`: the bit that arrives too late
 
-**1.4.0에서 더해졌다**(결과 구조체에 필드 추가 = minor). 같은 비트를 발급 시점에도 싣는다. 1.3.0은 이것을 `Status`에만 두었고 — 위 문단이 그 이유를 적어 두었다 — **그 선택의 대가가 사람에게 갔다.** `Status`로만 오는 비트는 수명주기가 이미 challenge 행을 쓴 **뒤에** 도착하므로, 셰딩된 발급은 `failed` 행이 되고 결정은 그 행을 최종 deny로 해소했다. 그래서 아무도 아무것도 묻지 않은 사람의 이력에 "거부됨"이 쌓였다.
+**Added in 1.4.0** (adding a field to a result struct = minor). The same bit, carried at issue time as well. 1.3.0 put it on `Status` alone — the paragraph above records why — and **the cost of that choice fell on people.** A bit that arrives only through `Status` arrives **after** the lifecycle has already written the challenge row, so a shed issuance became a `failed` row and the decision resolved that row into a final deny. And so "denied" accumulated on the history of a person nobody had asked anything.
 
-발급 시점에 읽으면 decide는 **행을 쓰기 전에** 물러날 수 있다. 결정 API 계약이 1.7.0에서 기술하는 답이 그것이다 — `id` 없는 deny, 저장된 행 없음, `Retry-After` 있음.
+Read at issue time, decide can back out **before it writes a row**. That is the answer the decision API contract describes in its 1.7.0 — a deny with no `id`, no stored row, and a `Retry-After`.
 
-`RetryAfter`는 그 `Retry-After`의 재료다. 어느 예산이 거절했는지는 핸들러만 알고, 초로 바꿔 헤더에 쓰는 것은 표면의 일이다. 비율이 아니라 기간인 이유는 표면이 적어야 하는 것이 초 하나이고, 비율은 그 초에서 산술 한 걸음 떨어져 있기 때문이다.
+`RetryAfter` is the material for that `Retry-After`. Which budget refused is known only to the handler, and converting it to seconds and writing the header is the surface's job. It is a duration rather than a rate because what the surface has to write is one number of seconds, and a rate is one step of arithmetic away from it.
 
-**두 곳 모두 설정하는 것이 구현자의 의무다.** 발급에서 `Shed`를 세우는 핸들러는 같은 challenge에 대해 `Status`에서도 세워야 한다. 재검증이 쓴 행은 읽을 때마다 근거를 다시 계산하고, 그때 비트가 없으면 그 결정은 사람이 거절한 것과 같은 단어를 달게 된다.
+**Setting both is the implementer's duty.** A handler that raises `Shed` at issue has to raise it in `Status` for the same challenge as well. A row written by re-evaluation recomputes its ground on every read, and if the bit is absent then, that decision ends up wearing the same word as one a person refused.
 
-## 핸들러는 자기 detail을 저장한다, 선언이 아니라
+## A handler stores its own detail, not the declaration
 
-`Issue`는 정책의 선언을 받아 `Detail`을 돌려주고, 수명주기는 그것을 challenge 행에 저장해 `Submit`과 `Status`에 그대로 되돌린다. 나중에 필요한 임계값이나 승인자 집합은 핸들러가 `Detail`에 넣는다. 그래야 challenge가 열린 조건이 fact 스냅샷·정책 버전과 함께 동결되고, 이 패키지가 정책 AST를 직렬화할 이유가 사라진다.
+`Issue` takes the policy's declaration and returns a `Detail`, which the lifecycle stores on the challenge row and hands back unchanged to `Submit` and `Status`. A threshold or an approver set that will be needed later is something the handler puts into `Detail`. That way the conditions a challenge was opened under are frozen together with the fact snapshot and the policy version, and this package has no reason to serialize a policy AST.
 
-## `Submit`은 재계산 가능해야 한다
+## `Submit` has to be recomputable
 
-핸들러가 쓰는 증거 행과 수명주기가 쓰는 challenge 상태는 **두 개의 진술이지 하나가 아니다.** 따라서 `Submit`은 멱등이어야 하고(중복 제출은 한 번으로 센다), `Status`는 핸들러가 저장한 것만으로 진행도를 재계산할 수 있어야 한다 — 둘 사이에서 크래시가 나면 증거는 쓰였고 상태는 아직 갱신되지 않은 채로 남기 때문이다.
+The evidence row a handler writes and the challenge state the lifecycle writes are **two statements and not one.** So `Submit` has to be idempotent (a duplicate submission counts once), and `Status` has to be able to recompute progress from what the handler stored alone — because a crash between the two leaves the evidence written and the state not yet updated.
 
-## 자료형
+## Types
 
-| 형 | 필드 |
+| Type | Fields |
 |---|---|
 | `Instance` | `DecisionID`, `Ordinal`, `Kind` |
-| `DecisionContext` | 동결된 결정 내용 |
+| `DecisionContext` | The frozen content of the decision |
 | `IssueRequest` | `Instance`, `Spec`, `Decision`, `Now` |
 | `IssueResult` | `State`, `Detail`, `Deadline`, `Shed`, `RetryAfter` |
 | `SubmitRequest` | `Instance`, `Decision`, `Detail`, `Submitter`, `Payload`, `Now` |
@@ -109,25 +109,25 @@ type Redeemer interface {
 | `ViewRequest` | `Instance`, `Decision`, `Detail`, `Now` |
 | `View` | `AuthorizationURL` |
 
-## 오류
+## Errors
 
-`ErrNoHandler`, `ErrDuplicateHandler`, `ErrNotSubmittable`, `ErrNotTarget`, `ErrInvalidPayload`, `ErrUnsupportedSpec`. 호출자는 `errors.Is`로 분기한다. **핸들러가 없는 종류는 만족될 수 없다** — 없음이 기본 허용으로 해석되지 않는다.
+`ErrNoHandler`, `ErrDuplicateHandler`, `ErrNotSubmittable`, `ErrNotTarget`, `ErrInvalidPayload`, `ErrUnsupportedSpec`. Callers branch with `errors.Is`. **A kind with no handler cannot be satisfied** — absence is not read as permission.
 
-레지스트리는 한 종류에 두 핸들러를 등록하면 오류를 반환하며, 등록 해제는 없다.
+The registry returns an error when two handlers are registered for one kind, and there is no deregistration.
 
-## 종류별 detail
+## Detail by kind
 
-`Detail`은 저장되고 그대로 되돌려지는 값이므로 그 JSON 표현이 계약의 일부다.
+`Detail` is stored and handed back unchanged, so its JSON representation is part of the contract.
 
-| 종류 | detail 필드 | 제출 |
+| Kind | detail fields | Submission |
 |---|---|---|
 | `quorum` | `threshold`, `mode`, `issuer`, `members`, `claim`, `source`, `binding_hash` | `{verdict, binding_hash}` |
 | `delay` | `duration`, `release_at`, `cancellable_by`, `cancelled_by`, `cancelled_at` | `{action}` |
 | `external` | `target`, `nonce`, `requested_at`, `respond_by`, `acknowledged`, `failure`, `verdict`, `responded_at` | `{nonce, verdict, signature}` |
-| `mfa` | `mfa.Detail`(`internal/challenge/mfa`) | `mfa.Submission` |
+| `mfa` | `mfa.Detail` (`internal/challenge/mfa`) | `mfa.Submission` |
 
-`mode`는 승인자 집합이 어떻게 해소되었는지다: `members`, `claim`, `source`.
+`mode` is how the approver set was resolved: `members`, `claim`, `source`.
 
-외부 challenge의 발신 본문은 `ExternalNotification`이고, 수신 콜백의 서명은 `X-Stamp-Signature` 헤더로 온다. 대상 URL은 정책이 아니라 운영자 허용목록에서 온다.
+An external challenge's outbound body is an `ExternalNotification`, and the inbound callback's signature arrives in the `X-Stamp-Signature` header. The target URL comes from the operator's allowlist rather than from a policy.
 
-MFA는 v1에서 위임 모드만 구현한다(D16). `direct`는 계약에만 정의되어 있고 적재 시 `ErrUnsupportedSpec`으로 거부된다 — 미구현을 침묵으로 두지 않는다.
+MFA implements delegated mode alone in v1 (D16). `direct` is defined in the contract only, and is refused at load with `ErrUnsupportedSpec` — an unimplemented thing is not left silent.

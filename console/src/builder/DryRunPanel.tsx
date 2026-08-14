@@ -1,5 +1,5 @@
 /**
- * The trial evaluation step.
+ * The dry run step.
  *
  * The dry-run endpoint takes an unsaved document plus a sample request, evaluates
  * it against the live fact plane, and stores nothing — its Go type holds no
@@ -115,8 +115,8 @@ function withRole(input: SampleInput, role: Role, entity: SampleEntity): SampleI
 }
 
 function resultLabel(trace: NodeTrace): string {
-  if (trace.result === null) return '평가 불가'
-  return trace.result ? '참' : '거짓'
+  if (trace.result === null) return 'not evaluated'
+  return trace.result ? 'true' : 'false'
 }
 
 function EntitySample({
@@ -139,7 +139,7 @@ function EntitySample({
       </legend>
       <div className="field">
         <label className="field__label" htmlFor={`sample-${role}-id`}>
-          {role} 식별자
+          {role} identifier
         </label>
         <input
           id={`sample-${role}-id`}
@@ -216,7 +216,7 @@ export function DryRunPanel({
           // The policy did not survive validation. Those failures belong on the
           // fields that caused them, not in a banner here.
           onDiagnostics(diagnostics)
-          setFailure('정책이 정적 검증을 통과하지 못했습니다. 위 오류 요약을 확인하십시오.')
+          setFailure('The policy did not pass static validation. See the error summary above.')
         } else {
           setFailure(messageOf(error))
         }
@@ -231,8 +231,8 @@ export function DryRunPanel({
   return (
     <div className="dry-run">
       <p>
-        저장하지 않고 지금 상태 그대로 평가합니다. 샘플 입력은 선언된 속성에서 렌더링되며, 선언에
-        없는 속성은 보내지 않습니다.
+        Evaluates the draft exactly as it stands, and stores nothing. The sample input is rendered
+        from the declared attributes, and an attribute the declarations do not have is not sent.
       </p>
 
       <div className="field">
@@ -245,7 +245,7 @@ export function DryRunPanel({
           value={input.action}
           onChange={(event) => onInputChange({ ...input, action: event.target.value })}
         >
-          <option value="">선택하십시오</option>
+          <option value="">Select one</option>
           {draft.policy.actions.map((action) => (
             <option key={action} value={action}>
               {action}
@@ -266,7 +266,7 @@ export function DryRunPanel({
       ))}
 
       <button type="button" className="button button--primary" onClick={run} disabled={running}>
-        {running ? '평가 중…' : '시험 평가 실행'}
+        {running ? 'Evaluating…' : 'Run dry run'}
       </button>
 
       {failure === null ? null : (
@@ -277,26 +277,26 @@ export function DryRunPanel({
 
       {result === null ? null : (
         <div className="dry-run__result" data-testid="dry-run-result">
-          <h3>시험 평가 결과</h3>
+          <h3>Dry run result</h3>
           <dl className="summary-list">
-            <dt>정책</dt>
+            <dt>Policy</dt>
             <dd>{result.policy_id}</dd>
-            <dt>매칭</dt>
-            <dd>{result.matched ? '이 요청에 적용됨' : '이 요청에 적용되지 않음'}</dd>
-            <dt>조건</dt>
-            <dd>{result.holds ? '성립' : '불성립'}</dd>
-            <dt>판정</dt>
+            <dt>Match</dt>
+            <dd>{result.matched ? 'applies to this request' : 'does not apply to this request'}</dd>
+            <dt>Condition</dt>
+            <dd>{result.holds ? 'holds' : 'does not hold'}</dd>
+            <dt>Judgment</dt>
             <dd>
               {result.decision}
               {result.reason === '' ? '' : ` (${result.reason})`}
             </dd>
-            <dt>저장 여부</dt>
+            <dt>Stored</dt>
             <dd data-testid="dry-run-stored">
-              {result.stored ? '저장됨' : '저장되지 않음 — 시험 평가는 아무것도 남기지 않습니다'}
+              {result.stored ? 'stored' : 'not stored — a dry run leaves nothing behind'}
             </dd>
           </dl>
 
-          <h4>조건별 결과</h4>
+          <h4>Per-condition results</h4>
           <ul className="trace">
             {result.conditions.map((trace) => (
               <li key={trace.pointer} data-pointer={fromTracePointer(trace.pointer)}>
@@ -306,9 +306,9 @@ export function DryRunPanel({
             ))}
           </ul>
 
-          <h4>발동될 challenge</h4>
+          <h4>Challenges that would fire</h4>
           {result.challenges.length === 0 ? (
-            <p>없습니다 — 이 정책은 check 경로에서 즉시 판정됩니다.</p>
+            <p>None — this policy is judged immediately on the check path.</p>
           ) : (
             <ul className="trace">
               {result.challenges.map((challenge, index) => (
@@ -326,7 +326,7 @@ export function DryRunPanel({
 
           {result.sources === undefined || result.sources.length === 0 ? null : (
             <>
-              <h4>호출된 fact source</h4>
+              <h4>Fact sources called</h4>
               <ul className="trace">
                 {result.sources.map((call) => (
                   <li key={call}>

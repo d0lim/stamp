@@ -1,354 +1,354 @@
 ---
-title: STAMP 결정 로그
+title: STAMP decision log
 last_updated: 2026-08-10
 ---
 
-# STAMP 결정 로그
+# STAMP decision log
 
-이 문서는 STAMP v1이 **왜 지금의 모양인지**를 기록한다. 무엇을 만드는지는 기능 계획서가, 어떻게 만드는지는 그 안의 구현 단위가 소유한다. 여기에는 되돌리기 비싼 선택과 그것을 고른 이유, 그리고 **기각한 대안**이 남는다.
+This document records **why STAMP v1 has the shape it has**. What gets built is owned by the feature plan, and how it gets built by the implementation units inside it. What stays here is the choices that are expensive to reverse, the reason each one was taken, and **the alternatives that were rejected**.
 
-기각한 대안을 함께 적는 이유는 하나다. 몇 달 뒤 같은 선택지가 다시 매력적으로 보일 때, 그때 이미 검토했는지 아닌지를 알 수 있어야 한다.
+There is one reason to write the rejected alternatives down. Months from now, when the same option looks attractive again, you have to be able to tell whether it was already considered.
 
-각 항목의 표기:
+How each entry is marked:
 
-- **확정** — 사용자가 직접 지시했거나, 대안을 검토한 뒤 승인한 결정. 선호의 문제로 다시 열지 않는다. 전제가 무너졌다는 증거가 나오면 그때 개정한다.
-- **파생** — 확정된 결정에서 기술적으로 따라 나온 선택. 상위 결정이 유지되는 한 함께 유지된다.
-
----
-
-## 제품 결정
-
-### D1. 결정은 boolean이 아니라 수명주기 객체다
-
-**확정** · 기각: stateless PDP + 외부 orchestrator
-
-기존 정책 엔진 위에 팀마다 승인 orchestrator를 다시 짓는 현상은 구현 실수가 아니라 **모델 미스매치**다. 판정이 한 값으로 끝나는 모델에서는 쿼럼 수집·MFA 왕복·시간 지연이 갈 곳이 엔진 밖뿐이다. 그래서 결정을 상태(pending → allow / deny / expired)와 challenge 수집 현황을 가진 객체로 만들고, 그 수집을 엔진 안으로 들인다.
-
-이것이 STAMP가 존재하는 이유이자 나머지 결정 대부분의 뿌리다.
-
-### D2. v1은 완결된 오픈소스 릴리즈다
-
-**확정** · 기각: 수직 슬라이스 조기 공개
-
-동력 소진 리스크를 인지한 상태에서 완성된 첫인상을 선택했다. 릴리즈 게이트는 전 영역 완결이되 빌드 순서는 엔진 → 저작 경로 → 패키징을 권장한다.
-
-이 결정은 **범위를 늘리는 모든 후속 결정의 비용을 키운다.** 그래서 2026-08-10 개정에서 파일 저작 경로를 조건부 범위로 둔 것이고(D10 참조), 그 조건이 릴리즈 게이트에 실제로 작동하도록 결정점을 명시했다.
-
-### D3. check와 decide는 같은 정책 모델의 두 실행 경로다
-
-**파생** (D1에서)
-
-상태가 필요한 결정은 QPS가 낮고, 고QPS 조회는 상태가 필요 없다. 두 요구가 충돌하는 것처럼 보였지만 프로파일이 반대일 뿐이었다. 같은 정책을 stateless 즉시 판정과 stateful 결정 생성 양쪽으로 실행한다.
-
-### D4. 표준 정렬은 AuthZEN, XACML 와이어 포맷은 비채택
-
-**확정** · 기각: XACML 3.0 준수
-
-표준화가 이 제품의 최대 외부 리스크다 — 주류 프로바이더가 같은 기능을 표준으로 내놓으면 자체 인터페이스는 부채가 된다. 그래서 check 표면을 AuthZEN Access Evaluation에 호환시키고, 결정 수명주기는 그 위의 상위집합 확장으로 포지셔닝한다. XACML은 와이어 포맷을 따라갈 이유가 없다고 판단했다.
-
-### D5. 정책 개정 시 작성자가 적용 방식을 고르고, 기본값은 재평가
-
-**확정** · 기각: 일괄 grandfather 기본값
-
-컴플라이언스 도메인에서 정책 강화는 대개 리스크 대응이다. 침묵 기본값이 옛 규칙 통과를 허용하면 강화의 의미가 사라진다. 그래서 기본은 재평가이고, 기존 규칙 유지가 필요하면 작성자가 명시적으로 고른다.
-
-**재평가는 사실을 다시 조회하지 않는다.** 결정 생성 시점의 사실 스냅샷을 재사용한다. 재조회하면 스냅샷이 바뀌어 승인 바인딩 해시가 달라지고, 그러면 D5가 약속한 "유효 승인 보존"이 사실상 전멸한다. 신 정책이 스냅샷에 없는 source를 새로 참조할 때만 그 source를 조회하고, 이때는 해시가 달라지므로 승인을 전부 다시 받는다.
-
-### D6. 정책 변경 자체가 STAMP의 결정을 통과한다
-
-**확정** · 기각: 정책 CRUD를 일반 API로 두기
-
-사용자가 처음 제시한 시나리오이자 제품의 dogfooding이다. 정책을 바꾸려면 정족수를 채워야 하는 시스템이 스스로 그렇게 동작하지 않으면 신뢰할 이유가 없다.
-
-최초 설치는 단독 관리자 모드로 시작하고, 명시적 잠금 액션 이후로는 되돌릴 수 없다.
-
-### D7. 승인자 신원은 외부 IdP에 위임한다
-
-**확정** · 기각: 자체 역할 저장소
-
-인증 서버를 따로 설계하지 않고 OIDC relying party로 닫는다. 자격증명·역할·세션을 저장하지 않는다. 부수 효과가 하나 있는데 오히려 좋다 — 승인자 집합을 IdP 그룹으로 해석하는 것이 사실 조달(Fact Plane)과 정확히 같은 모양이 된다.
-
-### D8. 저작 UX는 스키마에서 렌더링되는 폼 빌더다
-
-**확정** · 기각: 룰 캔버스(노드 그래프), 코드 + 라이브 프리뷰
-
-세 방향의 시각 시안을 만들어 비교한 뒤 골랐다. 대가를 명확히 알고 선택한 것이다 — **v1의 정책 표현력이 폼이 렌더링할 수 있는 범위로 제한된다.** 그 대가로 비개발자 저작을 얻는다.
-
-이 결정이 조건식 표현을 자체 구조화 AST로 만든 이유이기도 하다(D12).
-
-### D9. MIT 라이선스
-
-**확정** · 기각: Apache-2.0(권고했으나 미채택), AGPL-3.0
-
-### D10. 파일 저작은 폼과 동등한 1급 경로이고, 진리 원천은 엔진이다
-
-**확정** (2026-08-10 신설) · 기각: 폼 단일 저작, git-as-store
-
-GitOps가 맞는 팀과 맞지 않는 팀이 둘 다 존재하므로 저작 경로는 선택지여야 한다. 다만 **git을 진리 원천으로 두는 것은 별개 문제이고, 그건 안 된다.**
-
-git이 원천이면 네 가지가 동시에 무너진다. merge 권한이 곧 정책 변경 권한이 되어 정족수가 브랜치 보호 규칙으로 밀려나고, 개정 발효가 pending 결정 재평가와 같은 트랜잭션에 들어가지 못하며, 폼 빌더가 git 쓰기 자격증명을 갖게 되고, 두 사람이 폼에서 정책을 고치면 둘 다 열어본 적 없는 파일에서 YAML 병합 충돌이 난다 — 마지막 것은 D8을 고른 이유를 통째로 지운다.
-
-그래서 저작 경로와 진리 원천을 분리한다. git이 *원하는 상태*를 들고 CI가 밀어넣고, 엔진이 *발효 상태*를 들고 전이를 통치한다.
-
-**미검증 전제:** 파일 저작을 1급으로 요구하는 팀이 실제로 존재한다는 것은 사용자의 판단이며 구체 사례로 확인되지 않았다. 이 위에서 D10을 채택한 근거는 비용 비대칭인데, 그 비대칭이 실제로 성립하는 것은 **개정 델타 자료형과 파일 포맷의 사람-가독성**까지다. 이 둘은 나중에 바꾸려면 완화 분류·승인 해시·재평가를 함께 갈아엎어야 한다. apply·export·저작 모드·CLI는 가산적이라 같은 비대칭이 없고, 그래서 계획서의 결정점에서 조건부로 다룬다.
-
-### D11. 추상화는 IO 경계에만 둔다
-
-**확정** (2026-08-10 신설) · 기각: 브로커 추상화 없이 Kafka 직접 구현
-
-평가 코어와 거버넌스는 직접 구현하되, 외부 시스템이 교체되는 자리에는 포트를 둔다.
-
-이 결정은 **이전 판을 뒤집은 것이다.** 이전 근거는 "구현이 하나뿐인 추상화는 테스트 예산만 이중화한다"였는데, 그 논거는 행위 추상화에는 성립하지만 IO 포트에는 반대로 작동한다. 포트가 있으면 집계 로직을 브로커 없이 테스트할 수 있어 비용이 오히려 줄고, 데모 번들에서 브로커를 통째로 걷어낼 수 있다.
+- **Settled** — a decision the user directed outright, or approved after the alternatives were reviewed. It is not reopened as a matter of preference. It is revised when evidence arrives that its premise has broken.
+- **Derived** — a choice that follows technically from a settled decision. It holds as long as the decision above it holds.
 
 ---
 
-## 기술 결정
+## Product decisions
 
-### D12. 조건식은 자체 구조화 AST가 정본이고 cel-go로 컴파일한다
+### D1. A decision is a lifecycle object, not a boolean
 
-**파생** (D8에서)
+**Settled** · rejected: a stateless PDP plus an external orchestrator
 
-폼과 AST가 1:1이라야 "폼이 렌더링할 수 있다"는 성질이 구조적으로 보장된다. 문자열 DSL을 조립하는 방식은 그 보장이 없고 주입·이스케이프 문제도 생긴다. 평가는 검증된 cel-go가 맡되, 정적 검증의 마지막 단계에 cel-go 컴파일을 포함시켜 **"검증 통과 = 컴파일 성공"** 을 보장한다. 그러지 않으면 폼 프리플라이트를 통과한 정책이 저장에서 실패한다.
+Every team rebuilding an approval orchestrator on top of an existing policy engine is not an implementation mistake but a **model mismatch**. In a model where judgment ends at a single value, quorum collection, MFA round trips and time delays have nowhere to live but outside the engine. So a decision becomes an object carrying state (pending → allow / deny / expired) and the collection status of its challenges, and that collection is pulled inside the engine.
 
-AST 타입 체계는 CEL 타입의 진부분집합으로 정의한다 — 암묵 수치 변환 없음, timestamp·duration은 CEL 타입 그대로.
+This is why STAMP exists, and the root of most of the decisions below.
 
-cel-go의 `policy` 패키지는 pre-v1.0이라 쓰지 않는다. core 컴파일·평가 API만 사용하고 컴파일 계층을 얇은 어댑터로 격리해, 진행 중인 `cel-expr/cel-go` 리포 이전과 API 변경을 흡수한다.
+### D2. v1 is a complete open-source release
 
-### D13. AuthZEN Final에 직접 구현하고 추상화 계층을 두지 않는다
+**Settled** · rejected: publishing a vertical slice early
 
-**파생** (D4에서)
+The risk of running out of momentum was known, and a finished first impression was chosen anyway. The release gate is completeness across every area; the recommended build order is engine → authoring path → packaging.
 
-스펙이 2026-01 Final로 개정 불가이므로 추상화가 방어할 대상이 없다.
+This decision **raises the cost of every later decision that widens scope.** That is why the 2026-08-10 revision put the file authoring path in conditional scope (see D10), and why the decision point was written down so that the condition actually bites at the release gate.
 
-**적합성 범위를 Access Evaluation 단건 프로파일로 계약에 못박는다.** batch evaluations와 Search API는 이연 항목이다 — 하네스가 프로파일 전체를 요구하는데 범위를 열어두면 CI 게이트가 영구 실패로 고정된다.
+### D3. check and decide are two execution paths over the same policy model
 
-### D14. 배포는 단일 이미지 + 역할 선택 실행
+**Derived** (from D1)
 
-**확정** · 기각: 단일 바이너리 전용
+Decisions that need state are low QPS, and high-QPS queries need no state. The two requirements looked like a conflict; their profiles are simply opposite. The same policy runs both as a stateless immediate judgment and as a stateful decision creation.
 
-단일 바이너리와 멀티 바이너리 배포를 둘 다 지원해야 한다는 요구를, 하나의 산출물로 만족시킨다. 하나의 바이너리가 전체 또는 부분집합 역할로 기동한다. Loki·Temporal이 증명한 패턴이다.
+### D4. Standards alignment is AuthZEN; the XACML wire format is not adopted
 
-콘솔 서빙과 API 표면은 **별개 역할**이다. 하나로 묶으면 API 노출 없는 콘솔 티어가 불가능해지고 그 반대도 마찬가지다.
+**Settled** · rejected: XACML 3.0 conformance
 
-### D15. 만료 타이머는 Postgres 컬럼 + SKIP LOCKED 스위퍼
+Standardization is this product's largest external risk — if a mainstream provider ships the same capability as a standard, an interface of our own becomes debt. So the check surface is made compatible with AuthZEN Access Evaluation, and the decision lifecycle is positioned as a superset extension above it. XACML's wire format was judged not worth following.
 
-**파생** (D14의 단일 컨테이너 약속에서)
+### D5. On a policy revision the author chooses the application mode, and the default is revalidation
 
-외부 잡 큐 의존 없이 단일 컨테이너 약속을 지킨다. 만료의 정본은 컬럼 값이고 스위퍼는 지연된 정리 작업일 뿐이다 — 승인 제출·상태 조회·전이 함수가 모두 진입 즉시 마감 경과를 검사한다. 규모가 커지면 River로 승격하는 경로를 남긴다.
+**Settled** · rejected: a blanket grandfathering default
 
-### D16. MFA v1은 위임 모드다
+In a compliance domain, tightening a policy is usually a response to risk. A silent default that lets the old rule keep passing empties the tightening of its meaning. So the default is revalidation, and an author who needs the existing rule kept chooses that explicitly.
 
-**확정** · 기각: direct WebAuthn 우선, 둘 다 구현
+**Revalidation does not re-fetch facts.** It reuses the fact snapshot taken when the decision was created. Re-fetching moves the snapshot, which moves the approval binding hash, and the "valid approvals are preserved" that D5 promises is then wiped out in practice. A source is fetched only when the new policy newly references one the snapshot does not hold, and in that case the hash does move, so every approval is collected again.
 
-거래 확인(dynamic linking)에 쓸 수 있는 살아 있는 표준이 사실상 둘뿐이다 — RFC 9470 step-up과 OIDC CIBA의 `binding_message`. WebAuthn에는 거래 확인 확장이 없고 Secure Payment Confirmation은 Chromium 전용 초안이다. 그래서 외부 IdP에 위임하고 STAMP는 `acr`·`amr`·`auth_time` 검증만 한다.
+### D6. A policy change itself passes through a STAMP decision
 
-`binding_message`는 **표시용일 뿐 암호학적 결속이 아니다.** 결속은 서버가 개시한 상관자가 담당한다.
+**Settled** · rejected: leaving policy CRUD as an ordinary API
 
-direct 모드는 challenge 계약에만 정의하고 구현은 v2로 미룬다.
+This is the scenario the user first put forward, and the product's dogfooding. A system that requires a quorum to change a policy gives no reason to be trusted if it does not work that way on itself.
 
-### D17. 벨로시티 집계는 Postgres 고정 폭 버킷, 수집은 브로커 중립 포트 뒤
+A fresh install starts in single-administrator mode, and after the explicit lock action there is no way back.
 
-**파생** (D11, D14에서)
+### D7. Approver identity is delegated to an external IdP
 
-스트림 프로세서(Flink·Kafka Streams)는 단일 컨테이너 약속과 충돌해 채택하지 않는다.
+**Settled** · rejected: a role store of our own
 
-**포트를 정직하게 그으려면 세 가지가 따라온다.** 아니면 이름만 중립인 Kafka 인터페이스가 된다.
+No authentication server is designed here; it closes as an OIDC relying party. No credentials, roles or sessions are stored. There is one side effect, and it is a good one — resolving an approver set from an IdP group turns out to have exactly the same shape as fact procurement (the Fact Plane).
 
-1. 오프셋·파티션·컨슈머 그룹이 포트에 나오지 않는다. 경계는 "이벤트가 도착했다"와 "여기까지 처리했음을 확정한다"까지다.
-2. 멱등은 코어 책임이다. 어댑터는 at-least-once만 보장하고 중복 제거는 집계기가 이벤트 식별자로 한다. 그래야 재전송 시맨틱이 다른 브로커도 같은 포트를 구현할 수 있다.
-3. 어댑터가 수집 지연을 보고할 수 있어야 한다. 신선도 한계 판정이 그 값에 의존한다.
+### D8. The authoring UX is a form builder rendered from the schema
 
-v1 어댑터는 Kafka와 HTTP 인제스트 2종이다. 두 번째는 두 가지 역할을 한다 — 포트가 진짜 이음새인지 증명하는 검증 장치이자, 데모 번들에서 브로커를 제거하는 실제 기능.
+**Settled** · rejected: a rule canvas (node graph), code plus live preview
 
-### D18. 성능 목표는 검증된 요구가 아니라 설계 가정이다
+Three visual directions were mocked up and compared before choosing. The price was known when it was paid — **v1's policy expressiveness is bounded by what a form can render.** What that price buys is authoring by non-developers.
 
-**가정** · 벤치 결과에 따라 조정
+It is also why condition expressions are a structured AST of our own (D12).
 
-캐시 히트 경로 check p99 ≤ 10ms, 단일 check 인스턴스 ≥ 5k QPS, 레퍼런스 하드웨어 4 vCPU / 8GB.
+### D9. MIT license
 
-여기에 **미스율을 포함한 종단 p99를 별도 임계값으로 함께 둔다.** 미스 경로 지연은 source 선언의 타임아웃이 지배하므로, 웜 캐시만 측정하면 p99가 운영 지연과 무관한 숫자가 된다.
+**Settled** · rejected: Apache-2.0 (recommended but not adopted), AGPL-3.0
 
-### D19. 콘솔은 동봉하되 분리 가능성을 계약으로 확보한다
+### D10. File authoring is a first-class path equal to the form, and the engine is the source of truth
 
-**파생** (D14에서)
+**Settled** (added 2026-08-10) · rejected: form-only authoring, git-as-store
 
-React + TypeScript(Vite) 정적 빌드를 바이너리에 동봉한다. 콘솔 전용 BFF를 두지 않고 엔진의 공개 API를 그대로 소비한다 — API가 곧 공개 계약이라는 원칙을 유지한다.
+Teams that GitOps suits and teams it does not both exist, so the authoring path has to be a choice. But **making git the source of truth is a separate question, and the answer to that one is no.**
 
-Temporal이 UI를 별도 이미지로 뗀 이유는 UI가 Node SSR이라 Go 바이너리에 넣을 수 없기 때문이고, 순수 정적 빌드인 STAMP 콘솔에는 그 제약이 없다. Grafana가 같은 이유로 동봉한다.
+With git as the source, four things break at once. Merge permission becomes permission to change policy, pushing the quorum out into branch protection rules; a revision taking effect cannot sit in the same transaction as the revalidation of pending decisions; the form builder ends up holding git write credentials; and two people editing policy in the form get a YAML merge conflict in a file neither has ever opened — that last one erases the entire reason D8 was chosen.
 
-**동봉이 분리를 막지 않으려면 두 가지가 필요하다.** API 기준 주소가 설정 가능하고 엔진이 오리진 허용목록을 지원할 것, 콘솔이 공개 계약 밖 엔드포인트를 갖지 않을 것. 후자는 원칙만으로는 새므로 CI가 검사한다.
+So the authoring path and the source of truth are separated. Git holds the *desired state* and CI pushes it in; the engine holds the *state in force* and governs the transitions.
 
-v1은 동봉 하나만 배포하고 별도 이미지·CDN 배포는 이연한다.
+**Unverified premise:** that teams requiring file authoring as first-class actually exist is the user's judgment and has not been confirmed against a concrete case. What justifies adopting D10 on top of that is a cost asymmetry, and the asymmetry genuinely holds only as far as **the revision delta's data type and the human-readability of the file format**. Changing either of those later means tearing up weakening classification, approval hashes and revalidation along with them. Apply, export, authoring mode and the CLI are additive and carry no such asymmetry, which is why the plan handles them conditionally at its decision point.
 
-### D20. 운영 의존은 Postgres 하나다
+### D11. Abstraction goes at the IO boundary and nowhere else
 
-**파생** (D14에서)
+**Settled** (added 2026-08-10) · rejected: implementing Kafka directly with no broker abstraction
 
-정책·결정·감사·타이머·집계 버킷·중복 제거 인덱스 전부 Postgres. 브로커는 Kafka 어댑터를 쓰는 배포에서만 필요한 **선택 의존**이다.
+The evaluation core and governance are implemented directly, but where an external system gets swapped there is a port.
 
-이 대칭이 깨지는 지점이 하나 있는데 의도한 것이다 — 이벤트 수집은 포트 뒤로 뺐지만 **정책 저장은 뺄 수 없다.** 정책 저장은 거버넌스 결정·감사 체인과 같은 트랜잭션에 있어야 하기 때문이다.
+This decision **reverses the previous edition.** The earlier ground was "an abstraction with only one implementation just doubles the test budget", which holds for a behavioural abstraction and works the other way round for an IO port. With a port the aggregation logic can be tested without a broker, so the cost falls rather than rises, and the broker can be lifted out of the demo bundle entirely.
 
-### D21. 보안 통제는 정책 데이터가 아니라 코드 경로와 운영자 설정이 강제한다
+---
 
-**파생** (D6, D10에서)
+## Technical decisions
 
-**정책 작성자는 신뢰 경계 안이 아니라 밖에 있다고 가정한다.** 정책 저작 권한이 곧 인프라 접근 권한이 되어서는 안 된다.
+### D12. A structured AST of our own is the canonical form of a condition expression, compiled by cel-go
 
-이 원칙에서 나오는 강제 지점들:
+**Derived** (from D8)
 
-| 위협 | 강제하는 곳 |
+Only a 1:1 correspondence between form and AST makes "the form can render it" a structural guarantee. Assembling a string DSL has no such guarantee, and brings injection and escaping problems with it. Evaluation is left to the proven cel-go, and cel-go compilation is made the last stage of static validation so that **"validation passed" means "compilation succeeded"**. Otherwise a policy that passed the form's preflight fails at storage.
+
+The AST type system is defined as a proper subset of CEL's types — no implicit numeric conversion, and timestamp and duration are the CEL types unchanged.
+
+cel-go's `policy` package is pre-v1.0 and is not used. Only the core compile and evaluate APIs are used, with the compilation layer isolated behind a thin adapter, which absorbs the in-progress `cel-expr/cel-go` repository move and any API changes.
+
+### D13. AuthZEN Final is implemented against directly, with no abstraction layer
+
+**Derived** (from D4)
+
+The spec went Final in 2026-01 and cannot be revised, so there is nothing for an abstraction to defend against.
+
+**The conformance scope is pinned in the contract to the single Access Evaluation profile.** Batch evaluations and the Search API are deferred — the harness demands a whole profile, so leaving the scope open would fix the CI gate at permanently failing.
+
+### D14. Deployment is a single image with role-selected startup
+
+**Settled** · rejected: a single binary only
+
+The requirement to support both single-binary and multi-binary deployment is satisfied by one artifact. One binary starts with all roles or with a subset of them. Loki and Temporal have proven the pattern.
+
+Serving the console and the API surface are **separate roles**. Fusing them makes a console tier with no API exposure impossible, and the reverse too.
+
+### D15. Expiry timers are a Postgres column plus a SKIP LOCKED sweeper
+
+**Derived** (from D14's single-container promise)
+
+It keeps the single-container promise without depending on an external job queue. The column value is the canonical form of expiry and the sweeper is only deferred cleanup — approval submission, state reads and the transition functions all check the deadline the moment they are entered. A path to promoting this to River is left open for larger scale.
+
+### D16. MFA in v1 is delegated mode
+
+**Settled** · rejected: direct WebAuthn first, implementing both
+
+There are effectively only two live standards usable for transaction confirmation (dynamic linking) — RFC 9470 step-up and OIDC CIBA's `binding_message`. WebAuthn has no transaction confirmation extension, and Secure Payment Confirmation is a Chromium-only draft. So it is delegated to an external IdP, and STAMP verifies `acr`, `amr` and `auth_time` and nothing else.
+
+`binding_message` is **for display only and is not a cryptographic binding.** The binding is carried by a server-initiated correlator.
+
+Direct mode is defined in the challenge contract only; the implementation is deferred to v2.
+
+### D17. Velocity aggregation is fixed-width Postgres buckets, and ingestion sits behind a broker-neutral port
+
+**Derived** (from D11 and D14)
+
+A stream processor (Flink, Kafka Streams) conflicts with the single-container promise and is not adopted.
+
+**Drawing the port honestly brings three things with it.** Otherwise it is a Kafka interface that is neutral in name only.
+
+1. Offsets, partitions and consumer groups do not appear on the port. The boundary is "an event arrived" and "processing is committed up to here", and no further.
+2. Idempotency is the core's responsibility. The adapter guarantees at-least-once only, and deduplication is done by the aggregator on the event identifier. That is what lets a broker with different redelivery semantics implement the same port.
+3. The adapter has to be able to report ingestion lag. The freshness limit is judged against that value.
+
+v1 ships two adapters, Kafka and HTTP ingest. The second does two jobs — it is the device that proves the port is a real seam, and it is the actual feature that removes the broker from the demo bundle.
+
+### D18. The performance targets are a design assumption, not a validated requirement
+
+**Assumption** · adjusted against benchmark results
+
+Check p99 ≤ 10ms on the cache-hit path, ≥ 5k QPS for a single check instance, on reference hardware of 4 vCPU / 8GB.
+
+Alongside it sits **a separate threshold for end-to-end p99 including the miss rate.** Latency on the miss path is dominated by the source declaration's timeout, so measuring a warm cache alone produces a p99 that has nothing to do with operational latency.
+
+### D19. The console ships embedded, with separability secured as a contract
+
+**Derived** (from D14)
+
+A React + TypeScript (Vite) static build is embedded in the binary. There is no console-only BFF; it consumes the engine's public API as it is — which keeps the principle that the API is the public contract.
+
+Temporal split its UI into a separate image because that UI is Node SSR and cannot go inside a Go binary; the STAMP console is a pure static build and has no such constraint. Grafana embeds for the same reason.
+
+**Two things are needed for embedding not to foreclose separation.** The API base address must be configurable and the engine must support an origin allowlist; and the console must hold no endpoint outside the public contract. The second leaks if it is left as a principle, so CI checks it.
+
+v1 ships the embedded build alone; a separate image and CDN deployment are deferred.
+
+### D20. There is one operational dependency: Postgres
+
+**Derived** (from D14)
+
+Policy, decisions, audit, timers, aggregation buckets and the deduplication index are all Postgres. A broker is an **optional dependency**, needed only by a deployment that uses the Kafka adapter.
+
+There is one place this symmetry breaks, and it is intended — event ingestion went behind a port, but **policy storage cannot.** Policy storage has to be in the same transaction as the governance decision and the audit chain.
+
+### D21. Security controls are enforced by code paths and operator configuration, not by policy data
+
+**Derived** (from D6 and D10)
+
+**A policy author is assumed to be outside the trust boundary, not inside it.** Permission to author policy must not become permission to reach infrastructure.
+
+The enforcement points that follow from that principle:
+
+| Threat | Where it is enforced |
 |---|---|
-| check 경로로 challenge 우회 | 평가기 불변식 — 정책 설정이 아님 |
-| 매칭 정책 없는 요청의 판정 | 평가기 불변식 — 설정으로 뒤집을 수 없는 deny |
-| 정책이 지정한 URL로의 SSRF | 운영자 egress 허용목록 |
-| 작성자가 fail-open 선언 | 운영자 수준 플래그 필수 |
-| 승인·MFA의 결속 | 서버가 발급한 해시와 상관자 |
-| 정족수가 스스로를 약화 | diff 완화 분류 + 운영자 하한 |
+| Bypassing a challenge through the check path | An evaluator invariant — not a policy setting |
+| The verdict for a request no policy matches | An evaluator invariant — a deny no setting can reverse |
+| SSRF to a URL a policy names | The operator egress allowlist |
+| An author declaring fail-open | An operator-level flag is required |
+| Binding of approvals and MFA | A server-issued hash and correlator |
+| A quorum weakening itself | Weakening classification over the diff, plus the operator floor |
 
-### D22. 저작 경로는 둘이되 개정 파이프라인은 하나다
+### D22. Two authoring paths, one revision pipeline
 
-**파생** (D10에서, 2026-08-10 신설)
+**Derived** (from D10; added 2026-08-10)
 
-폼과 apply는 서로 다른 입력 어댑터일 뿐이고, 둘 다 같은 "개정 제안 → 검증 → 완화 분류 → 거버넌스 결정 → 발효 훅" 파이프라인에 들어간다.
+The form and apply are just two different input adapters, and both enter the same "revision proposal → validation → weakening classification → governance decision → effect hook" pipeline.
 
-**개정 제안은 정책 하나가 아니라 정책 집합의 델타를 담는 자료구조로 정의한다.** 폼 저작은 원소가 하나인 델타를 만든다. 반대로 설계하면 — 단일 정책이 기본형이고 집합이 특수 케이스면 — 완화 분류·승인 해시·재평가가 전부 두 벌이 된다.
+**A revision proposal is defined as a data structure holding a delta over the policy set, not a single policy.** Form authoring produces a delta with one element. Designed the other way round — the single policy as the base case and the set as the special case — weakening classification, approval hashes and revalidation all come in two copies.
 
-이 자료형은 M1의 거버넌스 유닛이 확정한다. 파일 저작 유닛이 아니다. 그래야 파일 저작이 이연되더라도 되짚을 것이 없다.
+This data type is fixed by M1's governance unit, not by the file authoring unit. That way there is nothing to go back over if file authoring is deferred.
 
-### D23. 두 저작 경로는 정책마다 소유권이 갈린다
+### D23. The two authoring paths split ownership per policy
 
-**파생** (D10, D22에서, 2026-08-10 신설)
+**Derived** (from D10 and D22; added 2026-08-10)
 
-모든 정책은 생성 시점에 저작 출처를 부여받고, apply의 원하는-상태 비교는 파일 출처 정책으로만 한정된다.
+Every policy is given an authoring origin at creation, and apply's desired-state comparison is confined to policies whose origin is file.
 
-이것이 없으면 기본 설정에서 제품이 성립하지 않는다 — 콘솔로 만든 정책은 파일 디렉터리에 없으므로, 다음 CI apply가 그것을 삭제로 계산해 **매 실행마다 콘솔 정책을 지우자는 제안을 올린다.**
+Without this the product does not stand up in its default configuration — a policy made in the console is not in the file directory, so the next CI apply counts it as a deletion and **opens a proposal to delete the console's policies on every single run.**
 
-출처 이동은 파일 문서의 명시적 인수 선언으로만 가능하다. 암묵적 이동은 없다.
+Moving origin is possible only through an explicit adoption declaration in a file document. There is no implicit move.
 
-### D24. 미결 개정은 한 번에 하나이고, 잠금은 네 경로로 풀린다
+### D24. One pending revision at a time, and the lock opens along four paths
 
-**확정** (2026-08-10) · 기각: 기준점 이동 시 제안 무효화, 겹치지 않는 개정의 병행 허용
+**Settled** (2026-08-10) · rejected: invalidating the proposal when the baseline moves, allowing non-overlapping revisions in parallel
 
-승인자가 항상 현 발효 상태 대비 diff 하나만 검토하게 하려고 직렬화를 택했다. 정책 개정이 저빈도 이벤트라는 전제 위에 선 결정이다.
+Serialization was chosen so that an approver always reviews exactly one diff against the state currently in force. The decision stands on the premise that policy revision is a low-frequency event.
 
-**그런데 직렬화만 두면 잠기고 풀리지 않는다.** 실패 경로가 넷인데 서로 다른 해법을 요구한다.
+**Serialization on its own, though, locks and never unlocks.** There are four failure paths and they demand different remedies.
 
-| 상황 | 해소 경로 |
+| Situation | How it clears |
 |---|---|
-| CI가 잘못된 디렉터리로 apply | 제안자 철회 — 현 상태로 되돌릴 뿐이라 정족수 불필요 |
-| 적대적 작성자가 승인 불가 제안으로 점유 | 정족수에 의한 철회 |
-| 승인자가 아무 행동도 하지 않음 | 운영자 설정 미결 수명 상한(기본 24h) |
-| CI가 머지마다 apply | 같은 출처의 새 제안이 기존 제안을 대체 |
+| CI applies from the wrong directory | Withdrawal by the proposer — no quorum needed, since it only returns to the current state |
+| A hostile author occupies the slot with a proposal that cannot be approved | Withdrawal by quorum |
+| The approvers do nothing at all | An operator-configured cap on pending lifetime (24h by default) |
+| CI applies on every merge | A new proposal from the same origin supersedes the existing one |
 
-넷 모두 속도 제한 대상이다. 그러지 않으면 철회 후 즉시 재점유하는 반복으로 게이트를 계속 붙잡을 수 있다.
+All four are subject to rate limiting. Otherwise withdrawing and immediately re-occupying, over and over, holds the gate indefinitely.
 
-**전제의 취약점:** "저빈도"는 폼 저작에는 성립하지만 CI가 머지마다 apply 하는 파일 저작에는 성립하지 않을 수 있다. 대체 경로가 그 격차를 메우는 장치이며, 실사용에서 마찰이 관측되면 병행 미결로 재검토한다.
+**Where the premise is weak:** "low-frequency" holds for form authoring and may not hold for file authoring where CI applies on every merge. The supersede path is the device that covers that gap, and if friction is observed in real use, parallel pending revisions are reconsidered.
 
-### D25. 착지 단위는 구현 유닛이고, 스택은 의존 그래프에서 끊긴다
+### D25. The landing unit is the implementation unit, and the stack is cut at the dependency graph
 
-**확정** (2026-08-10) · 기각: 유닛 11개를 한 줄로 편 선형 스택, 마일스톤 통합 브랜치, 유닛 묶어 PR 수 줄이기
+**Settled** (2026-08-10) · rejected: a linear stack flattening all 11 units into one line, a milestone integration branch, bundling units to cut the number of PRs
 
-PR 단위를 새로 설계하지 않고 구현 유닛을 그대로 쓴다. 유닛은 이미 "한 커밋으로 착지 가능한 의미 단위"라는 기준으로 잘렸으므로, 착지 시점에 다시 자르면 두 개의 분할 기준이 생기고 둘은 어긋난다.
+The PR unit is not designed anew; the implementation unit is used as it stands. Units were already cut on the criterion of "a meaningful unit that can land in one commit", so cutting them again at landing time produces two partitioning criteria, and the two will diverge.
 
-**선형 스택을 기각한 이유**는 M1의 의존 그래프가 사슬이 아니라 합류점을 가진 DAG이기 때문이다. U5는 네 유닛을, U7은 세 유닛을 요구하는데 git PR의 base는 하나뿐이다. 두 번째 합류점은 파일 소유권에서 나왔다 — `internal/api` 서버·라우터를 U5가 만드는데 U20·U9가 같은 패키지에 핸들러를 얹으므로, U5가 조상에 없는 브랜치는 모듈이 컴파일되지 않는다. 이 의존은 개정 전 유닛 표에 선언돼 있지 않았고 착지 순서를 그리는 과정에서 드러났다.
+**The linear stack was rejected because** M1's dependency graph is not a chain but a DAG with join points. U5 requires four units and U7 requires three, and a git PR has exactly one base. The second join point came out of file ownership — U5 builds the `internal/api` server and router while U20 and U9 add handlers to the same package, so a branch without U5 among its ancestors does not compile as a module. That dependency was not declared in the pre-revision unit table; it surfaced while drawing the landing order.
 
-**병합 방식은 squash로 고정했다.** 유닛 경계와 커밋 경계를 일치시키는 쪽을 골랐고, 대신 부모 커밋이 자식 히스토리에 남지 않으므로 병합마다 자식을 `rebase --onto`로 옮기는 비용을 받아들였다. GitHub의 base 자동 재지정은 head 브랜치 삭제가 조건인 데다 base 포인터만 옮기고 히스토리를 다시 쓰지 않아, squash 아래에서는 스택을 지켜주지 못한다 — 그래서 재지정에 기대지 않고 명시적 rebase를 규칙으로 둔다. 한 줄로 펴면 U6가 U4 뒤에 서는 식의 가짜 의존이 리뷰어에게 보이고, 맨 아래 PR이 막힐 때 위 열 개가 함께 멈춘다. 그래서 합류점에서 스택을 끊고 아래 티어를 main에 병합한 뒤 위 티어를 다시 시작한다 — 티어 경계는 발명한 절차가 아니라 그래프가 이미 가진 성질이다.
+**The merge method is fixed to squash.** Matching unit boundaries to commit boundaries was chosen, and in exchange — since the parent commit does not survive in the child's history — the cost of moving each child with `rebase --onto` on every merge was accepted. GitHub's automatic base retargeting is conditional on deleting the head branch, and it moves only the base pointer without rewriting history, so under squash it does not keep the stack standing — hence an explicit rebase as the rule rather than relying on retargeting. Flattened into one line, false dependencies show up to the reviewer — U6 queued behind U4 — and when the bottom PR is blocked the ten above it stop with it. So the stack is cut at the join points: the lower tier merges to main, then the upper tier starts again from there — the tier boundary is not an invented procedure but a property the graph already has.
 
-**마일스톤 통합 브랜치를 기각한 이유**는 지금 main이 비어 있어 main 자체가 마일스톤이기 때문이다. 통합 브랜치는 실제 충돌 발견을 마지막 한 번의 거대한 병합으로 미룬다.
+**The milestone integration branch was rejected because** main is empty right now, which makes main itself the milestone. An integration branch defers the discovery of real conflicts to one enormous merge at the end.
 
-**유닛을 묶어 PR 수를 줄이는 안을 기각한 이유**는 M1에서 가장 큰 유닛(U4 저장 계층, U9 거버넌스)이 이미 단독으로 무거워서, 묶으면 리뷰 가능한 크기를 넘기 때문이다. 같은 근거가 반대 방향을 가리킨다는 점도 함께 받아들였다 — 구현 중 유닛이 리뷰 가능한 크기를 넘으면 PR을 쪼개는 대신 유닛 분해 자체를 개정한다. 그래야 유닛과 PR의 1:1이 유지된다.
+**Bundling units to cut the number of PRs was rejected because** M1's largest units (U4, the storage layer; U9, governance) are already heavy on their own, so bundling pushes them past a reviewable size. That the same reasoning points the other way was accepted along with it — if a unit grows past a reviewable size during implementation, the unit decomposition itself is revised rather than the PR split. That is what keeps units and PRs 1:1.
 
-**합류 게이트는 티어 전량 대기가 아니라 유닛별 선행 집합으로 둔다.** 전량 대기로 두면 선형 스택을 기각한 바로 그 이유 — 가짜 의존과 무관한 PR의 연쇄 정지 — 가 티어 경계에서 그대로 되살아난다. U7이 U6를 요구하지 않는데 U6의 PR이 막혔다고 U7이 기다리는 상태가 그 예다.
+**The join gate is each unit's own set of prerequisites, not waiting for a whole tier.** Waiting for a whole tier revives at the tier boundary exactly the reason the linear stack was rejected — false dependencies and the chain-stopping of unrelated PRs. U7 waiting because U6's PR is blocked, when U7 does not require U6, is the example.
 
-**미해결로 남은 것:** 이 리포는 비공개 무료 플랜이라 브랜치 보호 API를 쓸 수 없어 병합 게이트가 강제되지 않는다. 규약으로 운영하다가 공개 전환 또는 Pro 승급 시 required check으로 잠근다.
+**Left unresolved:** this repository is private on a free plan, so the branch protection API is unavailable and the merge gate is not enforced. It runs as a convention until the repository goes public or moves to Pro, at which point it is locked down as a required check.
 
-### D26. 데모의 위임 MFA 기본 경로는 CIBA가 아니라 step-up 리다이렉트다
+### D26. The demo's default delegated-MFA path is a step-up redirect, not CIBA
 
-**확정** (2026-08-10) · 기각: decoupled authentication server를 직접 만들어 데모에 동봉, 위임 MFA를 데모에서 아예 제외
+**Settled** (2026-08-10) · rejected: building a decoupled authentication server ourselves and shipping it with the demo, leaving delegated MFA out of the demo entirely
 
-U0가 Keycloak을 실제로 띄워 확인한 결과다. CIBA 그랜트 표면은 실재하지만 `ciba-auth-channel` SPI의 유일한 구현이 인증을 **외부** HTTP 엔드포인트로 넘기는 어댑터이고, 그 인증 장치 서버는 Keycloak이 동봉하지 않는다. 형식이 유효한 CIBA 요청도 그 지점에서 실패한다.
+This is what U0 found by actually standing Keycloak up. The CIBA grant surface is real, but the only implementation of the `ciba-auth-channel` SPI is an adapter that hands authentication to an **external** HTTP endpoint, and Keycloak does not ship that authentication device server. A CIBA request that is valid in form still fails at that point.
 
-데모에 CIBA를 넣으려면 인증 승인 UI를 우리가 짓고 compose에 세 번째 서비스로 세워야 한다. 데모 편의를 위해 제품 범위 밖의 서버를 만드는 셈이라 기각했다. 위임 MFA를 데모에서 빼는 안은 반대 방향으로 틀렸다 — 결정 수명주기가 이 제품의 논지이므로 그것이 빠진 데모는 제품을 보여주지 못한다.
+Putting CIBA in the demo means building the authentication approval UI ourselves and standing it up as a third service in compose. That amounts to building a server outside the product's scope for the convenience of a demo, so it was rejected. Leaving delegated MFA out of the demo is wrong in the other direction — the decision lifecycle is this product's thesis, and a demo without it does not show the product.
 
-그래서 U10이 이미 폴백으로 적어 둔 RFC 9470 step-up 리다이렉트를 데모의 **기본** 경로로 승격했다. CIBA는 계약과 클라이언트 구현으로 남고 모의 OP로 검증한다.
+So the RFC 9470 step-up redirect, which U10 had already written down as a fallback, was promoted to the demo's **default** path. CIBA stays as a contract and a client implementation, verified against a mock OP.
 
-**함께 드러난 두 제약.** `binding_message`는 50자 상한과 공백 금지가 걸려 결정 컨텍스트를 직렬화해 실을 수 없다 — 상관자에서 파생한 짧은 참조 코드만 싣는다. 이는 "결속은 상관자가 담당하고 `binding_message`는 표시용"이라는 기존 결정과 정합적이다. 그리고 `amr`은 기본 구성에서 빈 배열로 돌아오므로 충족 조건에서 선택으로 내렸다 — 필수로 두면 challenge가 구조적으로 충족 불가능해진다.
+**Two constraints surfaced with it.** `binding_message` carries a 50-character cap and forbids whitespace, so a serialized decision context cannot be put in it — only a short reference code derived from the correlator goes there. That is consistent with the existing decision that the binding is the correlator's job and `binding_message` is for display. And `amr` comes back as an empty array in a default configuration, so it was demoted to optional in the satisfaction condition — required, it would make the challenge structurally impossible to satisfy.
 
-**계획이 옳았음이 확인된 지점.** 충족되지 않은 `acr` 요청은 오류가 아니라 침묵 강등으로 돌아온다. 응답의 `acr`를 검증하는 것이 편의가 아니라 유일한 방어선이라는 뜻이다.
-
----
-
-### D27. 개정 델타의 before 면은 서버가 쓴다
-
-**확정** (2026-08-10) · 기각: 제출된 before를 저장 상태와 대조해 불일치 시 거부, 낙관적 동시성 토큰으로 before를 고정
-
-완화 분류기가 개정에 필요한 승인 요구를 정한다(R33). 그 분류기는 두 정책 집합을 비교하는데, 한쪽은 발효 중인 상태여야 한다. 그런데 `assess()`가 제출된 델타를 그대로 분류했고 `Change.Before`를 읽는 곳은 분류기 하나뿐이었다 — `Delta.Result`는 `After`만 적용하고, `Delta.Validate`는 모양만 봤다. **제안자가 유리한 과거를 쓰면 자기 분류를 자기가 썼다.**
-
-대조 후 거부를 기각한 이유는 콘솔이 before를 보낼 이유가 애초에 없기 때문이다. 서버가 아는 것을 클라이언트에게 보내게 한 뒤 맞는지 확인하는 것은 왕복만 늘리고 불일치 처리라는 새 오류 경로를 만든다. 낙관적 동시성 토큰은 다른 문제(발효 집합이 제안 중에 움직이는 것)의 답이고, 그 문제는 `ErrBindingChanged`와 재평가 경로가 이미 갖고 있다.
-
-**재구성은 확장하지 않는다.** 제안자가 선언한 변경의 `Before`만 고치고 없는 변경을 만들지 않는다 — 발효 집합 전체를 before로 삼으면 파일 apply마다 콘솔 저작 정책이 전부 삭제로 계산되어 D23이 뒤집힌다.
-
-**순서가 결정의 절반이다.** 재구성은 `Validate`·`Classify`·`Digest` 전부보다 앞선다. `Digest`보다 앞이어야 R31이 성립한다 — 승인이 묶이는 해시와 승인자가 보는 델타가 같은 것이어야 하고, 그것이 참이어야 한다.
-
-**결과를 덮지 않는다.** 이 커밋 이전에 발급된 pending 개정에는 소급되지 않는다. 발효 경로가 `Before`를 읽지 않으므로 동작은 정상이고 digest도 움직이지 않아 수집된 승인이 증발하지 않지만, 업그레이드 시점에 위조된 pending이 있었다면 그것은 관대한 분류로 발효될 수 있다. 소급 재분류는 수집된 승인을 전부 무효화하므로 더 비싼 선택이었다.
-
-**미해결로 남은 것:** `Change.FromOrigin`은 여전히 저장 상태와 대조되지 않는다. 콘솔이 `Adoption` 문서 없이 `take_ownership`으로 저작 출처를 옮길 수 있다 — R54 관점의 별도 구멍이다.
+**Where the plan was confirmed right.** An `acr` request that is not satisfied comes back as a silent downgrade rather than an error. Which means verifying the `acr` on the response is not a convenience but the only line of defence.
 
 ---
 
+### D27. The before side of a revision delta is written by the server
 
-## 개정 이력
+**Settled** (2026-08-10) · rejected: comparing the submitted before against stored state and refusing on mismatch, pinning before with an optimistic concurrency token
 
-### 2026-08-07 — 초판
+The weakening classifier sets the approval requirement a revision has to meet (R33). That classifier compares two policy sets, one of which must be the state in force. But `assess()` classified the submitted delta as it arrived, and the classifier was the only reader of `Change.Before` — `Delta.Result` applies only `After`, and `Delta.Validate` looked only at shape. **A proposer who wrote a convenient past wrote their own classification.**
 
-D1–D9, D12–D21 확정. 계획서가 구현 준비 완료 상태에 도달.
+Compare-then-refuse was rejected because the console has no reason to send a before in the first place. Having the client send back what the server already knows and then checking that it agrees only adds a round trip and a new error path for the mismatch. An optimistic concurrency token is the answer to a different problem — the set in force moving while a proposal is open — and that problem is already held by `ErrBindingChanged` and the revalidation path.
 
-### 2026-08-10 — 저작 경로와 IO 경계
+**The reconstruction does not expand.** It fixes the `Before` of the changes the proposer declared and invents no change that was not there — taking the whole set in force as the before would count every console-authored policy as a deletion on each file apply, which overturns D23.
 
-두 질문에서 출발했다. 콘솔을 역할 분리 배포에서도 동봉하는 것이 맞는가, 그리고 정책 파일의 백엔드를 다양하게 구성할 수 있게 하면 어떤가.
+**The ordering is half the decision.** The reconstruction comes before `Validate`, `Classify` and `Digest`, all three. It has to come before `Digest` for R31 to hold — the hash an approval binds to and the delta the approver sees have to be the same thing, and that has to be true.
 
-첫 질문의 답은 **동봉 유지**였다 — 콘솔이 공개 API만 소비하므로 분리 이음새가 이미 열려 있고, Temporal의 분리는 Node SSR이라는 우리에게 없는 제약 때문이었다. 다만 이음새를 닫아버릴 수 있는 두 가지(설정 가능한 API 주소, 공개 계약 밖 호출 금지)를 계약으로 못박았다.
+**It does not reach back over results already produced.** It is not retroactive to pending revisions issued before this commit. The effect path does not read `Before`, so behaviour is correct and the digest does not move either, which means no collected approval evaporates; but if a forged pending revision existed at the moment of the upgrade, it can take effect under the lenient classification. Retroactive reclassification would invalidate every approval already collected, which was the more expensive choice.
 
-두 번째 질문은 전제가 어긋나 있었다 — 계획서는 git을 저장소로 삼은 적이 없었다. 대화가 진행되며 진짜 요구가 드러났다: **파일 저작이 폼 대신 쓸 수 있는 1급 경로여야 한다.** 여기서 D10, D22, D23, D24가 나왔다.
+**Left unresolved:** `Change.FromOrigin` is still not compared against stored state. The console can move a policy's authoring origin with `take_ownership` and no `Adoption` document — a separate hole, from R54's point of view.
 
-세 번째로 사용자가 IO 경계 추상화를 제기해 D11이 신설되고 D17이 뒤집혔다.
+---
 
-### 2026-08-10 — 다관점 리뷰 반영
 
-일곱 관점(정합성·실행 가능성·보안·적대적 검토·범위·제품·디자인)의 독립 검토를 거쳐 다음이 드러났다.
+## Revision history
 
-**독립 컨텍스트 간 수렴** — 네 관점이 각각 미결 개정 잠금의 해소 경로 부재를 지적했고, 두 관점이 정책 삭제가 완화 분류에서 빠진 것을 지적했다. 둘 다 반영했다(D24, D21).
+### 2026-08-07 — First edition
 
-**문서 텍스트만으로 확정된 결함** — 기본 설정에서 CI apply가 콘솔 정책을 삭제 제안하는 문제(D23으로 해소), 브로커 없는 기본 데모가 신선도 요구 때문에 로드 불가일 수 있는 문제(수집 지연을 생산자 타임스탬프 기준으로 정의해 해소), 데모 IdP로 지정했던 Dex가 CIBA도 step-up도 지원하지 않는 문제(스파이크가 확정할 때까지 제품명을 고정하지 않기로).
+D1–D9 and D12–D21 settled. The plan reached implementation-ready.
 
-**개정 이전부터 있었으나 드러난 것** — 신원 계층이 순환 의존에 걸려 있던 문제(신원 계층을 독립 유닛으로 분리), 재평가가 사실 스냅샷을 재조회하는지 정해지지 않아 D5의 승인 보존이 성립하지 않던 문제(고정 스냅샷 재사용으로 확정), 매칭 정책이 없을 때의 판정이 정의되지 않았던 문제(fail-closed deny 불변식으로 확정).
+### 2026-08-10 — Authoring paths and the IO boundary
 
-### 2026-08-10 — 착지 전략
+It started from two questions. Is embedding the console right even in a role-split deployment, and what about letting the policy files' backend be configured in different ways.
 
-계획서에 착지 방식이 없다는 결핍을 메웠다. (아래 U0 항목보다 앞선 개정이다.) 구현 유닛을 그대로 PR 단위로 쓰고, 의존 그래프의 합류점에서 스택을 끊는 티어 구조를 확정했다(D25). PR 본문의 네 항목(배경·해결법·근거·집중해서 봐야할 것)도 계획서의 Landing 전략에 고정했다 — 특히 근거 항목이 이 결정 로그를 인용만 하고 다시 논증하지 않게 하는 규칙이 함께 들어갔다.
+The answer to the first was **keep embedding it** — the console consumes only the public API, so the seam for separating them is already open, and Temporal's split was forced by Node SSR, a constraint we do not have. The two things that could close that seam (a configurable API address, no calls outside the public contract) were pinned as contract.
 
-### 2026-08-10 — U0 반증 스파이크 결과 반영
+The second question rested on a wrong premise — the plan had never made git the store. As the conversation went on the real requirement surfaced: **file authoring has to be a first-class path usable in place of the form.** D10, D22, D23 and D24 came out of that.
 
-세 전제를 실제로 돌려서 확인했다. 둘은 확정, 하나는 개정이다.
+Third, the user raised abstraction at the IO boundary, which added D11 and reversed D17.
 
-**개정된 것** — 데모 번들의 CIBA 종단 시연이 성립하지 않는다는 것이 드러나 D26이 신설됐다. 함께 `binding_message`의 형식 제약과 `amr`의 기본 공백이 확인되어 R3·R28·AE6·F2·U10이 개정됐다. 반증 장치가 실제로 반증을 해낸 첫 사례이며, 구현 전에 걸렸으므로 비용은 문서 개정뿐이다.
+### 2026-08-10 — Multi-lens review incorporated
 
-**확정된 것** — 세그먼트 감사 체인이 단일 전역 체인보다 처리량 자릿수가 하나 이상 높다는 U4의 전제가 성립했고, `writer_id`의 인스턴스 독점 귀속이 정확성 요구로 못박혔다. AuthZEN 하네스는 CI 재현 가능하며 Access Evaluation 프로파일만 따로 고를 수 있다 — 다만 러너가 결과와 무관하게 종료 코드 0을 내므로 U5는 출력 파싱 래퍼 없이는 게이트를 세울 수 없다.
+Independent review from seven lenses (coherence, feasibility, security, adversarial, scope, product, design) surfaced the following.
 
-관측과 측정 조건은 `docs/spike-results.md`에 있다.
+**Convergence across independent contexts** — four lenses each pointed at the missing way out of the pending-revision lock, and two pointed at policy deletion being absent from weakening classification. Both were taken up (D24, D21).
 
-### 2026-08-10 — 착지 절차 수정: 부모 브랜치 삭제가 자식 PR을 닫는다
+**Defects established from the document text alone** — CI apply proposing the deletion of console policies in the default configuration (resolved by D23); the broker-less default demo possibly being unable to load because of the freshness requirement (resolved by defining ingestion lag against the producer's timestamp); and Dex, which had been named as the demo IdP, supporting neither CIBA nor step-up (the product name is left unpinned until a spike settles it).
 
-D25의 스택 절차를 실제로 돌리다 첫 티어에서 걸렸다. `#1`을 `--delete-branch`로 squash 병합하자 그 위에 서 있던 `#3`이 재지정되지 않고 **닫혔고**, base 브랜치가 사라진 PR은 브랜치를 복구해도 다시 열리지 않았다. 새 번호로 올리는 것 말고 방법이 없었다.
+**Present before this revision and only now surfaced** — the identity layer caught in a circular dependency (split out as its own unit); whether revalidation re-fetches the fact snapshot never having been settled, which left D5's preservation of approvals not holding (settled as reuse of the fixed snapshot); and the verdict when no policy matches never having been defined (settled as a fail-closed deny invariant).
 
-리뷰가 이 위험을 미리 지적했지만 당시 확인되지 않은 주장으로 보고 절차에 반영하지 않았다. 확인된 지금, 병합·rebase·재지정·삭제의 **순서**를 규칙으로 못박았다. 자식이 있는 부모는 자식을 옮긴 뒤에야 지운다.
+### 2026-08-10 — Landing strategy
 
-교훈은 절차보다 앞선다 — 리뷰가 지목한 미확인 위험은 반박하거나 확인하거나 둘 중 하나여야지, 확인되지 않았다는 이유로 그냥 두면 안 된다.
+Filled the gap where the plan said nothing about how work lands. (This revision precedes the U0 entry below.) The implementation unit is used as the PR unit as it stands, and the tier structure that cuts the stack at the dependency graph's join points was settled (D25). The four sections of a PR body (background, approach, rationale, where to look closely) were pinned into the plan's landing strategy as well — in particular alongside the rule that keeps the rationale section citing this decision log rather than re-arguing it.
 
-### 2026-08-10 — U15가 보고한 공백 아래에서 인가 구멍이 나왔다
+### 2026-08-10 — U0 falsification spike results incorporated
 
-U15는 "발효 스키마를 읽을 방법이 없어 기존 정책 편집이 불가능하다"를 능력 결핍으로 보고하면서, 그 부수 효과로 콘솔이 `schema_before`를 실을 수 없어 R33의 `on_error` 완화가 분류기에 보이지 않는다는 것을 함께 적었다.
+Three premises were checked by actually running them. Two held, one was revised.
 
-두 번째 항목을 파고들자 결핍이 아니라 **구멍**이었다. 분류기의 before 면 전체가 제안자 통제 아래 있었고, 이는 스키마만이 아니라 정족수 축소·승인자 확대·발동 조건 축소에 모두 걸렸다. D27이 그 답이다.
+**What was revised** — an end-to-end CIBA demonstration in the demo bundle turned out not to stand up, and D26 was added. The format constraints on `binding_message` and `amr`'s default emptiness were confirmed alongside it, revising R3, R28, AE6, F2 and U10. This is the first case of the falsification device actually falsifying something, and it caught it before implementation, so the cost was a document revision and nothing else.
 
-교훈 둘. 유닛이 "부수 효과"로 적은 것이 본체보다 클 수 있다 — U15가 그것을 숨기지 않고 적었기 때문에 잡혔다. 그리고 `schema-read` 엔드포인트는 이 수정 뒤에 **보안 요구가 아니라 폼 렌더링 능력 요구**로 내려앉았다. 구멍을 먼저 닫으니 원래 요청의 성격이 바뀌었다.
+**What held** — U4's premise that a per-segment audit chain has at least an order of magnitude more throughput than a single global chain held, and one instance's exclusive claim on a `writer_id` was pinned as a correctness requirement. The AuthZEN harness is reproducible in CI and the Access Evaluation profile can be selected on its own — though the runner exits 0 regardless of the result, so U5 cannot stand a gate on it without a wrapper that parses the output.
+
+The observations and the conditions they were measured under are in `docs/spike-results.md`.
+
+### 2026-08-10 — Landing procedure fix: deleting a parent branch closes the child PR
+
+Running D25's stack procedure for real caught on the first tier. Squash-merging `#1` with `--delete-branch` left `#3`, which stood on top of it, not retargeted but **closed**, and a PR whose base branch is gone does not reopen even when the branch is restored. There was no way out but to raise it again under a new number.
+
+Review had pointed this risk out in advance, and it was treated at the time as an unconfirmed claim and left out of the procedure. Now that it is confirmed, the **order** of merge, rebase, retarget and delete is pinned as a rule. A parent with children is deleted only after the children have been moved.
+
+The lesson runs ahead of the procedure — an unconfirmed risk a review names must be either refuted or confirmed; it must not be left alone on the grounds that it is unconfirmed.
+
+### 2026-08-10 — An authorization hole came out from under the gap U15 reported
+
+U15 reported "there is no way to read the schema in force, so editing an existing policy is impossible" as a missing capability, and noted alongside it, as a side effect, that the console therefore cannot carry `schema_before`, which leaves R33's `on_error` weakening invisible to the classifier.
+
+Digging into the second item, it was not a gap but a **hole**. The classifier's entire before side was under the proposer's control, and that covered not only the schema but reducing a quorum, widening the approver set and narrowing a trigger. D27 is the answer to it.
+
+Two lessons. What a unit writes down as a "side effect" can be larger than the main item — this was caught because U15 wrote it down instead of hiding it. And after this fix the `schema-read` endpoint settled into being **a form-rendering capability requirement rather than a security requirement**. Closing the hole first changed the nature of the original request.

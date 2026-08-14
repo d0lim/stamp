@@ -115,7 +115,7 @@ async function auditable(container: HTMLElement): Promise<string[]> {
     // every token pair is written down with its ratio.
     rules: { 'color-contrast': { enabled: false } },
   })
-  return results.violations.map((v) => `${v.id}: ${v.help} (${v.nodes.length}곳)`)
+  return results.violations.map((v) => `${v.id}: ${v.help} (${v.nodes.length} nodes)`)
 }
 
 async function openBuilder(options: StubOptions = {}) {
@@ -125,7 +125,7 @@ async function openBuilder(options: StubOptions = {}) {
     route: '/policies/new',
     fetchImpl: stubbed.impl,
   })
-  await screen.findByRole('heading', { level: 1, name: '정책 저작' })
+  await screen.findByRole('heading', { level: 1, name: 'Policy authoring' })
   return { ...rendered, calls: stubbed.calls }
 }
 
@@ -136,19 +136,19 @@ async function goToStep(name: RegExp) {
 
 /** The minimum an author declares before a rule can be written. */
 async function declareEntity(name: string, attribute: string) {
-  await goToStep(/^1\. 선언$/)
-  await userEvent.click(screen.getByRole('button', { name: 'entity 선언 추가' }))
-  await userEvent.type(screen.getByLabelText('이름'), name)
-  await userEvent.click(screen.getByRole('button', { name: '속성 추가' }))
-  await userEvent.type(screen.getByLabelText('속성 1 이름'), attribute)
+  await goToStep(/^1\. Declarations$/)
+  await userEvent.click(screen.getByRole('button', { name: 'Add entity declaration' }))
+  await userEvent.type(screen.getByLabelText('Name'), name)
+  await userEvent.click(screen.getByRole('button', { name: 'Add attribute' }))
+  await userEvent.type(screen.getByLabelText('Attribute 1 name'), attribute)
 }
 
 // ---------------------------------------------------------------------------
 // (a) a diagnostic lands on the field that caused it
 // ---------------------------------------------------------------------------
 
-describe('진단이 원인 필드에 붙는다', () => {
-  it('challenge threshold 진단이 threshold 입력에 연결되고 요약이 그 필드를 가리킨다', async () => {
+describe('a diagnostic attaches to the field that caused it', () => {
+  it('ties a challenge threshold diagnostic to the threshold input and points the summary at it', async () => {
     await openBuilder({
       dryRun: {
         status: 400,
@@ -166,13 +166,13 @@ describe('진단이 원인 필드에 붙는다', () => {
     })
 
     await goToStep(/^5\. challenge$/)
-    await userEvent.click(screen.getByRole('button', { name: '정족수 승인 (quorum) 추가' }))
-    await goToStep(/^6\. 시험 평가$/)
-    await userEvent.click(screen.getByRole('button', { name: '시험 평가 실행' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add quorum approval (quorum)' }))
+    await goToStep(/^6\. Dry run$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Run dry run' }))
 
     // The flow moved to the step that owns the pointer, because an anchor into
     // a step that is not rendered is an anchor to nothing.
-    const threshold = await screen.findByLabelText('정족수')
+    const threshold = await screen.findByLabelText('Quorum')
     expect(threshold.id).toBe('bf.policies.0.challenges.0.threshold')
     expect(threshold).toHaveAttribute('aria-invalid', 'true')
     expect(threshold).toHaveAccessibleDescription(/quorum threshold must be at least 1/)
@@ -183,7 +183,7 @@ describe('진단이 원인 필드에 붙는다', () => {
     expect(document.getElementById('bf.policies.0.challenges.0.threshold')).toBe(threshold)
   })
 
-  it('승인자 목록 진단은 그 승인자 입력에 붙는다', async () => {
+  it('attaches an approver-list diagnostic to that approver input', async () => {
     await openBuilder({
       dryRun: {
         status: 400,
@@ -201,15 +201,15 @@ describe('진단이 원인 필드에 붙는다', () => {
     })
 
     await goToStep(/^5\. challenge$/)
-    await userEvent.click(screen.getByRole('button', { name: '정족수 승인 (quorum) 추가' }))
-    await goToStep(/^6\. 시험 평가$/)
-    await userEvent.click(screen.getByRole('button', { name: '시험 평가 실행' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add quorum approval (quorum)' }))
+    await goToStep(/^6\. Dry run$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Run dry run' }))
 
-    const member = await screen.findByLabelText('승인자 1')
+    const member = await screen.findByLabelText('Approver 1')
     expect(member).toHaveAccessibleDescription(/an approver may not be empty/)
   })
 
-  it('폼이 렌더링하지 않는 포인터는 가장 가까운 조상 필드로 올라간다', async () => {
+  it('climbs a pointer the form does not render to the nearest ancestor field', async () => {
     await openBuilder({
       dryRun: {
         status: 400,
@@ -221,7 +221,7 @@ describe('진단이 원인 필드에 붙는다', () => {
               // its own — the row it names does.
               pointer: '/policies/0/challenges/0/approvers/members/0/nowhere',
               code: 'invalid_value',
-              message: '조상으로 올라가야 하는 진단',
+              message: 'a diagnostic that has to climb to an ancestor',
             },
           ],
         },
@@ -229,34 +229,36 @@ describe('진단이 원인 필드에 붙는다', () => {
     })
 
     await goToStep(/^5\. challenge$/)
-    await userEvent.click(screen.getByRole('button', { name: '정족수 승인 (quorum) 추가' }))
-    await goToStep(/^6\. 시험 평가$/)
-    await userEvent.click(screen.getByRole('button', { name: '시험 평가 실행' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add quorum approval (quorum)' }))
+    await goToStep(/^6\. Dry run$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Run dry run' }))
 
-    const member = await screen.findByLabelText('승인자 1')
-    expect(member).toHaveAccessibleDescription(/조상으로 올라가야 하는 진단/)
+    const member = await screen.findByLabelText('Approver 1')
+    expect(member).toHaveAccessibleDescription(/a diagnostic that has to climb to an ancestor/)
   })
 
-  it('어느 필드도 소유하지 않는 진단은 사라지지 않고 문서 수준으로 표시된다', async () => {
+  it('shows a diagnostic no field owns at document level rather than dropping it', async () => {
     await openBuilder({
       dryRun: {
         status: 400,
         body: {
           error: 'invalid_policy',
           diagnostics: [
-            { pointer: '', code: 'invalid_yaml', message: '문서를 읽을 수 없습니다' },
+            { pointer: '', code: 'invalid_yaml', message: 'the document could not be read' },
           ],
         },
       },
     })
 
-    await goToStep(/^6\. 시험 평가$/)
-    await userEvent.click(screen.getByRole('button', { name: '시험 평가 실행' }))
+    await goToStep(/^6\. Dry run$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Run dry run' }))
 
     const summary = await screen.findByTestId('error-summary')
-    const link = within(summary).getByRole('link', { name: /문서를 읽을 수 없습니다/ })
+    const link = within(summary).getByRole('link', { name: /the document could not be read/ })
     expect(link).toHaveAttribute('href', '#bf-unplaced')
-    expect(document.getElementById('bf-unplaced')).toHaveTextContent('문서를 읽을 수 없습니다')
+    expect(document.getElementById('bf-unplaced')).toHaveTextContent(
+      'the document could not be read',
+    )
   })
 })
 
@@ -264,10 +266,10 @@ describe('진단이 원인 필드에 붙는다', () => {
 // (b) the form cannot express what the AST cannot hold
 // ---------------------------------------------------------------------------
 
-describe('폼은 AST가 담지 못하는 조건을 표현하지 못한다', () => {
-  it('규칙 팔레트는 AST의 노드 종류와 정확히 같다', async () => {
+describe('the form cannot express a condition the AST cannot hold', () => {
+  it('offers exactly the node kinds the AST has in the rule palette', async () => {
     await openBuilder()
-    await goToStep(/^4\. 규칙$/)
+    await goToStep(/^4\. Rule$/)
 
     const palette = await screen.findByTestId('condition-palette')
     const offered = within(palette)
@@ -277,79 +279,82 @@ describe('폼은 AST가 담지 못하는 조건을 표현하지 못한다', () =
     expect(offered).toHaveLength(3)
   })
 
-  it('규칙의 왼쪽은 참조만 받는다 — 상수는 선택지에 없다', async () => {
+  it("takes only a reference on a rule's left side — a constant is not on offer", async () => {
     await openBuilder()
     await declareEntity('user', 'id')
-    await goToStep(/^4\. 규칙$/)
-    await userEvent.click(screen.getByRole('button', { name: '비교 규칙 추가' }))
+    await goToStep(/^4\. Rule$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Add comparison rule' }))
 
-    const left = screen.getByLabelText('왼쪽 종류') as HTMLSelectElement
+    const left = screen.getByLabelText('Left operand kind') as HTMLSelectElement
     const kinds = Array.from(left.options).map((option) => option.value)
     expect(kinds).toEqual(['field', 'source'])
     expect(kinds).not.toContain('literal')
 
     // The right side does offer all three, which is the AST's own asymmetry.
-    const right = screen.getByLabelText('오른쪽 종류') as HTMLSelectElement
+    const right = screen.getByLabelText('Right operand kind') as HTMLSelectElement
     expect(Array.from(right.options).map((o) => o.value)).toEqual([...OPERAND_KINDS])
   })
 
-  it('fact source 인자는 다른 source 호출이 될 수 없다', async () => {
+  it("cannot make a fact source's argument another source call", async () => {
     await openBuilder()
-    await goToStep(/^1\. 선언$/)
-    await userEvent.click(screen.getByRole('button', { name: 'source 선언 추가' }))
-    await userEvent.type(screen.getByLabelText('이름'), 'role_members')
-    await userEvent.click(screen.getByRole('button', { name: '인자 추가' }))
-    await userEvent.type(screen.getByLabelText('인자 1 이름'), 'role')
+    await goToStep(/^1\. Declarations$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Add source declaration' }))
+    await userEvent.type(screen.getByLabelText('Name'), 'role_members')
+    await userEvent.click(screen.getByRole('button', { name: 'Add parameter' }))
+    await userEvent.type(screen.getByLabelText('Parameter 1 name'), 'role')
 
-    await goToStep(/^4\. 규칙$/)
-    await userEvent.click(screen.getByRole('button', { name: '비교 규칙 추가' }))
-    await userEvent.selectOptions(screen.getByLabelText('왼쪽 종류'), 'source')
-    await userEvent.selectOptions(screen.getByLabelText('왼쪽 — fact source'), 'role_members')
+    await goToStep(/^4\. Rule$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Add comparison rule' }))
+    await userEvent.selectOptions(screen.getByLabelText('Left operand kind'), 'source')
+    await userEvent.selectOptions(
+      screen.getByLabelText('Left operand — fact source'),
+      'role_members',
+    )
 
-    const argument = screen.getByLabelText('인자 role (string) 종류') as HTMLSelectElement
+    const argument = screen.getByLabelText('Argument role (string) kind') as HTMLSelectElement
     const kinds = Array.from(argument.options).map((option) => option.value)
     expect(kinds).toEqual(['field', 'literal'])
     expect(kinds).not.toContain('source')
   })
 
-  it('선언에 없는 source는 고를 수 없다', async () => {
+  it('cannot choose a source that is not in the declarations', async () => {
     await openBuilder()
     await declareEntity('user', 'id')
-    await goToStep(/^4\. 규칙$/)
-    await userEvent.click(screen.getByRole('button', { name: '비교 규칙 추가' }))
-    await userEvent.selectOptions(screen.getByLabelText('왼쪽 종류'), 'source')
+    await goToStep(/^4\. Rule$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Add comparison rule' }))
+    await userEvent.selectOptions(screen.getByLabelText('Left operand kind'), 'source')
 
-    const picker = screen.getByLabelText('왼쪽 — fact source') as HTMLSelectElement
+    const picker = screen.getByLabelText('Left operand — fact source') as HTMLSelectElement
     expect(Array.from(picker.options).map((o) => o.value)).toEqual([''])
     // And there is no text box to type one into.
     expect(picker.tagName).toBe('SELECT')
   })
 
-  it('허용목록이 비면 외부 대상은 자유 입력이 아니라 운영자 요청 안내가 된다', async () => {
+  it('turns an empty allowlist into an operator request rather than a free-text target', async () => {
     await openBuilder()
     await goToStep(/^5\. challenge$/)
-    await userEvent.click(screen.getByRole('button', { name: '외부 승인 (external) 추가' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add external approval (external)' }))
 
-    const target = screen.getByLabelText('외부 대상') as HTMLSelectElement
+    const target = screen.getByLabelText('External target') as HTMLSelectElement
     expect(target.tagName).toBe('SELECT')
     expect(target).toBeDisabled()
-    expect(screen.getByTestId('egress-empty')).toHaveTextContent('운영자에게')
+    expect(screen.getByTestId('egress-empty')).toHaveTextContent('Ask the operator')
   })
 
-  it('not은 피연산자를 하나만 갖는다', async () => {
+  it('gives not exactly one operand', async () => {
     await openBuilder()
-    await goToStep(/^4\. 규칙$/)
-    await userEvent.click(screen.getByRole('button', { name: '논리 그룹 추가' }))
-    await userEvent.click(screen.getByRole('button', { name: '비교 규칙 추가' }))
-    await userEvent.click(screen.getByRole('button', { name: '포함 규칙 추가' }))
-    expect(screen.getByText('교환 포맷')).toBeInTheDocument()
+    await goToStep(/^4\. Rule$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Add logic group' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add comparison rule' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add membership rule' }))
+    expect(screen.getByText('Exchange format')).toBeInTheDocument()
 
-    await userEvent.selectOptions(screen.getByLabelText('결합 방식'), 'not')
+    await userEvent.selectOptions(screen.getByLabelText('Combination'), 'not')
     const document_ = screen.getByTestId('document-preview').textContent ?? ''
     expect(document_).toContain('not:')
     // The second operand is gone, and there is no button to add another.
     expect(document_.match(/left:/g)).toHaveLength(1)
-    expect(screen.queryByRole('button', { name: '포함 규칙 추가' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Add membership rule' })).toBeNull()
   })
 })
 
@@ -357,56 +362,61 @@ describe('폼은 AST가 담지 못하는 조건을 표현하지 못한다', () =
 // (c) the gap between submitted and in effect
 // ---------------------------------------------------------------------------
 
-describe('제출과 발효 사이', () => {
-  it('프리플라이트 전에는 제출할 수 없고, 그 이유가 버튼에 연결되어 있다', async () => {
+describe('the gap between submitted and in force', () => {
+  it('refuses submission before the preflight, with the reason tied to the button', async () => {
     await openBuilder()
-    await goToStep(/^7\. 제출$/)
+    await goToStep(/^7\. Submit$/)
 
-    const submit = screen.getByRole('button', { name: '개정 제출' })
+    const submit = screen.getByRole('button', { name: 'Submit revision' })
     expect(submit).toBeDisabled()
-    expect(submit).toHaveAccessibleDescription(/먼저 프리플라이트를 실행해야/)
+    expect(submit).toHaveAccessibleDescription(/The preflight has to run before/)
   })
 
-  it('잠긴 설치에서는 정족수와 제안자 제외가 제출 전에 표시된다', async () => {
+  it('shows the quorum and the proposer exclusion before submission on a locked installation', async () => {
     const { calls } = await openBuilder()
-    await goToStep(/^7\. 제출$/)
-    await userEvent.click(screen.getByRole('button', { name: '제출 전 확인 (프리플라이트)' }))
+    await goToStep(/^7\. Submit$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Check before submitting (preflight)' }))
 
     const notice = await screen.findByTestId('quorum-notice')
-    expect(notice).toHaveTextContent('바로 발효되지 않습니다')
-    expect(notice).toHaveTextContent('승인자 3명')
-    expect(notice).toHaveTextContent('제안자 본인의 승인은 정족수에 포함되지 않습니다')
-    expect(screen.getByTestId('affected-decisions')).toHaveTextContent('4건')
+    expect(notice).toHaveTextContent('does not put this in force')
+    expect(notice).toHaveTextContent('a quorum of 3 approvers')
+    expect(notice).toHaveTextContent("the proposer's own approval does not count toward the quorum")
+    expect(screen.getByTestId('affected-decisions')).toHaveTextContent(
+      'Pending decisions this revision would affect: 4',
+    )
 
     // Only now does submission open, and nothing was submitted to get here.
-    expect(screen.getByRole('button', { name: '개정 제출' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Submit revision' })).toBeEnabled()
     expect(calls.filter((call) => call.path === '/policies/revisions')).toHaveLength(0)
   })
 
-  it('운영자 하한을 위반하면 프리플라이트 후에도 제출 버튼이 열리지 않는다', async () => {
+  it('keeps the submit button shut after the preflight when an operator floor is violated', async () => {
     await openBuilder({
       preview: {
         status: 200,
-        body: { ...QUORUM_PREVIEW, violations: ['최소 정족수 2 미만으로 낮출 수 없습니다'] },
+        body: {
+          ...QUORUM_PREVIEW,
+          violations: ['the quorum may not be lowered below the minimum of 2'],
+        },
       },
     })
-    await goToStep(/^7\. 제출$/)
-    await userEvent.click(screen.getByRole('button', { name: '제출 전 확인 (프리플라이트)' }))
+    await goToStep(/^7\. Submit$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Check before submitting (preflight)' }))
 
-    expect(await screen.findByTestId('floor-violations')).toHaveTextContent('최소 정족수 2')
-    expect(screen.getByRole('button', { name: '개정 제출' })).toBeDisabled()
+    expect(await screen.findByTestId('floor-violations')).toHaveTextContent('the minimum of 2')
+    expect(screen.getByRole('button', { name: 'Submit revision' })).toBeDisabled()
   })
 
-  it('제출은 성공이 아니라 미결 상태로 보고된다', async () => {
+  it('reports a submission as pending rather than as a success', async () => {
     const { calls } = await openBuilder()
-    await goToStep(/^7\. 제출$/)
-    await userEvent.click(screen.getByRole('button', { name: '제출 전 확인 (프리플라이트)' }))
+    await goToStep(/^7\. Submit$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Check before submitting (preflight)' }))
     await screen.findByTestId('quorum-notice')
-    await userEvent.click(screen.getByRole('button', { name: '개정 제출' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Submit revision' }))
 
     const result = await screen.findByTestId('proposal-result')
-    expect(result).toHaveTextContent('미결 — 아직 발효되지 않았습니다')
-    expect(result).toHaveTextContent('정족수를 채우면 발효됩니다')
+    expect(result).toHaveTextContent('pending — not in force yet')
+    expect(result).toHaveTextContent('once approvers reach the quorum')
 
     const submission = calls.find((call) => call.path === '/policies/revisions')
     const body = submission?.body as { delta: { changes: { kind: string }[] } }
@@ -415,15 +425,17 @@ describe('제출과 발효 사이', () => {
     expect(body.delta.changes[0]?.kind).toBe('add')
   })
 
-  it('미잠금 설치에서는 정족수 대신 잠기지 않았다는 사실을 말한다', async () => {
+  it('states that the installation is unlocked instead of naming a quorum', async () => {
     await openBuilder({
       governance: { mode: 'solo_admin' },
       preview: { status: 200, body: { ...QUORUM_PREVIEW, mode: 'solo_admin', threshold: 0 } },
     })
     expect(await screen.findByTestId('unlocked-warning')).toBeInTheDocument()
-    await goToStep(/^7\. 제출$/)
-    await userEvent.click(screen.getByRole('button', { name: '제출 전 확인 (프리플라이트)' }))
-    expect(await screen.findByTestId('unlocked-notice')).toHaveTextContent('정족수 없이 발효')
+    await goToStep(/^7\. Submit$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Check before submitting (preflight)' }))
+    expect(await screen.findByTestId('unlocked-notice')).toHaveTextContent(
+      'takes effect without a quorum',
+    )
   })
 })
 
@@ -431,12 +443,12 @@ describe('제출과 발효 사이', () => {
 // pending revisions, on entry rather than at submission
 // ---------------------------------------------------------------------------
 
-describe('미결 개정', () => {
+describe('pending revisions', () => {
   const pending = {
     governance: { mode: 'quorum', pending_revision: { ...PROPOSAL, proposer_id: 'u-1' } },
   }
 
-  it('저작 진입 시점에 배너가 뜨고 자기 제안이면 철회할 수 있다', async () => {
+  it('raises the banner on entry to authoring, with a withdrawal for your own proposal', async () => {
     const { calls } = await openBuilder(pending)
     const banner = await screen.findByTestId('pending-revision-banner')
     expect(banner).toHaveTextContent('rev-1')
@@ -444,16 +456,16 @@ describe('미결 개정', () => {
     expect(calls.some((call) => call.path === '/policies/revisions/rev-1/withdrawal')).toBe(true)
   })
 
-  it('남의 제안에는 철회 대신 제안자를 알려준다', async () => {
+  it("names the proposer instead of offering a withdrawal on someone else's proposal", async () => {
     await openBuilder({
       governance: { mode: 'quorum', pending_revision: { ...PROPOSAL, proposer_id: 'someone-else' } },
     })
     const banner = await screen.findByTestId('pending-revision-banner')
     expect(within(banner).queryByTestId('withdraw-revision')).toBeNull()
-    expect(banner).toHaveTextContent('철회는 제안자만')
+    expect(banner).toHaveTextContent('Only the proposer can withdraw')
   })
 
-  it('제출 시점에 미결이 생기면 일반 오류가 아니라 같은 배너로 처리된다', async () => {
+  it('answers a revision that appears at submission with the same banner, not a generic error', async () => {
     let hasPending = false
     const impl = vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input), 'http://console.test').pathname
@@ -485,12 +497,12 @@ describe('미결 개정', () => {
       route: '/policies/new',
       fetchImpl: impl as unknown as typeof fetch,
     })
-    await screen.findByRole('heading', { level: 1, name: '정책 저작' })
-    await userEvent.click(await screen.findByRole('button', { name: /^7\. 제출$/ }))
-    await userEvent.click(screen.getByRole('button', { name: '제출 전 확인 (프리플라이트)' }))
+    await screen.findByRole('heading', { level: 1, name: 'Policy authoring' })
+    await userEvent.click(await screen.findByRole('button', { name: /^7\. Submit$/ }))
+    await userEvent.click(screen.getByRole('button', { name: 'Check before submitting (preflight)' }))
 
     expect(await screen.findByTestId('pending-revision-banner')).toBeInTheDocument()
-    expect(screen.getByTestId('submit-failure')).toHaveTextContent('위 배너에서 확인하십시오')
+    expect(screen.getByTestId('submit-failure')).toHaveTextContent('See the banner above')
   })
 })
 
@@ -498,8 +510,8 @@ describe('미결 개정', () => {
 // the dry run
 // ---------------------------------------------------------------------------
 
-describe('시험 평가', () => {
-  it('매칭·조건별 결과·발동될 challenge를 돌려주고 아무것도 저장하지 않았음을 말한다', async () => {
+describe('the dry run', () => {
+  it('returns the match, the per-condition results and the challenges that would fire, and says it stored nothing', async () => {
     await openBuilder({
       dryRun: {
         status: 200,
@@ -521,14 +533,14 @@ describe('시험 평가', () => {
       },
     })
 
-    await goToStep(/^6\. 시험 평가$/)
-    await userEvent.click(screen.getByRole('button', { name: '시험 평가 실행' }))
+    await goToStep(/^6\. Dry run$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Run dry run' }))
 
     const result = await screen.findByTestId('dry-run-result')
-    expect(result).toHaveTextContent('이 요청에 적용됨')
-    expect(result).toHaveTextContent('불성립')
+    expect(result).toHaveTextContent('applies to this request')
+    expect(result).toHaveTextContent('does not hold')
     expect(result).toHaveTextContent('deny (condition_false)')
-    expect(screen.getByTestId('dry-run-stored')).toHaveTextContent('저장되지 않음')
+    expect(screen.getByTestId('dry-run-stored')).toHaveTextContent('not stored')
     expect(result).toHaveTextContent('quorum')
     expect(result).toHaveTextContent('role_members("editor")')
 
@@ -545,18 +557,18 @@ describe('시험 평가', () => {
     ])
   })
 
-  it('선언에 없는 속성은 샘플 입력 폼에 나타나지 않는다', async () => {
+  it('keeps an undeclared attribute out of the sample input form', async () => {
     const { calls } = await openBuilder()
     await declareEntity('user', 'dept')
-    await goToStep(/^2\. 발동 조건$/)
+    await goToStep(/^2\. Trigger conditions$/)
     await userEvent.selectOptions(screen.getByLabelText('subject entity'), 'user')
-    await goToStep(/^6\. 시험 평가$/)
+    await goToStep(/^6\. Dry run$/)
 
     expect(screen.getByLabelText('dept (string)')).toBeInTheDocument()
     expect(screen.queryByLabelText('secret (string)')).toBeNull()
 
     await userEvent.type(screen.getByLabelText('dept (string)'), 'ops')
-    await userEvent.click(screen.getByRole('button', { name: '시험 평가 실행' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Run dry run' }))
 
     const call = calls.find((c) => c.path === '/console/v1/policies/dry-run')
     const body = call?.body as { input: { subject: { attributes: Record<string, unknown> } } }
@@ -568,8 +580,8 @@ describe('시험 평가', () => {
 // accessibility
 // ---------------------------------------------------------------------------
 
-describe('접근성', () => {
-  it('정책 목록에 axe 위반이 없다', async () => {
+describe('accessibility', () => {
+  it('has no axe violations on the policy list', async () => {
     const stubbed = stub({
       policies: {
         policies: [
@@ -588,34 +600,34 @@ describe('접근성', () => {
       route: '/policies',
       fetchImpl: stubbed.impl,
     })
-    await screen.findByRole('heading', { level: 1, name: '정책' })
+    await screen.findByRole('heading', { level: 1, name: 'Policies' })
     await screen.findByRole('button', { name: /todo\.read/ })
     expect(await auditable(container)).toEqual([])
   })
 
-  it('빌더의 모든 단계에 axe 위반이 없다', async () => {
+  it('has no axe violations on any step of the builder', async () => {
     const { container } = await openBuilder()
     await declareEntity('user', 'dept')
-    await goToStep(/^4\. 규칙$/)
-    await userEvent.click(screen.getByRole('button', { name: '비교 규칙 추가' }))
+    await goToStep(/^4\. Rule$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Add comparison rule' }))
     await goToStep(/^5\. challenge$/)
-    await userEvent.click(screen.getByRole('button', { name: '정족수 승인 (quorum) 추가' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add quorum approval (quorum)' }))
 
     for (const step of [
-      /^1\. 선언$/,
-      /^2\. 발동 조건$/,
-      /^3\. source 바인딩$/,
-      /^4\. 규칙$/,
+      /^1\. Declarations$/,
+      /^2\. Trigger conditions$/,
+      /^3\. source binding$/,
+      /^4\. Rule$/,
       /^5\. challenge$/,
-      /^6\. 시험 평가$/,
-      /^7\. 제출$/,
+      /^6\. Dry run$/,
+      /^7\. Submit$/,
     ]) {
       await goToStep(step)
       expect(await auditable(container)).toEqual([])
     }
   })
 
-  it('오류가 붙은 폼에도 axe 위반이 없다', async () => {
+  it('has no axe violations on a form carrying errors', async () => {
     const { container } = await openBuilder({
       dryRun: {
         status: 400,
@@ -632,26 +644,26 @@ describe('접근성', () => {
       },
     })
     await goToStep(/^5\. challenge$/)
-    await userEvent.click(screen.getByRole('button', { name: '정족수 승인 (quorum) 추가' }))
-    await goToStep(/^6\. 시험 평가$/)
-    await userEvent.click(screen.getByRole('button', { name: '시험 평가 실행' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Add quorum approval (quorum)' }))
+    await goToStep(/^6\. Dry run$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Run dry run' }))
     await screen.findByTestId('error-summary')
     expect(await auditable(container)).toEqual([])
   })
 
-  it('저작 흐름은 키보드만으로 단계를 오간다', async () => {
+  it('moves between steps with the keyboard alone', async () => {
     await openBuilder()
-    const first = screen.getByRole('button', { name: /^1\. 선언$/ })
+    const first = screen.getByRole('button', { name: /^1\. Declarations$/ })
     first.focus()
     await userEvent.keyboard('{Enter}')
-    expect(screen.getByRole('button', { name: /^1\. 선언$/ })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: /^1\. Declarations$/ })).toHaveAttribute(
       'aria-current',
       'step',
     )
 
     await userEvent.tab()
     await userEvent.keyboard('{Enter}')
-    expect(screen.getByRole('button', { name: /^2\. 발동 조건$/ })).toHaveAttribute(
+    expect(screen.getByRole('button', { name: /^2\. Trigger conditions$/ })).toHaveAttribute(
       'aria-current',
       'step',
     )

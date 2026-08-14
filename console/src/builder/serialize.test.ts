@@ -26,7 +26,7 @@ entities:
 actions:
   - name: "can_update_todo"
   - name: "can_delete_todo"
-    description: "할 일을 지운다"
+    description: "Deletes a todo."
 sources:
   - name: "role_members"
     kind: "http"
@@ -44,7 +44,7 @@ sources:
 apiVersion: "stamp/v1"
 kind: "Policy"
 id: "todo.owner-write"
-description: "편집자는 자기 소유의 할 일을 고칠 수 있다"
+description: "An editor may update or delete a todo they own."
 subject: "user"
 resource: "todo"
 actions: ["can_update_todo", "can_delete_todo"]
@@ -77,19 +77,19 @@ function withRightConstant(draft: Draft, constant: LiteralOperand): Draft {
   }
 }
 
-describe('교환 포맷 직렬화', () => {
-  it('선언과 정책을 하나의 문서 스트림으로 쓴다', () => {
+describe('exchange format serialization', () => {
+  it('writes the declarations and the policy as one document stream', () => {
     expect(serializeDraft(sampleDraft())).toBe(GOLDEN)
   })
 
-  it('선언이 없으면 스키마 문서를 생략해 발효 중인 선언을 빌려 쓰게 한다', () => {
+  it('omits the schema document when there are no declarations, borrowing the ones in force', () => {
     const draft = sampleDraft()
     const bare: Draft = { schema: { entities: [], actions: [], sources: [] }, policy: draft.policy }
     expect(serializeDraft(bare)).not.toContain('kind: "Schema"')
     expect(serializeDraft(bare)).toBe(serializePolicy(draft.policy))
   })
 
-  it('상수는 언제나 명시적 {value, type}으로 나간다 — 태그 추론 경로를 쓰지 않는다', () => {
+  it('always writes a constant as an explicit {value, type} — never through tag inference', () => {
     const cases: readonly LiteralOperand[] = [
       { kind: 'literal', type: 'int', values: ['010'] },
       { kind: 'literal', type: 'bool', values: ['true'] },
@@ -116,7 +116,7 @@ describe('교환 포맷 직렬화', () => {
    * that tries to close the mapping it is written inside, both come out as
    * quoted string content.
    */
-  it('값 상자에 넣은 텍스트는 구조가 되지 못한다', () => {
+  it('text typed into the value box cannot become structure', () => {
     const asReference = serializePolicy(
       withRightConstant(sampleDraft(), {
         kind: 'literal',
@@ -138,7 +138,7 @@ describe('교환 포맷 직렬화', () => {
     expect(breakout.match(/type: "int"/g)).toBeNull()
   })
 
-  it('제어 문자와 줄바꿈도 스칼라 안에 갇힌다', () => {
+  it('traps control characters and newlines inside the scalar too', () => {
     const document = serializePolicy(
       withRightConstant(sampleDraft(), {
         kind: 'literal',

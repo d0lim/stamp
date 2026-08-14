@@ -89,12 +89,12 @@ check_document() {
 # The endpoint table of the decision API document, as rows.
 #
 # A row is a table line whose first cell holds a backticked pattern, under the
-# `## 엔드포인트` heading. It is the same shape internal/release parses, and it is
+# `## Endpoints` heading. It is the same shape internal/release parses, and it is
 # counted here so that deleting the table fails the release rather than making
 # the check that reads it vacuous.
 endpoint_rows() {
     awk '
-        /^## / { inside = ($0 ~ /엔드포인트/); next }
+        /^## / { inside = ($0 ~ /Endpoints/); next }
         inside && /^\|/ && index($0, "`") > 0 { rows++ }
         END { print rows + 0 }
     ' "$1"

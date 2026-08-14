@@ -13,9 +13,9 @@ import { RouteAnnouncer } from '../a11y/RouteAnnouncer'
 import type { ReactNode } from 'react'
 
 const REACHABLE: readonly { readonly to: string; readonly label: string; readonly role: ConsoleRole }[] = [
-  { to: '/policies', label: '정책 목록', role: 'author' },
-  { to: '/inbox', label: '승인함', role: 'approver' },
-  { to: '/audit', label: '감사 기록', role: 'auditor' },
+  { to: '/policies', label: 'Policy list', role: 'author' },
+  { to: '/inbox', label: 'Approval inbox', role: 'approver' },
+  { to: '/audit', label: 'Audit history', role: 'auditor' },
 ]
 
 export interface RequireRoleProps {
@@ -36,15 +36,15 @@ export function Forbidden({ required }: { readonly required: ConsoleRole }) {
 
   return (
     <div className="panel panel--refusal">
-      <RouteAnnouncer title="접근 권한 없음" />
-      <h1>이 화면에 접근할 권한이 없습니다</h1>
+      <RouteAnnouncer title="Access denied" />
+      <h1>You do not have permission to open this screen</h1>
       <p>
-        <code>{routerLocation.pathname}</code> 화면은 <strong>{ROLE_LABELS[required]}</strong> 권한이 필요합니다.
-        현재 토큰에는 그 권한이 없습니다.
+        The <code>{routerLocation.pathname}</code> screen requires the{' '}
+        <strong>{ROLE_LABELS[required]}</strong> role. Your current token does not carry it.
       </p>
       {reachable.length > 0 ? (
         <>
-          <h2>접근할 수 있는 화면</h2>
+          <h2>Screens you can reach</h2>
           <ul>
             {reachable.map((item) => (
               <li key={item.to}>
@@ -55,7 +55,8 @@ export function Forbidden({ required }: { readonly required: ConsoleRole }) {
         </>
       ) : (
         <p>
-          현재 토큰으로 접근할 수 있는 화면이 없습니다. 관리자에게 역할 부여를 요청하십시오.
+          Your current token reaches no screen in this console. Ask an administrator to grant you a
+          role.
         </p>
       )}
     </div>

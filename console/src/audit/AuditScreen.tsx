@@ -57,25 +57,27 @@ export function AuditScreen() {
 
   return (
     <div className="panel">
-      <RouteAnnouncer title="감사" />
-      <h1>감사</h1>
+      <RouteAnnouncer title="Audit" />
+      <h1>Audit</h1>
       <p>
-        결정 이력입니다. 각 결정에서 적용된 정책 버전과 사실 스냅샷은 결정을 열어 확인합니다.
+        The decision history. Open a decision to see the policy version it was evaluated under and
+        the fact snapshot it froze.
       </p>
 
       {refused ? (
         <div className="notice notice--warning" role="alert" data-testid="audit-refused">
-          <p className="notice__text">감사 이력을 조회할 자격이 없습니다.</p>
+          <p className="notice__text">You do not have auditor standing to query the audit history.</p>
           <p>
-            감사자 자격은 운영자가 설정한 토큰 claim으로 서버가 판별합니다. 자격이 없어도 자신이
-            초기화했거나 자신이 대상인 결정은 결정 식별자로 열람할 수 있습니다.
+            The server decides auditor standing from the token claim an operator configured. Without
+            it, you can still open the decisions you initiated or are the subject of, by decision
+            identifier.
           </p>
         </div>
       ) : null}
 
       {error === null || refused ? null : (
         <p className="notice notice--warning" role="alert" data-testid="audit-error">
-          결정 이력을 읽지 못했습니다: {error}
+          The decision history could not be read: {error}
         </p>
       )}
 
@@ -88,7 +90,7 @@ export function AuditScreen() {
       >
         <div className="field">
           <label className="field__label" htmlFor="audit-from">
-            기간 시작 (RFC 3339)
+            Period start (RFC 3339)
           </label>
           <input
             id="audit-from"
@@ -101,7 +103,7 @@ export function AuditScreen() {
         </div>
         <div className="field">
           <label className="field__label" htmlFor="audit-to">
-            기간 끝 (미포함)
+            Period end (exclusive)
           </label>
           <input
             id="audit-to"
@@ -114,7 +116,7 @@ export function AuditScreen() {
         </div>
         <div className="field">
           <label className="field__label" htmlFor="audit-policy">
-            정책
+            Policy
           </label>
           <input
             id="audit-policy"
@@ -126,7 +128,7 @@ export function AuditScreen() {
         </div>
         <div className="field">
           <label className="field__label" htmlFor="audit-subject">
-            주체
+            Subject
           </label>
           <input
             id="audit-subject"
@@ -138,7 +140,7 @@ export function AuditScreen() {
         </div>
         <div className="field">
           <label className="field__label" htmlFor="audit-state">
-            상태
+            State
           </label>
           <select
             id="audit-state"
@@ -146,7 +148,7 @@ export function AuditScreen() {
             value={draft.state}
             onChange={(event) => setDraft({ ...draft, state: event.target.value })}
           >
-            <option value="">전체</option>
+            <option value="">All</option>
             {DECISION_STATES.map((state) => (
               <option key={state} value={state}>
                 {STATE_LABELS[state] ?? state}
@@ -155,37 +157,37 @@ export function AuditScreen() {
           </select>
         </div>
         <button type="submit" className="button button--primary" data-testid="audit-search">
-          조회
+          Search
         </button>
       </form>
 
       {page === null ? (
-        refused ? null : <p>결정 이력을 읽는 중입니다…</p>
+        refused ? null : <p>Reading the decision history…</p>
       ) : (
         <>
           <p role="status" data-testid="audit-applied">
-            적용된 조회: 정렬 {page.query.order} · 페이지 크기 {page.query.limit}
-            {page.query.from === undefined ? '' : ` · ${page.query.from} 이후`}
-            {page.query.to === undefined ? '' : ` · ${page.query.to} 이전`}
-            {page.query.policy === undefined ? '' : ` · 정책 ${page.query.policy}`}
-            {page.query.subject === undefined ? '' : ` · 주체 ${page.query.subject}`}
-            {page.query.state === undefined ? '' : ` · 상태 ${page.query.state}`}
-            {` · ${page.decisions.length}건`}
+            Applied query: order {page.query.order} · page size {page.query.limit}
+            {page.query.from === undefined ? '' : ` · from ${page.query.from}`}
+            {page.query.to === undefined ? '' : ` · until ${page.query.to}`}
+            {page.query.policy === undefined ? '' : ` · policy ${page.query.policy}`}
+            {page.query.subject === undefined ? '' : ` · subject ${page.query.subject}`}
+            {page.query.state === undefined ? '' : ` · state ${page.query.state}`}
+            {` · ${page.decisions.length} decisions`}
           </p>
 
           {page.decisions.length === 0 ? (
-            <p data-testid="audit-empty">조회 조건에 맞는 결정이 없습니다.</p>
+            <p data-testid="audit-empty">No decision matches the query.</p>
           ) : (
             <table className="audit-table" data-testid="audit-table">
-              <caption>결정 이력 (최신순)</caption>
+              <caption>Decision history (newest first)</caption>
               <thead>
                 <tr>
-                  <th scope="col">결정</th>
-                  <th scope="col">정책</th>
-                  <th scope="col">주체</th>
-                  <th scope="col">액션</th>
-                  <th scope="col">상태</th>
-                  <th scope="col">생성</th>
+                  <th scope="col">Decision</th>
+                  <th scope="col">Policy</th>
+                  <th scope="col">Subject</th>
+                  <th scope="col">Action</th>
+                  <th scope="col">State</th>
+                  <th scope="col">Created</th>
                 </tr>
               </thead>
               <tbody>
@@ -219,7 +221,7 @@ export function AuditScreen() {
                 setCursor(previous)
               }}
             >
-              이전 페이지
+              Previous page
             </button>
             <button
               type="button"
@@ -231,7 +233,7 @@ export function AuditScreen() {
                 setCursor(page.next_cursor ?? '')
               }}
             >
-              다음 페이지
+              Next page
             </button>
           </div>
         </>

@@ -69,7 +69,11 @@ export function defaultLanding(roles: ReadonlySet<ConsoleRole>): string {
 }
 
 export const ROLE_LABELS: Readonly<Record<ConsoleRole, string>> = {
-  author: '정책 저작',
-  approver: '승인',
-  auditor: '감사',
+  // Person nouns, not activities. The strip these render in reads "No roles"
+  // when empty, so the filled state has to name roles too — and the navigation
+  // already has an item labelled "Audit" for the screen, so the role wants a
+  // word that cannot be mistaken for it.
+  author: 'Policy author',
+  approver: 'Approver',
+  auditor: 'Auditor',
 }

@@ -38,22 +38,25 @@ import { Field, FieldGroup } from './Field'
 import type { PlacedDiagnostics } from './diagnostics'
 import { fieldId, jptr } from './pointer'
 
+// Each label names the challenge and then, in parentheses, the `type` value the
+// document will carry — so an author reading the form and an approver reading
+// the diff are looking at the same four things under the same four names.
 const CHALLENGE_LABELS: Readonly<Record<ChallengeType, string>> = {
-  quorum: '정족수 승인 (quorum)',
-  mfa: '재인증 (mfa)',
-  delay: '대기 (delay)',
-  external: '외부 승인 (external)',
+  quorum: 'quorum approval (quorum)',
+  mfa: 're-authentication (mfa)',
+  delay: 'wait (delay)',
+  external: 'external approval (external)',
 }
 
 const APPROVER_LABELS: Readonly<Record<ApproverMode, string>> = {
-  members: '명시적 목록',
-  claim: '토큰 claim',
-  source: 'IdP 그룹 source',
+  members: 'explicit list',
+  claim: 'token claim',
+  source: 'IdP group source',
 }
 
 const MFA_LABELS: Readonly<Record<MFAMode, string>> = {
-  delegated: '위임 (delegated) — IdP가 step-up을 수행',
-  direct: '직접 (direct) — v1 미구현',
+  delegated: 'delegated — the IdP performs the step-up',
+  direct: 'direct — not implemented in v1',
 }
 
 function ApproverSetEditor({
@@ -76,7 +79,7 @@ function ApproverSetEditor({
     <FieldGroup pointer={pointer} legend={legend} placed={placed} className="group group--nested">
       <div className="field">
         <label className="field__label" htmlFor={`${fieldId(pointer)}--mode`}>
-          해석 방식
+          Resolution
         </label>
         <select
           id={`${fieldId(pointer)}--mode`}
@@ -97,7 +100,7 @@ function ApproverSetEditor({
             <Field
               key={index}
               pointer={jptr(pointer, 'members', index)}
-              label={`승인자 ${index + 1}`}
+              label={`Approver ${index + 1}`}
               placed={placed}
             >
               {(props) => (
@@ -123,12 +126,12 @@ function ApproverSetEditor({
           className="button"
           onClick={() => onChange({ ...set, members: [...set.members, ''] })}
         >
-          승인자 추가
+          Add approver
         </button>
       ) : null}
 
       {set.mode === 'claim' ? (
-        <Field pointer={jptr(pointer, 'claim')} label="claim 이름" placed={placed}>
+        <Field pointer={jptr(pointer, 'claim')} label="claim name" placed={placed}>
           {(props) => (
             <input
               {...props}
@@ -145,8 +148,8 @@ function ApproverSetEditor({
         <>
           <Field
             pointer={jptr(pointer, 'source')}
-            label="IdP 그룹 source"
-            hint="list<string>을 반환하는 idp_group source만 승인자 집합으로 해석됩니다."
+            label="IdP group source"
+            hint="Only an idp_group source that returns list<string> is resolved as an approver set."
             placed={placed}
           >
             {(props) => (
@@ -166,7 +169,7 @@ function ApproverSetEditor({
                   })
                 }}
               >
-                <option value="">선택하십시오</option>
+                <option value="">Select one</option>
                 {draft.schema.sources.map((source) => (
                   <option key={source.name} value={source.name}>
                     {source.name} → {source.returns}
@@ -182,7 +185,7 @@ function ApproverSetEditor({
               <Field
                 key={param.name}
                 pointer={jptr(pointer, 'args', index)}
-                label={`인자 ${param.name} (${param.type})`}
+                label={`Argument ${param.name} (${param.type})`}
                 placed={placed}
               >
                 {(props) => (
@@ -236,8 +239,8 @@ function ChallengeFields({
         <>
           <Field
             pointer={jptr(pointer, 'threshold')}
-            label="정족수"
-            hint="이 정책이 걸린 결정을 통과시키는 데 필요한 서로 다른 승인 수입니다."
+            label="Quorum"
+            hint="The number of distinct approvals a decision this policy gates needs before it passes."
             placed={placed}
           >
             {(props) => (
@@ -257,7 +260,7 @@ function ChallengeFields({
             draft={draft}
             placed={placed}
             pointer={jptr(pointer, 'approvers')}
-            legend="승인자 집합"
+            legend="Approver set"
             set={challenge.approvers}
             onChange={(approvers) => onChange({ ...challenge, approvers })}
           />
@@ -266,7 +269,7 @@ function ChallengeFields({
     case 'mfa':
       return (
         <>
-          <Field pointer={jptr(pointer, 'mode')} label="방식" placed={placed}>
+          <Field pointer={jptr(pointer, 'mode')} label="Mode" placed={placed}>
             {(props) => (
               <select
                 {...props}
@@ -288,7 +291,7 @@ function ChallengeFields({
             <Field
               key={index}
               pointer={jptr(pointer, 'acr_values', index)}
-              label={`허용 acr ${index + 1}`}
+              label={`Allowed acr ${index + 1}`}
               placed={placed}
             >
               {(props) => (
@@ -314,7 +317,7 @@ function ChallengeFields({
             className="button"
             onClick={() => onChange({ ...challenge, acrValues: [...challenge.acrValues, ''] })}
           >
-            acr 값 추가
+            Add acr value
           </button>
         </>
       )
@@ -323,8 +326,8 @@ function ChallengeFields({
         <>
           <Field
             pointer={jptr(pointer, 'duration')}
-            label="대기 시간"
-            hint="1h30m 처럼 씁니다."
+            label="Wait duration"
+            hint="Written like 1h30m."
             placed={placed}
           >
             {(props) => (
@@ -346,7 +349,7 @@ function ChallengeFields({
               onChange={(event) => onChange({ ...challenge, cancellable: event.target.checked })}
             />
             <label className="field__label" htmlFor={`${fieldId(pointer)}--cancellable`}>
-              대기 중 취소를 허용한다
+              Allow cancellation while waiting
             </label>
           </div>
           {challenge.cancellable ? (
@@ -354,7 +357,7 @@ function ChallengeFields({
               draft={draft}
               placed={placed}
               pointer={jptr(pointer, 'cancellable_by')}
-              legend="취소 권한"
+              legend="Who may cancel"
               set={challenge.cancellableBy}
               onChange={(cancellableBy) => onChange({ ...challenge, cancellableBy })}
             />
@@ -365,19 +368,19 @@ function ChallengeFields({
       return (
         <Field
           pointer={jptr(pointer, 'target')}
-          label="외부 대상"
-          hint="운영자 egress 허용목록에 있는 대상만 고를 수 있습니다. 자유 입력이 아닙니다."
+          label="External target"
+          hint="Only a target on the operator's egress allowlist can be chosen. This is not a free-text field."
           placed={placed}
         >
           {(props) =>
             egressTargets.length === 0 ? (
               <>
                 <select {...props} className="control" value="" disabled>
-                  <option value="">선택할 수 있는 대상이 없습니다</option>
+                  <option value="">No target is available</option>
                 </select>
                 <p className="field__hint" data-testid="egress-empty">
-                  이 배포에는 콘솔이 읽을 수 있는 egress 허용목록이 없습니다. 필요한 대상을 운영자에게
-                  요청해 허용목록에 등록한 뒤 다시 선택하십시오.
+                  This deployment exposes no egress allowlist the console can read. Ask the operator
+                  to add the target you need to the allowlist, then select it here.
                 </p>
               </>
             ) : (
@@ -387,7 +390,7 @@ function ChallengeFields({
                 value={challenge.target}
                 onChange={(event) => onChange({ ...challenge, target: event.target.value })}
               >
-                <option value="">선택하십시오</option>
+                <option value="">Select one</option>
                 {egressTargets.map((target) => (
                   <option key={target} value={target}>
                     {target}
@@ -419,8 +422,8 @@ export function ChallengeEditor({
     <div className="challenges">
       {challenges.length === 0 ? (
         <p>
-          challenge가 없는 정책은 check 경로에서 즉시 판정됩니다. 사람의 승인이나 대기가 필요하면
-          아래에서 추가하십시오.
+          A policy with no challenge is judged immediately on the check path. If it needs a human
+          approval or a wait, add one below.
         </p>
       ) : null}
       {challenges.map((challenge, index) => (
@@ -444,7 +447,7 @@ export function ChallengeEditor({
             className="button button--quiet"
             onClick={() => onChange(challenges.filter((_, i) => i !== index))}
           >
-            {CHALLENGE_LABELS[challenge.type]} 삭제
+            Delete {CHALLENGE_LABELS[challenge.type]}
           </button>
         </FieldGroup>
       ))}
@@ -457,7 +460,7 @@ export function ChallengeEditor({
             data-challenge-type={type}
             onClick={() => onChange([...challenges, newChallenge(type)])}
           >
-            {CHALLENGE_LABELS[type]} 추가
+            Add {CHALLENGE_LABELS[type]}
           </button>
         ))}
       </div>

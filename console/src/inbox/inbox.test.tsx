@@ -51,11 +51,11 @@ function twelvePolicyDelta() {
     changes: Array.from({ length: 12 }, (_, index) => ({
       kind: index === 0 ? ('modify' as const) : ('modify' as const),
       policy_id: `policy-${index}`,
-      before: policyDocument(`policy-${index}`, 3, `이전 ${index}`),
+      before: policyDocument(`policy-${index}`, 3, `before ${index}`),
       // Only policy-0 lowers its quorum, which is what makes it the weakening
       // one; every policy changes something, because a delta of twelve
       // policies where eleven are identical is not the case being tested.
-      after: policyDocument(`policy-${index}`, index === 0 ? 1 : 3, `개정 ${index}`),
+      after: policyDocument(`policy-${index}`, index === 0 ? 1 : 3, `revised ${index}`),
     })),
   }
 }
@@ -63,7 +63,7 @@ function twelvePolicyDelta() {
 const WEAKENING_FINDING = {
   subject: 'policy-0',
   reason: 'quorum_lowered',
-  detail: '정족수가 3에서 1로 낮아집니다',
+  detail: 'the quorum drops from 3 to 1',
 }
 
 function review(overrides: Record<string, unknown> = {}) {
@@ -204,8 +204,8 @@ async function entryList(expected: number): Promise<HTMLElement> {
 // R21: the list
 // ---------------------------------------------------------------------------
 
-describe('승인함 목록', () => {
-  it('서버가 준 순서를 그대로 쓰고 서버 시계로 잔여 시간을 계산한다', async () => {
+describe('the approval inbox list', () => {
+  it('keeps the order the server gave and computes time remaining on the server clock', async () => {
     const items = [
       {
         decision_id: 'soon',
@@ -249,19 +249,19 @@ describe('승인함 목록', () => {
 
     // The browser's clock is not consulted: the remaining time is the gap
     // between the server's expiry and the server's own now.
-    expect(screen.getByTestId('inbox-remaining-soon')).toHaveTextContent('30분')
-    expect(screen.getByTestId('inbox-remaining-later')).toHaveTextContent('1일 0시간')
+    expect(screen.getByTestId('inbox-remaining-soon')).toHaveTextContent('30 minutes')
+    expect(screen.getByTestId('inbox-remaining-later')).toHaveTextContent('1 day 0 hours')
     expect(screen.getByTestId('inbox-progress-soon')).toHaveTextContent('1 / 2')
   })
 
-  it('빈 승인함은 빈 목록이라고 말한다', async () => {
+  it('says an empty inbox is an empty list', async () => {
     renderShell({ roles: ['approver'], route: '/inbox', fetchImpl: stub().impl })
     expect(await screen.findByTestId('inbox-empty')).toBeInTheDocument()
   })
 
-  it('잔여 시간은 0분이라고 말하지 않는다', () => {
-    expect(remaining('2026-08-10T12:00:30Z', SERVER_NOW)).toBe('1분 미만')
-    expect(remaining('2026-08-10T11:59:00Z', SERVER_NOW)).toBe('만료됨')
+  it('never states the time remaining as 0 minutes', () => {
+    expect(remaining('2026-08-10T12:00:30Z', SERVER_NOW)).toBe('under 1 minute')
+    expect(remaining('2026-08-10T11:59:00Z', SERVER_NOW)).toBe('expired')
   })
 })
 
@@ -269,8 +269,8 @@ describe('승인함 목록', () => {
 // R55: collapse is compression, and the gate
 // ---------------------------------------------------------------------------
 
-describe('접힘과 승인 게이트', () => {
-  it('정책별로 접히고 완화 항목이 펼쳐진 채 맨 위에 온다', async () => {
+describe('collapse and the approve gate', () => {
+  it('collapses per policy and puts the weakening entry first, expanded', async () => {
     renderApproval()
     const list = await entryList(17)
     const triggers = within(list).getAllByRole('button')
@@ -283,11 +283,11 @@ describe('접힘과 승인 게이트', () => {
     expect(triggers[1]).toHaveAttribute('aria-expanded', 'false')
 
     // Collapsed or not, the summary states the totals (R23).
-    expect(screen.getByTestId('delta-summary')).toHaveTextContent('변경된 정책 12건')
-    expect(screen.getByTestId('delta-summary')).toHaveTextContent('완화로 분류된 항목 1건')
+    expect(screen.getByTestId('delta-summary')).toHaveTextContent('12 policies changed')
+    expect(screen.getByTestId('delta-summary')).toHaveTextContent('1 classified as weakening')
   })
 
-  it('접힌 항목의 내용이 DOM에 남아 스크린 리더와 페이지 내 검색에 잡힌다', async () => {
+  it('leaves a collapsed entry in the DOM, reachable by screen reader and find-in-page', async () => {
     renderApproval()
     await entryList(17)
 
@@ -306,26 +306,26 @@ describe('접힘과 승인 게이트', () => {
     expect(region.closest('[aria-hidden="true"]')).toBeNull()
   })
 
-  it('모든 항목을 펼치기 전에는 승인 버튼이 비활성이다', async () => {
+  it('keeps the approve button disabled until every entry has been expanded', async () => {
     const user = userEvent.setup()
     renderApproval()
     await entryList(17)
 
     const approve = screen.getByTestId('approve')
     expect(approve).toBeDisabled()
-    expect(screen.getByTestId('approve-gate')).toHaveTextContent('아직 펼치지 않은 항목이 16건')
+    expect(screen.getByTestId('approve-gate')).toHaveTextContent('16 entries have not been expanded')
 
     // Opening one entry is not enough, and the gate says how many are left.
     await user.click(screen.getByRole('button', { name: /^policy-1\b/u }))
     expect(approve).toBeDisabled()
-    expect(screen.getByTestId('approve-gate')).toHaveTextContent('15건')
+    expect(screen.getByTestId('approve-gate')).toHaveTextContent('15 entries')
 
     // A disabled button is not merely styled disabled — it cannot be pressed.
     await user.click(approve)
     expect(screen.queryByTestId('submit-result')).toBeNull()
   })
 
-  it('항목을 하나씩 전부 펼치면 승인 버튼이 열린다', async () => {
+  it('opens the approve button once every entry has been expanded one at a time', async () => {
     const user = userEvent.setup()
     renderApproval()
     const list = await entryList(17)
@@ -337,7 +337,7 @@ describe('접힘과 승인 게이트', () => {
     expect(approve).toBeEnabled()
   })
 
-  it('모두 펼치기 한 번으로도 게이트가 열리고, 다시 접어도 닫히지 않는다', async () => {
+  it('opens the gate with one expand-all, and collapsing again does not close it', async () => {
     const user = userEvent.setup()
     renderApproval()
     await entryList(17)
@@ -357,7 +357,7 @@ describe('접힘과 승인 게이트', () => {
     expect(approve).toBeEnabled()
   })
 
-  it('펼침·접힘이 키보드로 조작되고 aria-expanded가 따라온다', async () => {
+  it('expands and collapses from the keyboard, with aria-expanded following', async () => {
     const user = userEvent.setup()
     renderApproval()
     await entryList(17)
@@ -371,12 +371,13 @@ describe('접힘과 승인 게이트', () => {
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
   })
 
-  it('변경 유형이 색 외 수단으로도 구분된다', async () => {
+  it('distinguishes the change kind by more than colour', async () => {
     renderApproval()
     await entryList(17)
     const fields = screen.getByTestId('diff-policy-0-fields')
-    // The kind is a word. Greyscale, a screen reader and find-in-page all get it.
-    expect(within(fields).getAllByText('수정').length).toBeGreaterThan(0)
+    // The kind is a word — the shared diff's own label, not this screen's.
+    // Greyscale, a screen reader and find-in-page all get it.
+    expect(within(fields).getAllByText('Changed').length).toBeGreaterThan(0)
   })
 })
 
@@ -384,22 +385,22 @@ describe('접힘과 승인 게이트', () => {
 // R31: the hash, and what it covers
 // ---------------------------------------------------------------------------
 
-describe('승인 바인딩 해시', () => {
-  it('해시와 그 범위를 보여주고, 덮지 않는 것도 명시한다', async () => {
+describe('the approval binding hash', () => {
+  it('shows the hash and its reach, and states what it does not cover', async () => {
     renderApproval()
     expect(await screen.findByTestId('binding-hash')).toHaveTextContent('f00dbabe')
 
     const covered = screen.getByTestId('binding-covered')
-    expect(covered).toHaveTextContent('사실 스냅샷')
-    expect(covered).toHaveTextContent('의무')
-    expect(covered).toHaveTextContent('승인자 집합')
+    expect(covered).toHaveTextContent('Fact snapshot')
+    expect(covered).toHaveTextContent('Obligations')
+    expect(covered).toHaveTextContent('Approver set')
 
     const notCovered = screen.getByTestId('binding-not-covered')
-    expect(notCovered).toHaveTextContent('정족수 임계값')
-    expect(notCovered).toHaveTextContent('정책 버전')
+    expect(notCovered).toHaveTextContent('Quorum threshold')
+    expect(notCovered).toHaveTextContent('Policy version')
   })
 
-  it('표시된 자료 집합이 해시 입력 집합과 일치한다', async () => {
+  it('displays exactly the material set the hash takes as input', async () => {
     renderApproval()
     await entryList(17)
     // One entry per hash input, and no entry that is not one.
@@ -411,12 +412,12 @@ describe('승인 바인딩 해시', () => {
       'material:obligations',
       'material:approvers',
     ])
-    for (const title of ['요청 (request)', '사실 스냅샷 (fact snapshot)', '의무 (obligations)', '승인자 집합']) {
-      expect(screen.getByRole('button', { name: new RegExp(title.split(' ')[0] ?? title) })).toBeInTheDocument()
+    for (const title of ['Request', 'Fact snapshot', 'Obligations', 'Approver set']) {
+      expect(screen.getByRole('button', { name: new RegExp(`^${title}\\b`, 'u') })).toBeInTheDocument()
     }
   })
 
-  it('서버가 내려준 해시를 그대로 제출에 싣는다', async () => {
+  it('submits the hash the server sent, verbatim', async () => {
     const user = userEvent.setup()
     const { calls } = renderApproval()
     await entryList(17)
@@ -428,15 +429,15 @@ describe('승인 바인딩 해시', () => {
     expect(submission?.body).toEqual({ verdict: 'approve', binding_hash: 'f00dbabe' })
   })
 
-  it('결정이 고정한 digest와 다른 delta는 그리지 않는다', async () => {
+  it('does not draw a delta whose digest is not the one the decision froze', async () => {
     renderApproval({ proposal: { status: 200, body: proposal({ delta_digest: 'deadbeef' }) } })
     expect(await screen.findByTestId('digest-mismatch')).toBeInTheDocument()
     // The material entries are still there; the delta is not.
     expect(screen.queryByTestId('diff-policy-0-fields')).toBeNull()
-    expect(screen.getByTestId('delta-summary')).toHaveTextContent('변경된 정책 0건')
+    expect(screen.getByTestId('delta-summary')).toHaveTextContent('0 policies changed')
   })
 
-  it('HTML 페이로드가 담긴 사실 스냅샷을 이스케이프해 표시한다', async () => {
+  it('escapes a fact snapshot carrying an HTML payload', async () => {
     const { container } = renderApproval()
     await entryList(17)
     expect(container.querySelector('script')).toBeNull()
@@ -448,7 +449,7 @@ describe('승인 바인딩 해시', () => {
 // R21: the submission failures
 // ---------------------------------------------------------------------------
 
-describe('제출 실패', () => {
+describe('submission failures', () => {
   // Status and code together, because they are what the server sends together.
   // The one that changed is the last: `403 not_an_approver` is gone, and being
   // outside the approver set now arrives as the same `404 not_found` a decision
@@ -456,14 +457,14 @@ describe('제출 실패', () => {
   // server no longer sends, and passed — a stub asserts against itself, so it
   // stayed green while the branch it exercised became dead.
   const cases: readonly (readonly [number, string, string])[] = [
-    [409, 'expired', '만료되었습니다'],
-    [409, 'not_collecting', '더 이상 제출을 받지 않습니다'],
-    [409, 'material_changed', '결정 내용이 바뀌어'],
-    [404, 'not_found', '존재하지 않거나, 당신에게 열려 있지 않습니다'],
+    [409, 'expired', 'This decision has expired'],
+    [409, 'not_collecting', 'no longer takes submissions'],
+    [409, 'material_changed', 'The decision changed after it was displayed'],
+    [404, 'not_found', 'it does not exist, or it is not open to you'],
   ]
 
   for (const [status, code, phrase] of cases) {
-    it(`${code}는 전용 문구와 후속 동작을 보여준다`, async () => {
+    it(`${code} gets its own words and its own next step`, async () => {
       const user = userEvent.setup()
       renderApproval({ submit: { status, body: { error: code, message: 'server wording' } } })
       await entryList(17)
@@ -478,7 +479,7 @@ describe('제출 실패', () => {
     })
   }
 
-  it('404는 없는 결정인지 남의 결정인지 말하지 않고, 승인함으로 돌려보낸다', async () => {
+  it('does not say which of the two a 404 was, and sends the approver back to the inbox', async () => {
     // The server made the two indistinguishable on purpose, so the console must
     // not word one of them. What it can do is point at the surface that still
     // tells the truth: the inbox lists what is waiting on you, and omitting what
@@ -490,13 +491,13 @@ describe('제출 실패', () => {
     await user.click(screen.getByTestId('approve'))
 
     const failure = await screen.findByTestId('submit-failure')
-    expect(failure).toHaveTextContent('승인함 목록을 다시 읽으십시오')
-    for (const forbidden of ['기다리고 있지 않습니다', '권한이 없습니다']) {
+    expect(failure).toHaveTextContent('Read the approval inbox again')
+    for (const forbidden of ['is not waiting on you', 'do not have permission']) {
       expect(failure).not.toHaveTextContent(forbidden)
     }
   })
 
-  it('429 rate_limited는 기다리라고 말하지, 운영자에게 가라고 하지 않는다', async () => {
+  it('words a 429 rate_limited as a wait, and does not send the approver to an operator', async () => {
     // The budget refills on a timer (R43). Sending the approver to an operator
     // — which is what the generic branch does — is the one piece of advice that
     // makes the situation worse: the operator has nothing to do, and the
@@ -515,15 +516,15 @@ describe('제출 실패', () => {
     await user.click(screen.getByTestId('approve'))
 
     const failure = await screen.findByTestId('submit-failure')
-    expect(failure).toHaveTextContent('30초')
-    expect(failure).toHaveTextContent('다시 누르십시오')
+    expect(failure).toHaveTextContent('about 30 seconds')
+    expect(failure).toHaveTextContent('press the approve button again')
     // And it says the approval did not land, because an approver who thinks it
     // might have walks away from a quorum still one short.
-    expect(failure).toHaveTextContent('기록되지 않았습니다')
-    expect(failure).not.toHaveTextContent('운영자에게 이 화면의 결정 식별자를 전달')
+    expect(failure).toHaveTextContent('was not recorded')
+    expect(failure).not.toHaveTextContent('give an operator the decision identifier')
   })
 
-  it('Retry-After가 없으면 숫자를 지어내지 않고 그래도 기다리라고 말한다', async () => {
+  it('invents no number when Retry-After is missing, and still says to wait', async () => {
     // The header can be absent for reasons that are not about this deployment's
     // budget — a cross-origin response that does not expose it, a proxy that
     // dropped it. The advice is unchanged; only the number goes.
@@ -536,13 +537,13 @@ describe('제출 실패', () => {
     await user.click(screen.getByTestId('approve'))
 
     const failure = await screen.findByTestId('submit-failure')
-    expect(failure).toHaveTextContent('잠시 기다린 뒤')
+    expect(failure).toHaveTextContent('Wait a moment')
     expect(failure).not.toHaveTextContent('NaN')
     expect(failure).not.toHaveTextContent('undefined')
-    expect(failure).not.toHaveTextContent('운영자에게 이 화면의 결정 식별자를 전달')
+    expect(failure).not.toHaveTextContent('give an operator the decision identifier')
   })
 
-  it('코드를 읽을 수 없는 429도 기다림으로 읽힌다 — 중간자가 흘린 경우', async () => {
+  it('reads a 429 with no code as a wait too — the intermediary case', async () => {
     // The two cases above both carry `rate_limited` in the body, so either half
     // of `cause.isRateLimited || body?.error === RATE_LIMITED` alone keeps them
     // green — the mutation audit removed each half in turn and neither showed
@@ -564,12 +565,12 @@ describe('제출 실패', () => {
     await user.click(screen.getByTestId('approve'))
 
     const failure = await screen.findByTestId('submit-failure')
-    expect(failure).toHaveTextContent('기록되지 않았습니다')
-    expect(failure).toHaveTextContent('다시 누르십시오')
-    expect(failure).not.toHaveTextContent('운영자에게 이 화면의 결정 식별자를 전달')
+    expect(failure).toHaveTextContent('was not recorded')
+    expect(failure).toHaveTextContent('press the approve button again')
+    expect(failure).not.toHaveTextContent('give an operator the decision identifier')
   })
 
-  it('읽기가 실패하면 직전에 성공한 검토 화면은 남지 않는다', async () => {
+  it('leaves no previously successful review body behind when a read fails', async () => {
     // This screen re-reads while it is open, so a read that stops working has a
     // previous one to leave behind. Left behind, the "cannot be opened" notice
     // renders on top of a full review body with a live approve button under it:
@@ -593,25 +594,25 @@ describe('제출 실패', () => {
     await user.click(screen.getByTestId('approve'))
 
     const notice = await screen.findByTestId('review-unavailable')
-    expect(notice).toHaveTextContent('존재하지 않거나, 당신에게 열려 있지 않습니다')
+    expect(notice).toHaveTextContent('it does not exist, or it is not open to you')
     await waitFor(() => expect(screen.queryByTestId('entry-list')).toBeNull())
     expect(screen.queryByTestId('approve')).toBeNull()
     expect(screen.queryByTestId('binding-hash')).toBeNull()
     // And not the loading line either: the read finished, it just did not give
     // us anything.
-    expect(screen.queryByText('승인 자료를 읽는 중입니다…')).toBeNull()
+    expect(screen.queryByText('Reading the approval material…')).toBeNull()
   })
 
-  it('열 수 없는 승인 화면은 오류가 아니라 거부로 말한다', async () => {
+  it('words an approval screen that cannot be opened as a refusal, not an error', async () => {
     // The read surface collapsed the same way the submission did, so the first
-    // load of a decision that is not yours answers 404. "읽지 못했습니다" would
-    // read as an outage and invite a retry that cannot succeed.
+    // load of a decision that is not yours answers 404. "could not be read"
+    // would read as an outage and invite a retry that cannot succeed.
     renderApproval({ review: { status: 404, body: { error: 'not_found', message: 'no such decision or challenge' } } })
 
     const notice = await screen.findByTestId('review-unavailable')
-    expect(notice).toHaveTextContent('존재하지 않거나, 당신에게 열려 있지 않습니다')
+    expect(notice).toHaveTextContent('it does not exist, or it is not open to you')
     expect(screen.queryByTestId('review-error')).toBeNull()
-    expect(screen.queryByText('승인 자료를 읽는 중입니다…')).toBeNull()
+    expect(screen.queryByText('Reading the approval material…')).toBeNull()
   })
 })
 
@@ -619,8 +620,8 @@ describe('제출 실패', () => {
 // pure helpers
 // ---------------------------------------------------------------------------
 
-describe('개정 참조와 요약', () => {
-  it('거버넌스 결정의 요청에서 제안 식별자와 digest를 읽는다', () => {
+describe('the revision reference and the summary', () => {
+  it('reads the proposal identifier and digest out of a governance decision request', () => {
     expect(revisionRefOf(review().decision.request)).toEqual({
       proposalID: PROPOSAL_ID,
       deltaDigest: DELTA_DIGEST,
@@ -629,7 +630,7 @@ describe('개정 참조와 요약', () => {
     expect(revisionRefOf('nonsense')).toBeNull()
   })
 
-  it('완화 항목이 앞에 오고 요약이 건수를 센다', () => {
+  it('puts weakening entries first and counts them in the summary', () => {
     const entries = policyEntries(twelvePolicyDelta(), [WEAKENING_FINDING])
     expect(entries[0]?.id).toBe('policy:policy-0')
     expect(entries[0]?.weakening).toBe(true)
@@ -647,11 +648,11 @@ async function auditable(container: HTMLElement): Promise<string[]> {
     // which runs a real browser, and stated with ratios in the stylesheets.
     rules: { 'color-contrast': { enabled: false } },
   })
-  return results.violations.map((v) => `${v.id}: ${v.help} (${v.nodes.length}곳)`)
+  return results.violations.map((v) => `${v.id}: ${v.help} (${v.nodes.length} nodes)`)
 }
 
-describe('승인함 접근성', () => {
-  it('목록 화면에 axe 위반이 없다', async () => {
+describe('approval inbox accessibility', () => {
+  it('has no axe violation on the list screen', async () => {
     const { container } = renderShell({
       roles: ['approver'],
       route: '/inbox',
@@ -684,7 +685,7 @@ describe('승인함 접근성', () => {
     expect(await auditable(container)).toEqual([])
   })
 
-  it('승인 상세 화면에 axe 위반이 없다 — 접힌 상태와 펼친 상태 모두', async () => {
+  it('has no axe violation on the approval detail screen, collapsed or expanded', async () => {
     const user = userEvent.setup()
     const { container } = renderApproval()
     await entryList(17)

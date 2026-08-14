@@ -5,7 +5,7 @@
  * sits on, for the same reason styles.css does it: R55 asks for 4.5:1 on the
  * approval and audit screens too, and a ratio that is only checked in a browser
  * is a ratio nobody checks. The change kind is never carried by colour alone —
- * the row's text says 추가/수정/삭제 and the mark says +/−/~ — so these are
+ * the row's text says Added/Changed/Removed and the mark says +/−/~ — so these are
  * reinforcement, not information.
  */
 

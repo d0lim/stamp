@@ -17,7 +17,7 @@ import { ConfigError, loadRuntimeConfig } from './config/runtime-config'
 import './styles.css'
 
 const container = document.getElementById('root')
-if (!container) throw new Error('#root가 문서에 없습니다.')
+if (!container) throw new Error('#root is not in the document.')
 const root = createRoot(container)
 
 void (async () => {
@@ -37,7 +37,7 @@ void (async () => {
     root.render(
       <StrictMode>
         <ConfigErrorScreen
-          message={error?.message ?? '콘솔을 시작하지 못했습니다.'}
+          message={error?.message ?? 'The console did not start.'}
           {...(error?.detail ? { detail: error.detail } : {})}
         />
       </StrictMode>,

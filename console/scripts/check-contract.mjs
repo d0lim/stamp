@@ -176,8 +176,8 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
           report(
             'seam',
             node,
-            `${node.text}은(는) API 클라이언트 밖에서 쓸 수 없습니다. ` +
-              `모든 호출은 src/api/client.ts를 지나야 계약 검사가 성립합니다.`,
+            `${node.text} cannot be used outside the API client. ` +
+              `Every call has to pass through src/api/client.ts for the contract check to mean anything.`,
           )
         }
       }
@@ -187,8 +187,8 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
         report(
           'origin',
           node,
-          `${node.text}은(는) 콘솔에서 읽지 않습니다 (R50). ` +
-            `설정은 서버가 내려주는 문서에서만 옵니다.`,
+          `${node.text} is never read by the console (R50). ` +
+            `Configuration comes only from the document the server supplies.`,
         )
       }
       if (ts.isIdentifier(node) && node.text === 'sessionStorage' && !isDeclarationName(node)) {
@@ -196,7 +196,7 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
           report(
             'origin',
             node,
-            'sessionStorage는 OIDC 리다이렉트 왕복 상태에만 쓰입니다 (src/auth/oidc.ts).',
+            'sessionStorage carries the OIDC redirect round trip and nothing else (src/auth/oidc.ts).',
           )
         }
       }
@@ -211,8 +211,8 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
           report(
             'origin',
             node,
-            `window.location.${node.name.text}은(는) OIDC 콜백 화면에서만 읽습니다. ` +
-              `질의 문자열과 조각은 설정 채널이 아닙니다 (R50).`,
+            `window.location.${node.name.text} is read on the OIDC callback screen alone. ` +
+              `The query string and the fragment are not configuration channels (R50).`,
           )
         }
       }
@@ -223,17 +223,17 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
           report(
             'codes',
             node,
-            '응답 본문의 error 코드는 src/api/error-codes.ts에서만 읽습니다. ' +
-              'errorCodeOf()를 쓰십시오 — 코드 어휘가 한 곳에 모여 있어야 ' +
-              '서버가 낼 수 있는 코드와 대조할 수 있습니다.',
+            "The response body's error code is read in src/api/error-codes.ts alone. " +
+              'Use errorCodeOf() — the code vocabulary has to sit in one place to be ' +
+              'comparable against what the server can emit.',
           )
         }
         if (ts.isAsExpression(node) && node.type.kind === ts.SyntaxKind.AnyKeyword && isResponseBody(node.expression)) {
           report(
             'codes',
             node,
-            'ApiError의 body를 any로 열면 코드 어휘 대조를 빠져나갑니다. ' +
-              'src/api/error-codes.ts의 errorCodeOf()·errorMessageOf()를 쓰십시오.',
+            "Opening an ApiError's body as any slips past the code vocabulary comparison. " +
+              'Use errorCodeOf() and errorMessageOf() from src/api/error-codes.ts.',
           )
         }
         if (
@@ -244,8 +244,8 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
           report(
             'codes',
             node,
-            'ApiError의 body에서 error를 직접 읽지 마십시오. ' +
-              'src/api/error-codes.ts의 errorCodeOf()가 유일한 통로입니다.',
+            "Do not read error directly off an ApiError's body. " +
+              'errorCodeOf() in src/api/error-codes.ts is the only way through.',
           )
         }
       }
@@ -260,20 +260,20 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
         ) {
           const argument = node.arguments[REQUEST_CALL.endpointArgument]
           if (!argument) {
-            report('contract', node, 'request() 호출에 엔드포인트 이름이 없습니다.')
+            report('contract', node, 'this request() call names no endpoint.')
           } else if (!ts.isStringLiteral(argument) && !ts.isNoSubstitutionTemplateLiteral(argument)) {
             report(
               'contract',
               argument,
-              '엔드포인트 이름은 문자열 리터럴이어야 합니다. ' +
-                '변수로 계산하면 호출 대상이 정적으로 검사되지 않습니다.',
+              'An endpoint name has to be a string literal. ' +
+                'Computed into a variable, the call target is never statically checked.',
             )
           } else if (!declared.names.has(argument.text)) {
             report(
               'contract',
               argument,
-              `"${argument.text}"은(는) 공개 계약에 없습니다. ` +
-                `internal/api/contract.go에 선언한 뒤 계약 문서를 다시 생성하십시오.`,
+              `"${argument.text}" is not in the public contract. ` +
+                `Declare it in internal/api/contract.go and regenerate the contract document.`,
             )
           }
         }
@@ -285,8 +285,8 @@ export function checkConsole({ root = CONSOLE_ROOT, scanDir = 'src', contract } 
           report(
             'contract',
             node,
-            `절대 주소 ${node.text}이(가) 소스에 박혀 있습니다. ` +
-              `호출 대상은 계약과 서버가 내려준 기준 주소에서만 옵니다.`,
+            `The absolute address ${node.text} is hard-coded in the source. ` +
+              `Call targets come only from the contract and from the base address the server supplied.`,
           )
         }
       }
@@ -436,8 +436,8 @@ export function loadServedErrorCodes(root = CONSOLE_ROOT) {
   const document = JSON.parse(raw)
   if (document.version !== ERROR_CODE_DOCUMENT_VERSION) {
     throw new Error(
-      `contract/error-codes.json은 version ${document.version}인데 이 검사는 ` +
-        `${ERROR_CODE_DOCUMENT_VERSION}을 읽습니다. 문서 모양이 바뀌었습니다.`,
+      `contract/error-codes.json states version ${document.version} and this check reads ` +
+        `${ERROR_CODE_DOCUMENT_VERSION}. The document's shape has changed.`,
     )
   }
   const served = new Map()
@@ -470,24 +470,24 @@ export function parseErrorCodeExemptions(document) {
       file: 'contract/error-code-exemptions.json',
       at: 'version',
       message:
-        `면제 목록이 version ${document.version}인데 이 검사는 ` +
-        `${EXEMPTION_DOCUMENT_VERSION}을 읽습니다.`,
+        `the exemption list states version ${document.version} and this check reads ` +
+        `${EXEMPTION_DOCUMENT_VERSION}.`,
     })
   }
   for (const group of document.codes ?? []) {
     const reason = typeof group.reason === 'string' ? group.reason.trim() : ''
     const codes = group.codes ?? []
     if (reason === '') {
-      problems.push(violation(`면제 묶음 [${codes.join(', ')}]에 이유가 없습니다. ` +
-        '이유 없는 면제는 목록을 다시 그냥 목록으로 만듭니다.'))
+      problems.push(violation(`the exemption group [${codes.join(', ')}] states no reason. ` +
+        'An exemption with no reason turns the list back into the bare list it replaced.'))
     }
     if (codes.length === 0) {
-      problems.push(violation('코드가 하나도 없는 면제 묶음이 있습니다.'))
+      problems.push(violation('an exemption group holds no codes at all.'))
     }
     for (const code of codes) {
       if (exempt.has(code)) {
-        problems.push(violation(`"${code}"이(가) 두 묶음에 면제로 적혀 있습니다 — ` +
-          '어느 이유가 참인지 파일이 답하지 못합니다.'))
+        problems.push(violation(`"${code}" is exempted in two groups — ` +
+          'the file cannot say which of the two reasons is the true one.'))
         continue
       }
       exempt.set(code, reason)
@@ -498,14 +498,14 @@ export function parseErrorCodeExemptions(document) {
   for (const entry of document.endpoints ?? []) {
     const reason = typeof entry.reason === 'string' ? entry.reason.trim() : ''
     if (typeof entry.name !== 'string' || entry.name === '') {
-      problems.push(violation('이름 없는 미구현 엔드포인트 항목이 있습니다.'))
+      problems.push(violation('an unimplemented endpoint entry states no name.'))
       continue
     }
     if (reason === '') {
-      problems.push(violation(`"${entry.name}"이(가) 이유 없이 미구현으로 적혀 있습니다.`))
+      problems.push(violation(`"${entry.name}" is listed as unimplemented with no reason.`))
     }
     if (unimplemented.has(entry.name)) {
-      problems.push(violation(`"${entry.name}"이(가) 두 번 적혀 있습니다.`))
+      problems.push(violation(`"${entry.name}" is listed twice.`))
       continue
     }
     unimplemented.set(entry.name, reason)
@@ -550,18 +550,18 @@ export function loadConsumedErrorCodes(root = CONSOLE_ROOT, modulePath = ERROR_C
   ts.forEachChild(file, visit)
 
   if (found === undefined) {
-    throw new Error(`${modulePath}에 ${CONSUMED_DECLARATION} 선언이 없습니다.`)
+    throw new Error(`${modulePath} has no ${CONSUMED_DECLARATION} declaration.`)
   }
   // `[...] as const` is an as-expression around the array.
   const array = ts.isAsExpression(found) ? found.expression : found
   if (!ts.isArrayLiteralExpression(array)) {
-    throw new Error(`${CONSUMED_DECLARATION}이(가) 배열 리터럴이 아닙니다 — ` +
-      '계산된 목록은 정적으로 읽을 수 없고, 읽을 수 없으면 대조도 없습니다.')
+    throw new Error(`${CONSUMED_DECLARATION} is not an array literal — ` +
+      'a computed list cannot be read statically, and what cannot be read cannot be compared.')
   }
   const codes = []
   for (const element of array.elements) {
     if (!ts.isStringLiteral(element) && !ts.isNoSubstitutionTemplateLiteral(element)) {
-      throw new Error(`${CONSUMED_DECLARATION}의 원소는 문자열 리터럴이어야 합니다.`)
+      throw new Error(`every element of ${CONSUMED_DECLARATION} has to be a string literal.`)
     }
     codes.push(element.text)
   }
@@ -629,9 +629,9 @@ export function checkEndpointCoverage({
     if (reached.has(name) || listed.has(name)) continue
     violations.push(
       coverage(
-        `"${name}"은(는) 공개 계약에 있는데 콘솔의 어떤 화면도 부르지 않고, ` +
-          '미구현 목록에도 없습니다. 화면을 만들거나, 이유와 함께 적으십시오 — ' +
-          '적히지 않은 미구현 표면은 아무도 모르는 미구현 표면입니다.',
+        `"${name}" is in the public contract, no console screen calls it, and the ` +
+          'unimplemented list does not name it. Build the screen, or write it down with a ' +
+          'reason — an unimplemented surface nobody wrote down is one nobody knows about.',
         name,
       ),
     )
@@ -639,13 +639,13 @@ export function checkEndpointCoverage({
   for (const [name] of listed) {
     if (!declared.names.has(name)) {
       violations.push(
-        coverage(`"${name}"은(는) 공개 계약의 API 엔드포인트가 아닌데 미구현 목록에 있습니다.`, name),
+        coverage(`"${name}" is in the unimplemented list and is not an API endpoint of the public contract.`, name),
       )
       continue
     }
     if (reached.has(name)) {
       violations.push(
-        coverage(`"${name}"은(는) 콘솔이 실제로 부르는데 미구현 목록에 남아 있습니다.`, name),
+        coverage(`"${name}" is one the console actually calls, and it is still in the unimplemented list.`, name),
       )
     }
   }
@@ -677,16 +677,16 @@ export function checkErrorVocabulary({
     const entry = servedCodes.get(code)
     if (entry === undefined) {
       report(
-        `"${code}": 콘솔이 분기하는데 서버는 어디서도 내지 않습니다. 죽은 분기입니다 — ` +
-          'src/api/error-codes.ts에서 지우고, 그 코드를 쓰던 화면의 문구도 함께 지우십시오. ' +
-          '(#51의 not_an_approver가 정확히 이 상태였습니다.)',
+        `"${code}": the console branches on it and the server emits it nowhere. A dead branch — ` +
+          'delete it from src/api/error-codes.ts, and delete the copy on whichever screen worded it. ' +
+          '(not_an_approver in #51 was exactly this.)',
       )
       continue
     }
     if (!entry.surfaces.includes('console')) {
       report(
-        `"${code}": 서버가 내기는 하지만 ${entry.surfaces.join('·')} 리스너에서만 냅니다. ` +
-          '콘솔은 console 리스너만 부르므로 이 분기에는 도달할 수 없습니다.',
+        `"${code}": the server does emit it, but only on the ${entry.surfaces.join(', ')} listener. ` +
+          'The console calls the console listener alone, so this branch is unreachable.',
       )
     }
   }
@@ -694,23 +694,23 @@ export function checkErrorVocabulary({
   for (const [code, entry] of servedCodes) {
     if (consumedCodes.has(code) || exempt.has(code)) continue
     report(
-      `"${code}" (${entry.statuses.join('·')}, ${entry.surfaces.join('·')}): 서버가 내는데 ` +
-        '콘솔에 처리가 없습니다. src/api/error-codes.ts에 더해 문구를 쓰거나, ' +
-        'contract/error-code-exemptions.json에 이유와 함께 적으십시오.',
+      `"${code}" (${entry.statuses.join(', ')}, ${entry.surfaces.join(', ')}): the server emits it ` +
+        'and the console does not handle it. Add it to src/api/error-codes.ts and word it, or ' +
+        'write it into contract/error-code-exemptions.json with a reason.',
     )
   }
 
   for (const [code] of exempt) {
     if (!servedCodes.has(code)) {
       violations.push(
-        violation(`"${code}"은(는) 서버가 더 이상 내지 않는데 면제 목록에 남아 있습니다. ` +
-          '면제가 그것이 설명하던 코드보다 오래 살았습니다.'),
+        violation(`"${code}" is exempted and the server no longer emits it. ` +
+          'The exemption outlived the code it explained.'),
       )
     }
     if (consumedCodes.has(code)) {
       violations.push(
-        violation(`"${code}"은(는) 콘솔이 실제로 처리하는데 면제 목록에도 있습니다. ` +
-          '둘 중 하나는 거짓입니다.'),
+        violation(`"${code}" is handled by the console and exempted at the same time — ` +
+          'one of the two is false.'),
       )
     }
   }
@@ -726,7 +726,7 @@ export function formatViolations(violations) {
   }
   const lines = []
   for (const [rule, items] of byRule) {
-    lines.push(`\n[${rule}] ${items.length}건`)
+    lines.push(`\n[${rule}] ${items.length}`)
     for (const item of items) {
       lines.push(`  ${item.file}:${item.at}  ${item.message}`)
     }
@@ -745,22 +745,23 @@ if (isMain) {
     const consumed = loadConsumedErrorCodes()
     const { unimplemented } = loadErrorCodeExemptions()
     console.log(
-      `콘솔 계약 경계: 위반 없음 (공개 계약 엔드포인트 ${contract.names.size}개, 문서 버전 ${contract.version}).`,
+      `console contract boundary: no violations (${contract.names.size} public contract endpoints, document version ${contract.version}).`,
     )
     console.log(
-      `error 코드 어휘: 양방향 일치 (서버 ${served.size}개, 콘솔이 분기하는 것 ${consumed.size}개, ` +
-        `면제 ${served.size - consumed.size}개).`,
+      `error code vocabulary: agrees in both directions (${served.size} served, ` +
+        `${consumed.size} branched on by the console, ${served.size - consumed.size} exempt).`,
     )
     console.log(
-      `표면 구현: 계약 엔드포인트 ${contract.names.size}개 중 ${contract.names.size - unimplemented.size}개를 ` +
-        `콘솔이 부르고, ${unimplemented.size}개가 이유와 함께 미구현으로 적혀 있다.`,
+      `surface coverage: the console calls ${contract.names.size - unimplemented.size} of ` +
+        `${contract.names.size} contract endpoints, and ${unimplemented.size} are written down ` +
+        `as unimplemented with a reason.`,
     )
     process.exit(0)
   }
-  console.error(`콘솔 계약 경계 검사 실패: ${violations.length}건${formatViolations(violations)}`)
+  console.error(`console contract boundary check failed: ${violations.length}${formatViolations(violations)}`)
   console.error(
-    '\n공개 계약 밖을 호출해야 한다면 그 엔드포인트를 먼저 공개 계약으로 만드십시오 — ' +
-      '콘솔 전용 엔드포인트를 만드는 것이 D19가 막으려는 바로 그 일입니다.',
+    '\nIf you have to call outside the public contract, make that endpoint part of the public ' +
+      'contract first — growing a console-only endpoint is the exact thing D19 exists to prevent.',
   )
   process.exit(1)
 }

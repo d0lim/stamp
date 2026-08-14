@@ -86,9 +86,9 @@ export const EMPTY_QUERY: AuditQuery = { from: '', to: '', policy: '', subject: 
 export const DECISION_STATES = ['pending', 'allowed', 'denied', 'expired', 'cancelled'] as const
 
 export const STATE_LABELS: Readonly<Record<string, string>> = {
-  pending: '미결',
-  allowed: '허용',
-  denied: '거부',
-  expired: '만료',
-  cancelled: '취소',
+  pending: 'Pending',
+  allowed: 'Allowed',
+  denied: 'Denied',
+  expired: 'Expired',
+  cancelled: 'Cancelled',
 }

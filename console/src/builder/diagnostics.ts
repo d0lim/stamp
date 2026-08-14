@@ -5,8 +5,8 @@
  * The dry-run endpoint passes those through unchanged, and its comment says why:
  * rewording them here would give the console two vocabularies for the same
  * mistake depending on which door the policy came through. So the message text
- * is the server's, and what the console adds is placement and a stable Korean
- * label for the code.
+ * is the server's, and what the console adds is placement and a stable label
+ * for the code.
  *
  * The console never validates a policy itself. It could — it knows the declared
  * types and could refuse a string compared against an int before the request is
@@ -31,7 +31,7 @@ export interface Diagnostic {
 export const UNPLACED_ANCHOR_ID = 'bf-unplaced'
 
 /**
- * The stable codes, in Korean.
+ * The stable codes, given a human label.
  *
  * The code is the machine-readable half of the contract and the message is the
  * human half; the label is what turns "type_mismatch" into something an author
@@ -40,29 +40,29 @@ export const UNPLACED_ANCHOR_ID = 'bf-unplaced'
  * built against an older engine should degrade quietly.
  */
 const CODE_LABELS: Readonly<Record<string, string>> = {
-  invalid_yaml: '문서 형식 오류',
-  invalid_document: '문서 구조 오류',
-  unknown_api_version: '알 수 없는 apiVersion',
-  unknown_kind: '알 수 없는 kind',
-  unknown_key: '알 수 없는 항목',
-  missing_field: '필수 항목 누락',
-  invalid_name: '이름 규칙 위반',
-  invalid_value: '값 오류',
-  unknown_type: '알 수 없는 타입',
-  duplicate: '중복',
-  unknown_entity: '선언되지 않은 entity',
-  unknown_action: '선언되지 않은 action',
-  unknown_attribute: '선언되지 않은 속성',
-  unbound_role: '바인딩되지 않은 역할',
-  unknown_source: '선언되지 않은 source',
-  type_mismatch: '타입 불일치',
-  arity_mismatch: '인자 개수 불일치',
-  invalid_operand: '피연산자 오류',
-  invalid_operator: '연산자 오류',
-  limit_exceeded: '한도 초과',
-  unknown_challenge: '알 수 없는 challenge',
-  unsupported: '미지원',
-  cel_compile: '컴파일 실패',
+  invalid_yaml: 'Document format error',
+  invalid_document: 'Document structure error',
+  unknown_api_version: 'Unknown apiVersion',
+  unknown_kind: 'Unknown kind',
+  unknown_key: 'Unknown key',
+  missing_field: 'Missing required field',
+  invalid_name: 'Invalid name',
+  invalid_value: 'Invalid value',
+  unknown_type: 'Unknown type',
+  duplicate: 'Duplicate',
+  unknown_entity: 'Undeclared entity',
+  unknown_action: 'Undeclared action',
+  unknown_attribute: 'Undeclared attribute',
+  unbound_role: 'Unbound role',
+  unknown_source: 'Undeclared source',
+  type_mismatch: 'Type mismatch',
+  arity_mismatch: 'Wrong number of arguments',
+  invalid_operand: 'Invalid operand',
+  invalid_operator: 'Invalid operator',
+  limit_exceeded: 'Limit exceeded',
+  unknown_challenge: 'Unknown challenge',
+  unsupported: 'Unsupported',
+  cel_compile: 'Compile failure',
 }
 
 /** The label for a code, or an empty string when the code is unfamiliar. */

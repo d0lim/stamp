@@ -16,8 +16,8 @@ if (!globalThis.crypto?.subtle) {
 
 globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
   throw new Error(
-    `테스트가 주입하지 않은 fetch를 호출했습니다: ${String(input)}. ` +
-      `fetchImpl을 넘기십시오.`,
+    `A test called fetch without injecting one: ${String(input)}. ` +
+      `Pass fetchImpl.`,
   )
 }) as unknown as typeof fetch
 

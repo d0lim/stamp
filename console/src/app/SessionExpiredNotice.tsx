@@ -17,13 +17,15 @@ export function SessionExpiredNotice() {
 
   return (
     <div className="notice notice--warning" role="alert" data-testid="session-expired">
-      <p className="notice__text">로그인이 만료되었습니다. 다시 로그인하면 이 화면으로 돌아옵니다.</p>
+      <p className="notice__text">
+        Your session has expired. Signing in again returns you to this screen.
+      </p>
       <button
         type="button"
         className="button"
         onClick={() => void signIn(`${routerLocation.pathname}${routerLocation.search}`)}
       >
-        다시 로그인
+        Sign in again
       </button>
     </div>
   )

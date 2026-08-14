@@ -11,6 +11,6 @@ consumes — and the failure mode this fixture pins is that deleting it would
 otherwise make internal/release/routes_test.go pass against nothing while the
 release gate still reported three correctly versioned contracts.
 
-## 엔드포인트
+## Endpoints
 
-이 절에 표가 없다.
+This section has no table.

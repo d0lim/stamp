@@ -47,7 +47,7 @@ function token(claims: Record<string, unknown>): string {
 const session = sessionFromTokens({
   accessToken: token({
     sub: 'u-1',
-    name: '테스트 승인자',
+    name: 'Test Approver',
     roles: ['author', 'approver', 'auditor'],
     exp: Math.floor(Date.now() / 1000) + 3600,
   }),
@@ -56,7 +56,7 @@ const session = sessionFromTokens({
 })
 
 const container = document.getElementById('root')
-if (!container) throw new Error('#root가 문서에 없습니다.')
+if (!container) throw new Error('#root is not in the document.')
 
 createRoot(container).render(
   <StrictMode>

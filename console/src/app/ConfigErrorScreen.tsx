@@ -15,12 +15,12 @@ export function ConfigErrorScreen({ message, detail }: ConfigErrorScreenProps) {
   return (
     <main id="main" className="shell__main" tabIndex={-1}>
       <div className="panel panel--refusal" role="alert">
-        <h1>콘솔을 시작하지 못했습니다</h1>
+        <h1>The console did not start</h1>
         <p>{message}</p>
         {detail ? <p className="panel__meta">{detail}</p> : null}
         <p>
-          콘솔 설정 문서는 콘솔을 서빙하는 프로세스가 내려줍니다. <code>--roles</code>에{' '}
-          <code>console</code>이 포함되어 있는지 확인하십시오.
+          The console configuration document is served by the process that serves the console.
+          Check that <code>--roles</code> includes <code>console</code>.
         </p>
       </div>
     </main>

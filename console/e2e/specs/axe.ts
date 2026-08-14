@@ -52,6 +52,6 @@ export async function expectAccessible(page: Page, ready: () => Promise<unknown>
     await page.emulateMedia({ colorScheme: scheme })
     await ready()
     const found = await violations(page)
-    expect(found, `${scheme} 스킴 axe 위반: ${JSON.stringify(found, null, 2)}`).toEqual([])
+    expect(found, `axe violations in the ${scheme} scheme: ${JSON.stringify(found, null, 2)}`).toEqual([])
   }
 }

@@ -9,7 +9,7 @@ import type { ErrorResponse } from '../../../src/builder/api-types'
 
 export function wordIt(cause: ApiError): string {
   const body = cause.body as { error?: string; message?: string } | undefined
-  if (body?.error === 'not_an_approver') return '당신은 승인자가 아닙니다.'
+  if (body?.error === 'not_an_approver') return 'You are not an approver.'
   return body?.message ?? cause.message
 }
 

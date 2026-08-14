@@ -46,13 +46,13 @@ const DELTA = {
   changes: Array.from({ length: 12 }, (_, index) => ({
     kind: 'modify' as const,
     policy_id: `policy-${index}`,
-    before: policyDocument(`policy-${index}`, 3, `이전 ${index}`),
-    after: policyDocument(`policy-${index}`, index === 0 ? 1 : 3, `개정 ${index}`),
+    before: policyDocument(`policy-${index}`, 3, `before ${index}`),
+    after: policyDocument(`policy-${index}`, index === 0 ? 1 : 3, `revision ${index}`),
   })),
 }
 
 const FINDINGS = [
-  { subject: 'policy-0', reason: 'quorum_lowered', detail: '정족수가 3에서 1로 낮아집니다' },
+  { subject: 'policy-0', reason: 'quorum_lowered', detail: 'the quorum drops from 3 to 1' },
 ]
 
 const AUDIT_ROW = {
@@ -76,7 +76,7 @@ const RESPONSES: Readonly<Record<string, unknown>> = {
         version: 3,
         origin: 'form',
         reserved: false,
-        document: policyDocument('policy-0', 3, '이전 0'),
+        document: policyDocument('policy-0', 3, 'before 0'),
       },
     ],
   },
@@ -159,7 +159,7 @@ const AUDIT_DETAIL = {
   request: REVIEW.decision.request,
   fact_snapshot: REVIEW.decision.fact_snapshot,
   obligations: REVIEW.decision.obligations,
-  policy_document: policyDocument('stamp.governance', 2, '거버넌스 정책'),
+  policy_document: policyDocument('stamp.governance', 2, 'governance policy'),
   policy_origin: 'form',
   challenges: [{ ordinal: 0, kind: 'quorum', state: 'pending' }],
   approvals: [

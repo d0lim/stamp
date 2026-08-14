@@ -90,8 +90,8 @@ function stub(options: StubOptions = {}) {
 // R22: the axes
 // ---------------------------------------------------------------------------
 
-describe('감사 목록', () => {
-  it('네 축이 서버 질의로 전달되고, 적용된 조회를 서버 답으로 표시한다', async () => {
+describe('the audit list', () => {
+  it('sends the four axes to the server and displays the server answer as the applied query', async () => {
     const user = userEvent.setup()
     const stubbed = stub({
       list: {
@@ -113,11 +113,11 @@ describe('감사 목록', () => {
     renderShell({ roles: ['auditor'], route: '/audit', fetchImpl: stubbed.impl })
     await screen.findByTestId('audit-table')
 
-    await user.type(screen.getByLabelText('기간 시작 (RFC 3339)'), '2026-08-01T00:00:00Z')
-    await user.type(screen.getByLabelText('기간 끝 (미포함)'), '2026-09-01T00:00:00Z')
-    await user.type(screen.getByLabelText('정책'), 'wire')
-    await user.type(screen.getByLabelText('주체'), 'alice')
-    await user.selectOptions(screen.getByLabelText('상태'), 'allowed')
+    await user.type(screen.getByLabelText('Period start (RFC 3339)'), '2026-08-01T00:00:00Z')
+    await user.type(screen.getByLabelText('Period end (exclusive)'), '2026-09-01T00:00:00Z')
+    await user.type(screen.getByLabelText('Policy'), 'wire')
+    await user.type(screen.getByLabelText('Subject'), 'alice')
+    await user.selectOptions(screen.getByLabelText('State'), 'allowed')
     await user.click(screen.getByTestId('audit-search'))
 
     const last = stubbed.calls[stubbed.calls.length - 1]
@@ -130,11 +130,11 @@ describe('감사 목록', () => {
 
     // The screen reports the filter the *server* says it applied, so an auditor
     // can tell what they are looking at rather than what they meant to ask for.
-    expect(screen.getByTestId('audit-applied')).toHaveTextContent('정책 wire')
+    expect(screen.getByTestId('audit-applied')).toHaveTextContent('policy wire')
     expect(screen.getByTestId('audit-applied')).toHaveTextContent('created_at desc')
   })
 
-  it('빈 축은 질의에 실리지 않는다', () => {
+  it('leaves an empty axis off the query', () => {
     expect(queryParams(EMPTY_QUERY, '')).toEqual({
       from: undefined,
       to: undefined,
@@ -147,7 +147,7 @@ describe('감사 목록', () => {
     expect(queryParams(EMPTY_QUERY, 'c1').cursor).toBe('c1')
   })
 
-  it('커서로 페이지를 넘기고 마지막 페이지에서는 다음이 비활성이다', async () => {
+  it('pages by cursor and disables next on the last page', async () => {
     const user = userEvent.setup()
     const stubbed = stub({
       list: {
@@ -164,7 +164,7 @@ describe('감사 목록', () => {
     expect(new URLSearchParams(last?.search ?? '').get('cursor')).toBe('cursor-2')
   })
 
-  it('감사자 자격이 없으면 거부 화면을 보여주고 남은 경로를 알려준다', async () => {
+  it('shows a refusal that names the path still open when auditor standing is missing', async () => {
     // The one 403 that survived #38's collapse, and it is not an accident:
     // standing to read a collection says nothing about whether any single
     // decision exists, so it is an oracle for nothing (R22).
@@ -174,8 +174,8 @@ describe('감사 목록', () => {
       fetchImpl: stub({ list: { status: 403, body: { error: 'not_an_auditor', message: 'nope' } } }).impl,
     })
     const refusal = await screen.findByTestId('audit-refused')
-    expect(refusal).toHaveTextContent('자격이 없습니다')
-    expect(refusal).toHaveTextContent('자신이 대상인 결정')
+    expect(refusal).toHaveTextContent('do not have auditor standing')
+    expect(refusal).toHaveTextContent('are the subject of')
     expect(screen.queryByTestId('audit-table')).toBeNull()
   })
 })
@@ -184,15 +184,15 @@ describe('감사 목록', () => {
 // R22: one decision
 // ---------------------------------------------------------------------------
 
-describe('결정 상세', () => {
-  it('적용된 정책 버전과 사실 스냅샷을 보여준다', async () => {
+describe('one decision', () => {
+  it('shows the policy version applied and the fact snapshot', async () => {
     renderShell({ roles: ['auditor'], route: `/audit/${DECISION_ID}`, fetchImpl: stub().impl })
     expect(await screen.findByTestId('policy-version')).toHaveTextContent('wire · v3')
     expect(screen.getByTestId('audit-policy-document')).toHaveTextContent('kind: Policy')
     expect(screen.getByTestId('audit-facts')).toHaveTextContent('onerror')
   })
 
-  it('HTML·스크립트 페이로드가 이스케이프되어 표시된다', async () => {
+  it('escapes an HTML or script payload before displaying it', async () => {
     const { container } = renderShell({
       roles: ['auditor'],
       route: `/audit/${DECISION_ID}`,
@@ -206,14 +206,14 @@ describe('결정 상세', () => {
     expect(screen.getByTestId('audit-facts').textContent).toContain('<script>alert(2)</script>')
   })
 
-  it('수집된 승인과 그 바인딩 해시를 보여준다', async () => {
+  it('shows the approvals collected and their binding hashes', async () => {
     renderShell({ roles: ['auditor'], route: `/audit/${DECISION_ID}`, fetchImpl: stub().impl })
     const table = await screen.findByTestId('audit-approvals')
     expect(within(table).getByText('bob')).toBeInTheDocument()
     expect(within(table).getByText('f00dbabe')).toBeInTheDocument()
   })
 
-  it('감사자 자격이 아닌 열람이면 그렇게 말한다', async () => {
+  it('says so when the reading is not on auditor standing', async () => {
     renderShell({
       roles: ['approver'],
       route: `/audit/${DECISION_ID}`,
@@ -222,19 +222,20 @@ describe('결정 상세', () => {
     expect(await screen.findByTestId('own-record-notice')).toBeInTheDocument()
   })
 
-  it('감사자 자격이 없는 사람도 결정 상세 경로에는 도달한다', async () => {
+  it('lets a reader without auditor standing reach the decision detail route', async () => {
     // R22's second half is only usable if the link works. The role claim is
     // navigation; the server is the authorisation.
     renderShell({ roles: ['approver'], route: `/audit/${DECISION_ID}`, fetchImpl: stub().impl })
     expect(await screen.findByTestId('policy-version')).toBeInTheDocument()
   })
 
-  it('감사 목록은 감사자 역할이 없으면 제공되지 않는다', async () => {
+  it('does not serve the audit list without the auditor role', async () => {
     renderShell({ roles: ['approver'], route: '/audit', fetchImpl: stub().impl })
-    expect(await screen.findByRole('heading', { level: 1, name: /권한이 없습니다/ })).toBeInTheDocument()
+    // The refusal itself is app/RequireRole.tsx's, not this screen's.
+    expect(await screen.findByRole('heading', { level: 1, name: /do not have permission/ })).toBeInTheDocument()
   })
 
-  it('열람할 수 없는 결정은 없는 것과 같은 답을 받고, 화면도 그렇게 말한다', async () => {
+  it('answers a decision you cannot read as one that is not there, and says so', async () => {
     // The detail surface no longer has a `403 not_readable`: it and `404
     // not_found` were the same existence oracle the approval surface had, so
     // they became one answer with one body (#38). This test used to stub the
@@ -248,16 +249,16 @@ describe('결정 상세', () => {
     })
     const notice = await screen.findByTestId('decision-unavailable')
     // Both halves, and neither claimed as the one that happened.
-    expect(notice).toHaveTextContent('존재하지 않거나, 당신에게 열려 있지 않습니다')
-    expect(notice).toHaveTextContent('자신이 초기화했거나 자신이 대상인 결정만 열람할 수 있습니다')
+    expect(notice).toHaveTextContent('it does not exist, or it is not open to you')
+    expect(notice).toHaveTextContent('only the decisions you initiated or are the subject of')
     // Not the generic read failure, which reads as an outage.
     expect(screen.queryByTestId('decision-error')).toBeNull()
-    expect(screen.queryByText('결정을 읽는 중입니다…')).toBeNull()
+    expect(screen.queryByText('Reading the decision…')).toBeNull()
   })
 
-  it('JSON은 텍스트로 렌더링된다', () => {
+  it('renders JSON as text', () => {
     expect(asText({ a: 1 })).toBe('{\n  "a": 1\n}')
-    expect(asText(null)).toBe('(없음)')
+    expect(asText(null)).toBe('(none)')
     expect(asText('x')).toBe('x')
   })
 })
@@ -270,17 +271,17 @@ async function auditable(container: HTMLElement): Promise<string[]> {
   const results = await axe.run(container, {
     rules: { 'color-contrast': { enabled: false } },
   })
-  return results.violations.map((v) => `${v.id}: ${v.help} (${v.nodes.length}곳)`)
+  return results.violations.map((v) => `${v.id}: ${v.help} (${v.nodes.length} nodes)`)
 }
 
-describe('감사 콘솔 접근성', () => {
-  it('목록 화면에 axe 위반이 없다', async () => {
+describe('audit console accessibility', () => {
+  it('has no axe violation on the list screen', async () => {
     const { container } = renderShell({ roles: ['auditor'], route: '/audit', fetchImpl: stub().impl })
     await screen.findByTestId('audit-table')
     expect(await auditable(container)).toEqual([])
   })
 
-  it('결정 상세 화면에 axe 위반이 없다', async () => {
+  it('has no axe violation on the decision detail screen', async () => {
     const { container } = renderShell({
       roles: ['auditor'],
       route: `/audit/${DECISION_ID}`,
@@ -290,7 +291,7 @@ describe('감사 콘솔 접근성', () => {
     expect(await auditable(container)).toEqual([])
   })
 
-  it('거부 화면에도 axe 위반이 없다', async () => {
+  it('has no axe violation on the refusal screen', async () => {
     const { container } = renderShell({
       roles: ['auditor'],
       route: '/audit',

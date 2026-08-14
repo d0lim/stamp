@@ -77,7 +77,7 @@ export class ApiError extends Error {
 
 export class NetworkError extends Error {
   constructor(cause: unknown) {
-    super(`요청이 네트워크 단계에서 실패했습니다: ${String(cause)}`)
+    super(`The request failed at the network layer: ${String(cause)}`)
     this.name = 'NetworkError'
   }
 }
@@ -179,15 +179,15 @@ function buildQuery(query: ApiRequestOptions['query']): string {
 async function describeFailure(response: Response): Promise<string> {
   switch (response.status) {
     case 401:
-      return '로그인이 만료되었습니다. 다시 로그인하십시오.'
+      return 'Your session has expired. Sign in again.'
     case 403:
-      return '이 작업을 수행할 권한이 없습니다.'
+      return 'You do not have permission to perform this action.'
     case 404:
-      return '대상을 찾을 수 없습니다.'
+      return 'The target was not found.'
     case 409:
-      return '대상의 상태가 바뀌어 요청을 적용할 수 없습니다.'
+      return 'The target changed state, so the request cannot be applied.'
     default:
-      return `요청이 ${response.status}로 실패했습니다.`
+      return `The request failed with ${response.status}.`
   }
 }
 

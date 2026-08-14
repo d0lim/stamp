@@ -42,7 +42,7 @@ export function CallbackScreen() {
         const error = cause instanceof AuthError ? cause : null
         setState({
           kind: 'failed',
-          message: error?.message ?? '로그인을 완료하지 못했습니다.',
+          message: error?.message ?? 'Sign-in did not complete.',
           ...(error?.detail ? { detail: error.detail } : {}),
         })
       }
@@ -54,12 +54,12 @@ export function CallbackScreen() {
   if (state.kind === 'failed') {
     return (
       <div className="panel panel--refusal" role="alert">
-        <RouteAnnouncer title="로그인 실패" />
-        <h1>로그인을 완료하지 못했습니다</h1>
+        <RouteAnnouncer title="Sign-in failed" />
+        <h1>Sign-in did not complete</h1>
         <p>{state.message}</p>
         {state.detail ? <p className="panel__meta">{state.detail}</p> : null}
         <p>
-          <a href={config.basePath}>처음부터 다시 로그인</a>
+          <a href={config.basePath}>Start the sign-in again</a>
         </p>
       </div>
     )
@@ -67,9 +67,9 @@ export function CallbackScreen() {
 
   return (
     <div className="panel">
-      <RouteAnnouncer title="로그인 처리 중" />
-      <h1>로그인을 완료하는 중입니다</h1>
-      <p role="status">잠시만 기다려 주십시오.</p>
+      <RouteAnnouncer title="Signing in" />
+      <h1>Completing sign-in</h1>
+      <p role="status">One moment.</p>
     </div>
   )
 }

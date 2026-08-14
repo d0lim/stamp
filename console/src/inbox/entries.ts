@@ -39,10 +39,10 @@ export interface ReviewEntry {
 }
 
 const CHANGE_KIND_LABELS: Readonly<Record<string, string>> = {
-  add: '추가',
-  modify: '수정',
-  delete: '삭제',
-  take_ownership: '소유 경로 인수',
+  add: 'Added',
+  modify: 'Modified',
+  delete: 'Deleted',
+  take_ownership: 'Ownership path adoption',
 }
 
 /**
@@ -53,13 +53,18 @@ const CHANGE_KIND_LABELS: Readonly<Record<string, string>> = {
  * one thing an approval screen must not do is interpret it.
  */
 export function asText(value: unknown): string {
-  if (value === undefined || value === null) return '(없음)'
+  if (value === undefined || value === null) return '(none)'
   if (typeof value === 'string') return value
   try {
     return JSON.stringify(value, null, 2)
   } catch {
     return String(value)
   }
+}
+
+/** How a policy entry states the findings that classified it as weakening. */
+function weakeningFindings(count: number): string {
+  return `${count} weakening finding${count === 1 ? '' : 's'}`
 }
 
 /** Does a finding name this policy? */
@@ -84,7 +89,7 @@ export function materialEntries(review: QuorumReview): ReviewEntry[] {
     {
       id: 'material:decision',
       kind: 'material',
-      title: '결정 식별 정보',
+      title: 'Decision identity',
       meta: `${d.action} · ${d.resource_id}`,
       weakening: false,
       value: asText({
@@ -99,32 +104,32 @@ export function materialEntries(review: QuorumReview): ReviewEntry[] {
     {
       id: 'material:request',
       kind: 'material',
-      title: '요청 (request)',
-      meta: '결정이 만들어질 때 고정된 요청',
+      title: 'Request',
+      meta: 'The request frozen when the decision was created',
       weakening: false,
       value: asText(d.request),
     },
     {
       id: 'material:facts',
       kind: 'material',
-      title: '사실 스냅샷 (fact snapshot)',
-      meta: '평가에 쓰인 사실, 그 시점 그대로',
+      title: 'Fact snapshot',
+      meta: 'The facts the evaluation used, exactly as they stood',
       weakening: false,
       value: asText(d.fact_snapshot),
     },
     {
       id: 'material:obligations',
       kind: 'material',
-      title: '의무 (obligations)',
-      meta: '허용될 경우 호출자가 집행할 목록',
+      title: 'Obligations',
+      meta: 'What the caller enforces if the decision allows',
       weakening: false,
       value: asText(d.obligations),
     },
     {
       id: 'material:approvers',
       kind: 'material',
-      title: '승인자 집합',
-      meta: `해석 방식: ${review.mode}`,
+      title: 'Approver set',
+      meta: `resolution mode: ${review.mode}`,
       weakening: false,
       value: asText({
         mode: review.mode,
@@ -145,7 +150,7 @@ export function policyEntries(delta: Delta, findings: readonly Finding[]): Revie
       id: `policy:${change.policy_id}`,
       kind: 'policy' as const,
       title: `${change.policy_id}`,
-      meta: `${CHANGE_KIND_LABELS[change.kind] ?? change.kind}${own.length === 0 ? '' : ` · 완화 근거 ${own.length}건`}`,
+      meta: `${CHANGE_KIND_LABELS[change.kind] ?? change.kind}${own.length === 0 ? '' : ` · ${weakeningFindings(own.length)}`}`,
       weakening: own.length > 0,
       change,
       findings: own,
@@ -156,8 +161,8 @@ export function policyEntries(delta: Delta, findings: readonly Finding[]): Revie
     entries.push({
       id: 'policy:schema',
       kind: 'policy',
-      title: '선언 (schema)',
-      meta: `수정${own.length === 0 ? '' : ` · 완화 근거 ${own.length}건`}`,
+      title: 'Schema declarations',
+      meta: `Modified${own.length === 0 ? '' : ` · ${weakeningFindings(own.length)}`}`,
       weakening: own.length > 0,
       change: {
         kind: 'modify',

@@ -51,31 +51,34 @@ import { Field, FieldGroup } from './Field'
 import type { PlacedDiagnostics } from './diagnostics'
 import { fieldId, jptr } from './pointer'
 
+// The node and operand labels are lowercase noun phrases because they are read
+// inside a sentence as often as they are read alone — "Add comparison rule" and
+// "Delete comparison rule" are the same words the group's legend carries.
 const NODE_LABELS: Readonly<Record<NodeKind, string>> = {
-  logic: '논리 그룹',
-  compare: '비교 규칙',
-  member: '포함 규칙',
+  logic: 'logic group',
+  compare: 'comparison rule',
+  member: 'membership rule',
 }
 
 const LOGIC_LABELS: Readonly<Record<LogicOp, string>> = {
-  all: '모두 만족 (all)',
-  any: '하나 이상 만족 (any)',
-  not: '부정 (not)',
+  all: 'all must hold (all)',
+  any: 'at least one must hold (any)',
+  not: 'negation (not)',
 }
 
 const COMPARE_LABELS: Readonly<Record<CompareOp, string>> = {
-  eq: '같다 (eq)',
-  ne: '다르다 (ne)',
-  lt: '보다 작다 (lt)',
-  le: '보다 작거나 같다 (le)',
-  gt: '보다 크다 (gt)',
-  ge: '보다 크거나 같다 (ge)',
+  eq: 'equals (eq)',
+  ne: 'does not equal (ne)',
+  lt: 'less than (lt)',
+  le: 'less than or equal to (le)',
+  gt: 'greater than (gt)',
+  ge: 'greater than or equal to (ge)',
 }
 
 const OPERAND_LABELS: Readonly<Record<OperandKind, string>> = {
-  field: '엔티티 속성',
-  source: 'fact source 호출',
-  literal: '상수',
+  field: 'entity attribute',
+  source: 'fact source call',
+  literal: 'constant',
 }
 
 /** Types that lt/le/gt/ge accept, from policy.Type.IsOrdered. */
@@ -128,7 +131,7 @@ function OperandEditor({
     <div className="operand">
       <div className="field">
         <label className="field__label" htmlFor={kindId}>
-          {label} 종류
+          {label} kind
         </label>
         <select
           id={kindId}
@@ -146,7 +149,7 @@ function OperandEditor({
 
       {operand.kind === 'field' ? (
         <>
-          <Field pointer={pointer} label={`${label} — 역할`} placed={placed}>
+          <Field pointer={pointer} label={`${label} — role`} placed={placed}>
             {(props) => (
               <select
                 {...props}
@@ -166,7 +169,7 @@ function OperandEditor({
           </Field>
           <div className="field">
             <label className="field__label" htmlFor={`${fieldId(pointer)}--attribute`}>
-              {label} — 속성
+              {label} — attribute
             </label>
             <select
               id={`${fieldId(pointer)}--attribute`}
@@ -174,7 +177,7 @@ function OperandEditor({
               value={operand.attribute}
               onChange={(event) => onChange({ ...operand, attribute: event.target.value })}
             >
-              <option value="">선택하십시오</option>
+              <option value="">Select one</option>
               {attributesFor(draft, operand.role).map((attribute) => (
                 <option key={attribute.name} value={attribute.name}>
                   {attribute.name} ({attribute.type})
@@ -197,7 +200,7 @@ function OperandEditor({
 
       {operand.kind === 'literal' ? (
         <>
-          <Field pointer={pointer} label={`${label} — 타입`} placed={placed}>
+          <Field pointer={pointer} label={`${label} — type`} placed={placed}>
             {(props) => (
               <select
                 {...props}
@@ -243,7 +246,7 @@ function SourceOperandEditor({
       <Field
         pointer={pointer}
         label={`${label} — fact source`}
-        hint="선언된 source만 고를 수 있습니다. 선언에 없는 이름은 여기에 나타나지 않습니다."
+        hint="Only a declared source can be chosen. A name that is not in the declarations does not appear here."
         placed={placed}
       >
         {(props) => (
@@ -263,7 +266,7 @@ function SourceOperandEditor({
               })
             }}
           >
-            <option value="">선택하십시오</option>
+            <option value="">Select one</option>
             {draft.schema.sources.map((source) => (
               <option key={source.name} value={source.name}>
                 {source.name} → {source.returns}
@@ -277,7 +280,7 @@ function SourceOperandEditor({
           key={param.name}
           context={context}
           pointer={jptr(pointer, 'args', index)}
-          label={`인자 ${param.name} (${param.type})`}
+          label={`Argument ${param.name} (${param.type})`}
           operand={operand.args[index] ?? newOperand('literal')}
           // SourceRef arguments may not be source calls; the AST says so and the
           // validator refuses one, so the palette does not offer it.
@@ -310,7 +313,7 @@ function LiteralValues({
     return (
       <div className="field">
         <label className="field__label" htmlFor={`${fieldId(pointer)}--value`}>
-          {label} — 값
+          {label} — value
         </label>
         <input
           id={`${fieldId(pointer)}--value`}
@@ -325,12 +328,12 @@ function LiteralValues({
   return (
     <div className="literal-list">
       <p className="field__label">
-        {label} — 목록 항목 ({element})
+        {label} — list items ({element})
       </p>
       {operand.values.map((value, index) => (
         <div className="field field--inline" key={index}>
           <label className="field__label" htmlFor={`${fieldId(pointer)}--value-${index}`}>
-            {index + 1}번째 항목
+            Item {index + 1}
           </label>
           <input
             id={`${fieldId(pointer)}--value-${index}`}
@@ -351,7 +354,7 @@ function LiteralValues({
               onChange({ ...operand, values: operand.values.filter((_, i) => i !== index) })
             }
           >
-            {index + 1}번째 항목 삭제
+            Delete item {index + 1}
           </button>
         </div>
       ))}
@@ -360,7 +363,7 @@ function LiteralValues({
         className="button"
         onClick={() => onChange({ ...operand, values: [...operand.values, ''] })}
       >
-        목록 항목 추가
+        Add list item
       </button>
     </div>
   )
@@ -370,13 +373,7 @@ function LiteralValues({
 // nodes
 // ---------------------------------------------------------------------------
 
-function AddNodeButtons({
-  onAdd,
-  suffix,
-}: {
-  readonly onAdd: (kind: NodeKind) => void
-  readonly suffix: string
-}) {
+function AddNodeButtons({ onAdd }: { readonly onAdd: (kind: NodeKind) => void }) {
   return (
     <div className="palette" data-testid="condition-palette">
       {NODE_KINDS.map((kind) => (
@@ -387,7 +384,7 @@ function AddNodeButtons({
           data-node-kind={kind}
           onClick={() => onAdd(kind)}
         >
-          {NODE_LABELS[kind]} {suffix}
+          Add {NODE_LABELS[kind]}
         </button>
       ))}
     </div>
@@ -415,7 +412,7 @@ function NodeEditor({
       <FieldGroup pointer={pointer} legend={NODE_LABELS.logic} placed={placed} className="node">
         <div className="field">
           <label className="field__label" htmlFor={`${fieldId(pointer)}--op`}>
-            결합 방식
+            Combination
           </label>
           <select
             id={`${fieldId(pointer)}--op`}
@@ -461,12 +458,11 @@ function NodeEditor({
         </ol>
         {canAdd ? (
           <AddNodeButtons
-            suffix="추가"
             onAdd={(kind) => onChange({ ...node, operands: [...node.operands, newNode(kind)] })}
           />
         ) : null}
         <button type="button" className="button button--quiet" onClick={onRemove}>
-          {NODE_LABELS.logic} 삭제
+          Delete {NODE_LABELS.logic}
         </button>
       </FieldGroup>
     )
@@ -483,12 +479,12 @@ function NodeEditor({
         <OperandEditor
           context={context}
           pointer={jptr(pointer, 'left')}
-          label="왼쪽"
+          label="Left operand"
           operand={node.left}
           allowed={['field', 'source']}
           onChange={(next) => onChange({ ...node, left: next as ReferenceOperand })}
         />
-        <Field pointer={opPointer} label="연산자" placed={placed}>
+        <Field pointer={opPointer} label="Operator" placed={placed}>
           {(props) => (
             <select
               {...props}
@@ -507,13 +503,13 @@ function NodeEditor({
         <OperandEditor
           context={context}
           pointer={jptr(pointer, 'right')}
-          label="오른쪽"
+          label="Right operand"
           operand={node.right}
           allowed={OPERAND_KINDS}
           onChange={(next) => onChange({ ...node, right: next })}
         />
         <button type="button" className="button button--quiet" onClick={onRemove}>
-          {NODE_LABELS.compare} 삭제
+          Delete {NODE_LABELS.compare}
         </button>
       </FieldGroup>
     )
@@ -525,14 +521,14 @@ function NodeEditor({
       <OperandEditor
         context={context}
         pointer={jptr(pointer, 'left')}
-        label="왼쪽"
+        label="Left operand"
         operand={node.left}
         allowed={['field', 'source']}
         onChange={(next) => onChange({ ...node, left: next as ReferenceOperand })}
       />
       <div className="field">
         <label className="field__label" htmlFor={`${fieldId(pointer)}--negate`}>
-          포함 방향
+          Membership direction
         </label>
         <select
           id={`${fieldId(pointer)}--negate`}
@@ -540,20 +536,20 @@ function NodeEditor({
           value={node.negate ? 'not_in' : 'in'}
           onChange={(event) => onChange({ ...node, negate: event.target.value === 'not_in' })}
         >
-          <option value="in">에 포함된다 (in)</option>
-          <option value="not_in">에 포함되지 않는다 (not_in)</option>
+          <option value="in">is in (in)</option>
+          <option value="not_in">is not in (not_in)</option>
         </select>
       </div>
       <OperandEditor
         context={context}
         pointer={collectionPointer}
-        label="집합"
+        label="Collection"
         operand={node.collection}
         allowed={OPERAND_KINDS}
         onChange={(next) => onChange({ ...node, collection: next })}
       />
       <button type="button" className="button button--quiet" onClick={onRemove}>
-        {NODE_LABELS.member} 삭제
+        Delete {NODE_LABELS.member}
       </button>
     </FieldGroup>
   )
@@ -577,9 +573,10 @@ export function ConditionEditor({
     return (
       <div className="node node--empty" id={fieldId(pointer)} tabIndex={-1}>
         <p>
-          조건이 없습니다. 조건 없는 정책은 바인딩한 entity와 action에 항상 적용됩니다.
+          There is no condition. A policy without a condition always applies to the entities and
+          actions it is bound to.
         </p>
-        <AddNodeButtons suffix="추가" onAdd={(kind) => onChange(newNode(kind))} />
+        <AddNodeButtons onAdd={(kind) => onChange(newNode(kind))} />
       </div>
     )
   }

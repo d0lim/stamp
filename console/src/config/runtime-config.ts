@@ -65,35 +65,35 @@ export async function loadRuntimeConfig(
     response = await fetchImpl(CONFIG_URL, { credentials: 'omit', cache: 'no-store' })
   } catch (cause) {
     throw new ConfigError(
-      '콘솔 설정을 불러오지 못했습니다.',
-      `${CONFIG_URL} 요청이 실패했습니다: ${String(cause)}`,
+      'Could not load the console configuration.',
+      `The request for ${CONFIG_URL} failed: ${String(cause)}`,
     )
   }
   if (!response.ok) {
     throw new ConfigError(
-      '콘솔 설정을 불러오지 못했습니다.',
-      `${CONFIG_URL}이(가) ${response.status}을(를) 반환했습니다.`,
+      'Could not load the console configuration.',
+      `${CONFIG_URL} returned ${response.status}.`,
     )
   }
   let raw: unknown
   try {
     raw = await response.json()
   } catch (cause) {
-    throw new ConfigError('콘솔 설정을 해석하지 못했습니다.', String(cause))
+    throw new ConfigError('Could not parse the console configuration.', String(cause))
   }
   return parseRuntimeConfig(raw)
 }
 
 export function parseRuntimeConfig(raw: unknown): ConsoleRuntimeConfig {
   if (typeof raw !== 'object' || raw === null) {
-    throw new ConfigError('콘솔 설정 문서가 객체가 아닙니다.')
+    throw new ConfigError('The console configuration document is not an object.')
   }
   const doc = raw as Record<string, unknown>
   const version = doc.version
   if (version !== SUPPORTED_CONFIG_VERSION) {
     throw new ConfigError(
-      '콘솔 설정 문서의 버전을 이 빌드가 이해하지 못합니다.',
-      `문서 버전 ${String(version)}, 이 빌드가 아는 버전 ${SUPPORTED_CONFIG_VERSION}.`,
+      'This build does not understand the version of the console configuration document.',
+      `Document version ${String(version)}; this build knows version ${SUPPORTED_CONFIG_VERSION}.`,
     )
   }
 
@@ -103,7 +103,7 @@ export function parseRuntimeConfig(raw: unknown): ConsoleRuntimeConfig {
   const basePath = requireString(doc, 'basePath') || import.meta.env.BASE_URL
   const oidcRaw = doc.oidc
   if (typeof oidcRaw !== 'object' || oidcRaw === null) {
-    throw new ConfigError('콘솔 설정 문서에 oidc 항목이 없습니다.')
+    throw new ConfigError('The console configuration document has no oidc entry.')
   }
   const oidc = oidcRaw as Record<string, unknown>
 
@@ -138,15 +138,15 @@ function assertSafeApiBase(value: string): void {
     parsed = new URL(value)
   } catch {
     throw new ConfigError(
-      'API 기준 주소가 절대 주소가 아닙니다.',
-      `설정된 값: ${value}. 같은 오리진을 쓰려면 빈 값으로 두십시오.`,
+      'The API base address is not an absolute address.',
+      `Configured value: ${value}. Leave it empty to use the same origin.`,
     )
   }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new ConfigError('API 기준 주소의 스킴이 http 또는 https가 아닙니다.', value)
+    throw new ConfigError('The API base address scheme is neither http nor https.', value)
   }
   if (parsed.search !== '' || parsed.hash !== '') {
-    throw new ConfigError('API 기준 주소에 질의 문자열이나 조각이 포함되어 있습니다.', value)
+    throw new ConfigError('The API base address carries a query string or a fragment.', value)
   }
 }
 
@@ -154,7 +154,7 @@ function requireString(source: Record<string, unknown>, key: string): string {
   const value = source[key]
   if (value === undefined || value === null) return ''
   if (typeof value !== 'string') {
-    throw new ConfigError(`콘솔 설정 문서의 ${key} 항목이 문자열이 아닙니다.`)
+    throw new ConfigError(`The ${key} entry in the console configuration document is not a string.`)
   }
   return value
 }

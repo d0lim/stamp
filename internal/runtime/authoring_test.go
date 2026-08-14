@@ -31,10 +31,10 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// F4 — 파일 저작 왕복 (R45, R46, R48, R54)
+// F6 — File-authored set revision, as a round trip (R45, R46, R48, R54)
 // ---------------------------------------------------------------------------
 
-// TestF4FileAuthoringThroughTheCompositionRoot is the round trip the plan's
+// TestF6FileAuthoringThroughTheCompositionRoot is the round trip the
 // verification contract names — export, then apply, and nothing changes —
 // asserted over the real server instead of over the package.
 //
@@ -43,7 +43,7 @@ import (
 // about a process nobody handed a Service to. This one runs over HTTP, through
 // the mount table, the identity middleware and the capability gate, against the
 // same Postgres the deployment would use.
-func TestF4FileAuthoringThroughTheCompositionRoot(t *testing.T) {
+func TestF6FileAuthoringThroughTheCompositionRoot(t *testing.T) {
 	h := newHarness(t, harnessOptions{writerID: "f4-writer"})
 	h.seed(tenantSchema(), whitelistPolicy("whitelist-transfer"))
 

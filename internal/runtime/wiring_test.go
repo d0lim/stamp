@@ -38,7 +38,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// F1 — 계좌 화이트리스트 검사 (R1, R7, R13, R14)
+// F1 — Account whitelist check (R1, R7, R13, R14)
 // ---------------------------------------------------------------------------
 
 // TestF1AccountWhitelistCheck walks the whole check path: a PEP presents a
@@ -132,7 +132,7 @@ func TestF1AccountWhitelistCheck(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F2 — 정책 수정 정족수 승인 (R2, R3, R4, R6, R7, R21, R23)
+// F2 — Quorum approval of a policy change (R2, R3, R4, R6, R7, R21, R23)
 // ---------------------------------------------------------------------------
 
 // TestF2RevisionQuorumApproval walks the whole decide path for a policy change:
@@ -354,7 +354,8 @@ func TestF2RevisionQuorumApproval(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F3 — 시간 지연 결정과 정책 개정 (R3(delay), R5, R17, R18)
+// F3 — Pending decisions when a revision takes effect, over the delay kind
+// (R3(delay), R5, R17, R18)
 // ---------------------------------------------------------------------------
 
 // TestF3DelayedDecisionSurvivesARevision is M2's exit condition for the delay

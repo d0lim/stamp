@@ -13,9 +13,9 @@ This one is the control: it shares the parsers and the comparison with its three
 siblings, so a fixture set that failed for a structural reason shows up as this
 test failing rather than as three drift assertions quietly passing.
 
-## 엔드포인트
+## Endpoints
 
-| 메서드·경로 | 표면 | 인증 | 역할 |
+| Method and path | Surface | Auth | Roles |
 |---|---|---|---|
 | `POST /decisions` | PEP | workload | `decide` |
 | `GET /decisions/inbox` | console | user | `decide` |

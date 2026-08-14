@@ -43,8 +43,8 @@
 
 /*
  * The weakening badge is a bordered text label, not a colour swatch. R55 asks
- * for the distinction to survive without colour, and the word 완화 is the thing
- * that carries it.
+ * for the distinction to survive without colour, and the word "Weakening" is the
+ * thing that carries it.
  */
 .entry__weakening {
   border: 1px solid var(--warn-line);

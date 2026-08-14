@@ -44,17 +44,17 @@ export const DETAIL_POLL_MS = 5000
 
 /** What the binding hash covers, in the approver's words (R31). */
 const COVERED = [
-  '결정 식별 정보 (결정 ID·호출자·주체·리소스·액션)',
-  '요청 (request)',
-  '사실 스냅샷 (fact snapshot)',
-  '의무 (obligations)',
-  '승인자 집합 — 해석 방식·발급자·구성원(또는 claim·source)',
+  'Decision identity (decision ID · caller · subject · resource · action)',
+  'Request',
+  'Fact snapshot',
+  'Obligations',
+  'Approver set — resolution mode · issuer · members (or claim · source)',
 ]
 
 /** What it deliberately does not cover, and why. */
 const NOT_COVERED = [
-  '정족수 임계값 — 임계값만 올리는 개정에서 이미 모인 승인이 증발하지 않게 하기 위해 제외됩니다.',
-  '정책 버전 식별자 — 같은 이유로 제외됩니다.',
+  'Quorum threshold — excluded so that a revision which only raises the threshold does not evaporate the approvals already collected.',
+  'Policy version identifier — excluded for the same reason.',
 ]
 
 /**
@@ -73,8 +73,8 @@ const NOT_COVERED = [
  * what is waiting on you leaks nothing by leaving out what is not.
  */
 const NOT_FOUND = {
-  text: '이 결정을 열 수 없습니다 — 존재하지 않거나, 당신에게 열려 있지 않습니다. 서버는 이 둘을 구분해 답하지 않습니다.',
-  next: '승인함 목록을 다시 읽으십시오. 승인자 집합이 개정으로 바뀌었더라도, 당신을 기다리는 결정은 그 목록에 남아 있습니다.',
+  text: 'This decision cannot be opened — it does not exist, or it is not open to you. The server does not distinguish between the two.',
+  next: 'Read the approval inbox again. Even if a revision changed the approver set, a decision that is waiting on you is still on that list.',
 } as const
 
 /**
@@ -106,16 +106,16 @@ const RATE_LIMITED: ConsumedErrorCode = 'rate_limited'
  * Without a readable `Retry-After` the copy still stands, minus the number. The
  * header can be missing for reasons that have nothing to do with this
  * deployment's budget — a cross-origin response that does not expose it, an
- * intermediary that dropped it — and "잠시" is honest where a fabricated
+ * intermediary that dropped it — and "a moment" is honest where a fabricated
  * countdown would not be.
  */
 function rateLimited(seconds: number | undefined): { text: string; next: string } {
   return {
-    text: '승인 제출이 너무 잦아 이번 제출이 거부되었습니다. 이 승인은 기록되지 않았습니다.',
+    text: 'Approvals are being submitted too often, and this submission was refused. This approval was not recorded.',
     next:
       seconds === undefined
-        ? '잠시 기다린 뒤 승인 버튼을 다시 누르십시오. 운영자에게 알릴 일은 아닙니다 — 이 한도는 시간이 지나면 저절로 풀립니다.'
-        : `약 ${seconds}초 뒤에 승인 버튼을 다시 누르십시오. 운영자에게 알릴 일은 아닙니다 — 이 한도는 시간이 지나면 저절로 풀립니다.`,
+        ? 'Wait a moment, then press the approve button again. This is not something to tell an operator — the limit clears on its own.'
+        : `Wait about ${seconds} seconds, then press the approve button again. This is not something to tell an operator — the limit clears on its own.`,
   }
 }
 
@@ -132,20 +132,20 @@ const FAILURES: Readonly<
   Partial<Record<ConsumedErrorCode, { readonly text: string; readonly next: string }>>
 > = {
   expired: {
-    text: '이 결정은 만료되었습니다. 승인은 기록되지 않았습니다.',
-    next: '승인함으로 돌아가십시오. 필요하다면 요청자가 결정을 다시 만들어야 합니다.',
+    text: 'This decision has expired. The approval was not recorded.',
+    next: 'Return to the approval inbox. If it is still needed, the requester has to create the decision again.',
   },
   not_collecting: {
-    text: '이 challenge는 더 이상 제출을 받지 않습니다 — 이미 정족수가 충족되었거나 결정이 종결되었습니다.',
-    next: '아래의 수집 현황을 확인하십시오. 추가 승인은 필요하지 않습니다.',
+    text: 'This challenge no longer takes submissions — the quorum is already met, or the decision has been resolved.',
+    next: 'Check what has been collected, below. No further approval is needed.',
   },
   // Where `not_an_approver` used to be. The server no longer sends it: being
   // outside the approver set, naming a challenge that is not there, and naming
   // a decision that does not exist are one 404 with one body.
   not_found: NOT_FOUND,
   material_changed: {
-    text: '표시된 이후 결정 내용이 바뀌어 승인이 거부되었습니다 — 당신이 읽은 자료에 묶인 해시가 더 이상 유효하지 않습니다.',
-    next: '화면을 다시 읽고 바뀐 자료를 처음부터 검토하십시오.',
+    text: 'The decision changed after it was displayed, so the approval was refused — the hash bound to the material you read is no longer valid.',
+    next: 'Read the screen again and review the changed material from the start.',
   },
 }
 
@@ -160,10 +160,10 @@ export function ApprovalScreen() {
 
   return (
     <div className="panel">
-      <RouteAnnouncer title="승인 상세" />
-      <h1>승인 상세</h1>
+      <RouteAnnouncer title="Approval detail" />
+      <h1>Approval detail</h1>
       <p>
-        <Link to="/inbox">승인함으로 돌아가기</Link>
+        <Link to="/inbox">Back to the approval inbox</Link>
       </p>
 
       {unavailable ? (
@@ -173,12 +173,12 @@ export function ApprovalScreen() {
         </div>
       ) : error === null ? null : (
         <p className="notice notice--warning" role="alert" data-testid="review-error">
-          승인 자료를 읽지 못했습니다: {error}
+          The approval material could not be read: {error}
         </p>
       )}
 
       {review === null ? (
-        unavailable ? null : <p>승인 자료를 읽는 중입니다…</p>
+        unavailable ? null : <p>Reading the approval material…</p>
       ) : (
         <ReviewBody
           api={api}
@@ -199,8 +199,8 @@ function useReview(api: ApiClient, decisionID: string, ordinal: string) {
   const [error, setError] = useState<string | null>(null)
   // Kept apart from `error` because it is not one: the read succeeded and the
   // answer was that there is nothing here for this reader. It gets the refusal
-  // the server can no longer word for us, rather than "읽지 못했습니다: 대상을
-  // 찾을 수 없습니다", which reads like an outage.
+  // the server can no longer word for us, rather than "could not be read: the
+  // target was not found", which reads like an outage.
   const [unavailable, setUnavailable] = useState(false)
 
   const load = useCallback(async () => {
@@ -320,24 +320,26 @@ function ReviewBody({
 
       {proposal === null ? null : proposal.mismatch ? (
         <p className="notice notice--warning" role="alert" data-testid="digest-mismatch">
-          이 결정이 고정한 delta digest와 지금 읽은 개정 제안의 digest가 다릅니다. 화면에 그려질
-          변경 내용이 승인 해시가 덮는 그 변경이라고 보장할 수 없으므로 표시하지 않습니다.
+          The delta digest this decision froze differs from the digest of the revision proposal just
+          read. There is no guarantee that the change that would be drawn is the change the approval
+          hash covers, so it is not shown.
         </p>
       ) : proposal.proposal === null ? (
         <p className="notice notice--warning" data-testid="proposal-unavailable">
-          이 결정이 가리키는 개정 제안({proposal.ref.proposalID})을 읽지 못했습니다. 아래의 해시
-          입력 자료만 표시합니다.
+          The revision proposal this decision points at ({proposal.ref.proposalID}) could not be
+          read. Only the hash input material below is shown.
         </p>
       ) : null}
 
-      <h2>검토 항목</h2>
+      <h2>Review entries</h2>
       <p data-testid="delta-summary">
-        변경된 정책 {summary.policies}건 · 완화로 분류된 항목 {summary.weakening}건 · 읽은 항목{' '}
-        {gate.seen.size} / {entries.length}
+        {summary.policies} policies changed · {summary.weakening} classified as weakening ·{' '}
+        {gate.seen.size} / {entries.length} entries read
       </p>
       <p className="field__hint">
-        접기는 표시를 감추지 않습니다 — 접힌 항목의 내용도 화면에 남아 스크린 리더와 페이지 내
-        검색에 잡힙니다. 승인 버튼은 모든 항목을 한 번씩 펼친 뒤에 열립니다.
+        Collapsing hides nothing — a collapsed entry's content stays on the page, where a screen
+        reader and find-in-page still reach it. The approve button opens once every entry has been
+        expanded one time.
       </p>
       <button
         type="button"
@@ -345,7 +347,7 @@ function ReviewBody({
         onClick={gate.expandAll}
         data-testid="expand-all"
       >
-        모두 펼치기
+        Expand all
       </button>
 
       <ul className="entry-list" data-testid="entry-list">
@@ -354,9 +356,13 @@ function ReviewBody({
             <Disclosure
               summary={
                 <span className="entry__summary">
-                  <span className="entry__title">{entry.title}</span>
-                  <span className="entry__meta">{entry.meta}</span>
-                  {entry.weakening ? <span className="entry__weakening">완화</span> : null}
+                  {/* The spaces are load-bearing and not layout: this row is a
+                      flex container, which drops a whitespace-only text node,
+                      but the accessible name keeps it. Without them a screen
+                      reader announces the trigger as "policy-0Modified". */}
+                  <span className="entry__title">{entry.title}</span>{' '}
+                  <span className="entry__meta">{entry.meta}</span>{' '}
+                  {entry.weakening ? <span className="entry__weakening">Weakening</span> : null}
                 </span>
               }
               expanded={gate.isExpanded(entry)}
@@ -438,14 +444,14 @@ function EntryBody({ entry }: { readonly entry: ReviewEntry }) {
         <ul className="trace" data-testid={`findings-${change.policy_id}`}>
           {entry.findings.map((finding, index) => (
             <li key={`${finding.reason}-${index}`}>
-              <strong>완화</strong> · {finding.reason} — {finding.detail}
+              <strong>Weakening</strong> · {finding.reason} — {finding.detail}
             </li>
           ))}
         </ul>
       )}
       {change.from_origin === undefined || change.to_origin === undefined ? null : (
         <p className="field__hint">
-          소유 경로: {change.from_origin} → {change.to_origin}
+          Ownership path: {change.from_origin} → {change.to_origin}
         </p>
       )}
       <DocumentDiff
@@ -460,32 +466,32 @@ function EntryBody({ entry }: { readonly entry: ReviewEntry }) {
 function BindingPanel({ review }: { readonly review: QuorumReview }) {
   return (
     <section className="binding" aria-labelledby="binding-heading">
-      <h2 id="binding-heading">승인 바인딩 해시</h2>
+      <h2 id="binding-heading">Approval binding hash</h2>
       <p className="field__hint">
-        승인은 아래 해시에 묶입니다. 서버가 내려준 값을 그대로 제출에 실어 보내므로, 지금 보고 있는
-        자료가 바뀌면 제출이 거부됩니다.
+        The approval is bound to the hash below. The value the server sent is what the submission
+        carries, verbatim, so if the material you are looking at changes the submission is refused.
       </p>
       <p className="document" data-testid="binding-hash">
         {review.binding_hash}
       </p>
-      <h3>해시가 덮는 것</h3>
+      <h3>What the hash covers</h3>
       <ul data-testid="binding-covered">
         {COVERED.map((item) => (
           <li key={item}>{item}</li>
         ))}
       </ul>
-      <h3>해시가 덮지 않는 것</h3>
+      <h3>What the hash does not cover</h3>
       <ul data-testid="binding-not-covered">
         {NOT_COVERED.map((item) => (
           <li key={item}>{item}</li>
         ))}
       </ul>
       <dl className="summary-list">
-        <dt>수집 현황</dt>
+        <dt>Collected</dt>
         <dd data-testid="collection-progress">
           {review.have} / {review.need}
         </dd>
-        <dt>만료</dt>
+        <dt>Expires</dt>
         <dd>{review.decision.expires_at}</dd>
       </dl>
     </section>
@@ -535,11 +541,11 @@ function SubmitPanel({
 
   return (
     <section className="submit" aria-labelledby="submit-heading">
-      <h2 id="submit-heading">승인</h2>
+      <h2 id="submit-heading">Approval</h2>
       <p id="approve-gate" className="field__hint" data-testid="approve-gate">
         {ready
-          ? '모든 항목을 펼쳤습니다. 승인하면 위 해시에 묶인 자료를 검토했다는 기록이 남습니다.'
-          : `아직 펼치지 않은 항목이 ${unread}건 있습니다. 모든 항목을 한 번씩 펼쳐야 승인할 수 있습니다.`}
+          ? 'Every entry has been expanded. Approving records that you reviewed the material bound to the hash above.'
+          : `${unread} ${unread === 1 ? 'entry has' : 'entries have'} not been expanded yet. Every entry has to be expanded one time before you can approve.`}
       </p>
       <button
         type="button"
@@ -549,12 +555,12 @@ function SubmitPanel({
         aria-describedby="approve-gate"
         data-testid="approve"
       >
-        승인
+        Approve
       </button>
       <p className="field__hint" data-testid="reject-unavailable">
-        거부 제출은 이 버전에서 수집하지 않습니다 — 거부가 결정을 즉시 deny로 옮기는지, 정족수
-        충족 불가가 확정될 때까지 pending인지가 아직 정해지지 않았기 때문입니다. 승인하지 않으면
-        이 결정은 정족수를 채우지 못한 채 만료됩니다.
+        This version does not collect rejections — whether a rejection moves the decision straight
+        to deny, or leaves it pending until the quorum is certainly unreachable, is not settled yet.
+        If you do not approve, this decision expires without reaching its quorum.
       </p>
 
       {failure === null ? null : (
@@ -566,9 +572,9 @@ function SubmitPanel({
 
       {result === null ? null : (
         <div className="proposal" role="status" data-testid="submit-result">
-          <h3>승인이 기록되었습니다</h3>
+          <h3>The approval was recorded</h3>
           <dl className="summary-list">
-            <dt>결정 상태</dt>
+            <dt>Decision state</dt>
             <dd>{result.state}</dd>
             {(result.challenges ?? []).map((challenge) => (
               <div key={challenge.ordinal} className="summary-list__pair">
@@ -609,10 +615,10 @@ export function failureOf(cause: unknown): { text: string; next: string } {
     if (cause.isNotFound) return NOT_FOUND
     return {
       text: errorMessageOf(cause) ?? cause.message,
-      next: '문제가 계속되면 운영자에게 이 화면의 결정 식별자를 전달하십시오.',
+      next: 'If this continues, give an operator the decision identifier on this screen.',
     }
   }
-  return { text: describe(cause), next: '네트워크 상태를 확인한 뒤 다시 시도하십시오.' }
+  return { text: describe(cause), next: 'Check the network and try again.' }
 }
 
 function describe(cause: unknown): string {

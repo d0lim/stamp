@@ -96,13 +96,13 @@ export function GovernanceBanner({
     <>
       {state.error === null ? null : (
         <p className="notice notice--warning" data-testid="governance-error">
-          거버넌스 상태를 읽지 못했습니다: {state.error}
+          Could not read the governance state: {state.error}
         </p>
       )}
 
       {view?.mode === 'solo_admin' ? (
         <p className="notice notice--warning" data-testid="unlocked-warning">
-          이 설치는 거버넌스가 잠기지 않았습니다. 개정이 정족수 없이 발효됩니다.
+          This installation's governance is not locked. Revisions take effect without a quorum.
         </p>
       ) : null}
 
@@ -110,18 +110,20 @@ export function GovernanceBanner({
         <div className="notice notice--warning" data-testid="pending-revision-banner">
           <div>
             <p className="notice__text">
-              이미 열려 있는 개정 제안이 있습니다 — 승인자는 한 번에 하나의 diff만 봅니다. 이 제안이
-              끝나기 전에는 새 개정을 제출할 수 없습니다.
+              A revision proposal is already open — approvers review one diff at a time. No new
+              revision can be submitted until this proposal finishes.
             </p>
-            <Disclosure summary={`제안 ${pending.id} · 승인 ${pending.threshold}명 필요`}>
+            <Disclosure
+              summary={`Proposal ${pending.id} · ${pending.threshold} approvals required`}
+            >
               <dl className="summary-list">
-                <dt>제안자</dt>
+                <dt>Proposer</dt>
                 <dd>{pending.proposer_id}</dd>
-                <dt>상태</dt>
+                <dt>State</dt>
                 <dd>{pending.state}</dd>
-                <dt>변경 대상</dt>
+                <dt>Changed policies</dt>
                 <dd>{changedPolicies(pending).join(', ')}</dd>
-                <dt>델타 다이제스트</dt>
+                <dt>Delta digest</dt>
                 <dd>
                   <code>{pending.delta_digest}</code>
                 </dd>
@@ -141,10 +143,12 @@ export function GovernanceBanner({
               onClick={() => withdraw(pending.id)}
               data-testid="withdraw-revision"
             >
-              내 제안 철회
+              Withdraw my proposal
             </button>
           ) : (
-            <p className="notice__text">이 제안은 다른 사람이 올렸습니다. 철회는 제안자만 할 수 있습니다.</p>
+            <p className="notice__text">
+              Someone else opened this proposal. Only the proposer can withdraw it.
+            </p>
           )}
         </div>
       )}

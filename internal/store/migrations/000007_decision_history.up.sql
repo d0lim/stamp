@@ -1,7 +1,8 @@
 -- The audit console's query axes and the approver inbox, indexed.
 --
--- The plan deferred "감사 콘솔의 조회 축(기간·정책·주체·상태)과 정렬·페이지네이션,
--- 대응 인덱스" to U16's design time and asked for the answer to land in this
+-- The requirements deferred the audit console's query axes (period, policy,
+-- subject, state) with their ordering, pagination and the indexes that serve
+-- them to design time, and asked for the answer to land in this
 -- directory. internal/store/history.go states the axes; these are the indexes
 -- that make them a seek rather than a scan.
 --

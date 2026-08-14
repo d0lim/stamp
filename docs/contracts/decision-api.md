@@ -4,43 +4,43 @@ version: 1.8.1
 source: internal/api
 ---
 
-# 결정 API 계약
+# Decision API contract
 
-엔진이 HTTP로 노출하는 표면이다. 공개 계약 3종 중 하나이며 semver로 버전 관리한다(R11). 정본은 `internal/api`의 라우트 선언이고, 콘솔이 부르는 부분집합은 `internal/api/contract.go`에서 기계가 읽는 형태로 따로 내보내진다 — 콘솔은 이 계약 밖의 엔드포인트를 갖지 않으며 CI가 검사한다(D19).
+The surface the engine exposes over HTTP. One of the three public contracts, versioned with semver (R11). The source of truth is the route declarations in `internal/api`, and the subset the console calls is exported separately in machine-readable form from `internal/api/contract.go` — the console has no endpoint outside this contract, and CI checks that (D19).
 
-경로의 `v1`은 이 계약의 메이저와 같다.
+The `v1` in the paths is this contract's major.
 
-## 버전 규칙
+## Version rules
 
-| 변경 | 등급 |
+| Change | Level |
 |---|---|
-| 엔드포인트 제거, 경로·메서드·인증 요건 변경, 응답 필드 제거나 의미 변경, 요청 필드의 필수화 | major |
-| 엔드포인트 추가, 선택 요청 필드 추가, 응답 필드 추가 | minor |
-| 의미를 바꾸지 않는 수정 | patch |
+| Removing an endpoint; changing a path, a method or an authentication requirement; removing a response field or changing its meaning; making a request field required | major |
+| Adding an endpoint, adding an optional request field, adding a response field | minor |
+| A correction that does not change meaning | patch |
 
-## 표면은 셋이고, 경로 접두사가 아니라 리스너다
+## Three surfaces, and they are listeners rather than path prefixes
 
-| 표면 | 기본 주소 | 허용 인증 | 호출자 |
+| Surface | Default address | Auth accepted | Callers |
 |---|---|---|---|
-| PEP | `:8080` | workload | 클라이언트 자격증명을 든 워크로드 |
-| console | `:8081` | user, static | 최종 사용자 토큰을 든 운영자·승인자 |
-| callback | 미바인딩 | workload, public | challenge를 완료시키는 외부 시스템 |
+| PEP | `:8080` | workload | workloads holding client credentials |
+| console | `:8081` | user, static | operators and approvers holding end-user tokens |
+| callback | unbound | workload, public | external systems completing a challenge |
 
-한 표면에 마운트된 라우트는 다른 표면으로 도달할 수 없다. 다른 리스너의 라우터는 그 라우트를 들어본 적이 없다 — 404이지 403이 아니다. 이것이 콜백 수신 표면을 PEP·콘솔 표면과 분리해 노출하라는 R39의 이행 형태다.
+A route mounted on one surface is not reachable through another. The other listener's router has never heard of it — a 404, not a 403. This is the form R39 takes, which asks that the callback-receiving surface be exposed separately from the PEP and console surfaces.
 
-역할이 꺼진 프로세스도 마찬가지다. 활성이 아닌 역할의 엔드포인트는 그 프로세스에서 404다.
+The same holds for a process with a role switched off. An endpoint belonging to a role that is not active answers 404 on that process.
 
-모든 표면이 인증 없는 `GET /healthz`와 `GET /readyz`를 답하고, 두 응답 모두에 어느 리스너가 답했는지를 담은 `X-Stamp-Surface` 헤더가 붙는다.
+Every surface answers `GET /healthz` and `GET /readyz` without authentication, and both responses carry an `X-Stamp-Surface` header naming which listener answered.
 
-`GET /healthz`는 **살아 있음 신호일 뿐 준비 신호가 아니다** — 데이터베이스도 감사 버퍼도 조회하지 않고, 언제나 200이다.
+`GET /healthz` is **a liveness signal and not a readiness one** — it queries neither the database nor the audit buffer, and is always 200.
 
-`GET /readyz`가 준비 신호다. 이 프로세스로 보낸 요청이 실제로 처리될 수 있으면 200 `ready`, 아니면 503과 그 이유를 담은 평문 한 줄이다. 1.6.0에서 답하는 조건은 스키마 하나다: 데이터베이스에 적용된 마이그레이션 버전이 이 바이너리가 필요로 하는 버전에 도달했는가. 마이그레이션을 적용하는 티어는 `api` 하나뿐인데 `helm upgrade`는 모든 Deployment를 동시에 굴리므로, 새 이미지의 decide 파드가 옛 스키마를 보고 있는 구간이 존재한다. 그 구간에서 이 파드는 Service에서 빠져 있어야 하며 — 그렇지 않으면 모든 결정 조회가 `42703 column ... does not exist`가 된다 — 그것이 이 엔드포인트가 하는 일의 전부다. 스키마가 dirty이거나 데이터베이스에 닿을 수 없어도 503이다.
+`GET /readyz` is the readiness signal. If a request sent to this process can actually be served it answers 200 `ready`; otherwise 503 and one line of plain text stating why. In 1.6.0 it answers on a single condition, the schema: whether the migration version applied to the database has reached the version this binary requires. Only the `api` tier applies migrations, and `helm upgrade` rolls every Deployment at once, so there is a window in which a decide pod on the new image is looking at the old schema. In that window this pod has to be out of its Service — otherwise every decision read becomes `42703 column ... does not exist` — and that is the whole of what this endpoint does. A dirty schema, or a database it cannot reach, is a 503 as well.
 
-두 경로 모두 이 문서의 엔드포인트 표에 없다. 역할과 무관하게 리스너가 직접 답하므로 표의 넷째 열이 가리킬 역할이 없기 때문이다.
+Neither path is in this document's endpoint table. The listener answers them itself, independently of any role, so there is no role for the table's fourth column to name.
 
-## 엔드포인트
+## Endpoints
 
-| 메서드·경로 | 표면 | 인증 | 역할 |
+| Method and path | Surface | Auth | Roles |
 |---|---|---|---|
 | `POST /access/v1/evaluation` | PEP | workload | `check` |
 | `POST /decisions` | PEP | workload | `decide` |
@@ -67,18 +67,18 @@ source: internal/api
 | `GET /governance` | console | user | `api` |
 | `POST /governance/lock` | console | user | `api` |
 | `GET /console/config.json` | console | static | `console` |
-| `/console/` (하위 트리) | console | static | `console` |
-| `/console` (하위 트리로의 리다이렉트) | console | static | `console` |
+| `/console/` (subtree) | console | static | `console` |
+| `/console` (redirect into the subtree) | console | static | `console` |
 
-**이 표는 `internal/release`가 실제 마운트 표와 대조한다.** 마운트됐는데 행이 없거나, 행이 있는데 아무 컴포넌트도 마운트하지 않거나, 표면·인증·역할이 다르면 CI가 빨개진다([#44](https://github.com/d0lim/stamp/issues/44)). 버전 문자열 비교로는 구조적으로 잡을 수 없던 것이다. **1.3.1은 그 대조가 처음 잡은 것을 반영한다** — 하위 트리 리다이렉트 `/console`이 표에 없었고, 하위 트리 라우트가 `GET`을 싣는 것처럼 적혀 있었다. 엔드포인트는 하나도 바뀌지 않았고 문서만 고쳐졌다(의미를 바꾸지 않는 수정 = patch). 인증 없는 `GET /healthz`와 `GET /readyz`는 이 표에 없다 — 역할과 무관하게 리스너가 직접 답하므로 네 번째 열이 가리킬 역할이 없다.
+**`internal/release` compares this table against the real mount table.** A route that is mounted with no row here, a row no component mounts, or a difference in surface, auth or roles turns CI red ([#44](https://github.com/d0lim/stamp/issues/44)). It is what comparing version strings structurally could not catch. **1.3.1 records the first thing that comparison caught** — the subtree redirect `/console` was missing from the table, and the subtree routes were written as though they carried `GET`. Not one endpoint changed; only the document was corrected (a correction that does not change meaning = patch). The unauthenticated `GET /healthz` and `GET /readyz` are not in this table — the listener answers them itself, independently of any role, so there is no role for the fourth column to name.
 
-**콘솔의 두 정적 라우트는 메서드를 싣지 않는다.** net/http는 경로가 맞고 메서드가 다른 패턴에 405를 답하므로, `GET /console/` 하위 트리를 선언하면 콘솔만 서빙하는 티어가 `POST /console/v1/policies/dry-run`에 405를 답한다 — 그 엔드포인트를 서빙하지 않는 유일한 티어가 "여기 있다"고 말하는 것이다. 메서드 판정은 핸들러 안으로 옮겨져 404로 돌아온다.
+**The console's two static routes carry no method.** net/http answers 405 to a pattern whose path matches and whose method does not, so declaring the subtree as `GET /console/` would make a console-only tier answer 405 to `POST /console/v1/policies/dry-run` — the one tier that does not serve that endpoint saying "it is here". The method decision moved inside the handler, and comes back as a 404.
 
-두 콜백 엔드포인트가 `public`인 것은 인증이 없다는 뜻이지 통제가 없다는 뜻이 아니다. 외부 콜백은 서명(`X-Stamp-Signature`)과 서버가 발급한 nonce로, MFA 콜백은 서버가 개시한 상관자로 결속된다 — 표시용 값이 아니라 그쪽이 결속의 정본이다(D16).
+`public` on the callback endpoints means there is no authentication, not that there is no control. An external callback is bound by a signature (`X-Stamp-Signature`) and a server-issued nonce, and the MFA callback by a server-initiated correlator — those are the binding's source of truth rather than values carried for display (D16).
 
 ## AuthZEN check
 
-`POST /access/v1/evaluation`은 AuthZEN Access Evaluation이다(D4).
+`POST /access/v1/evaluation` is an AuthZEN Access Evaluation (D4).
 
 ```json
 {"subject": {"type": "user", "id": "alice", "properties": {}},
@@ -93,251 +93,251 @@ source: internal/api
              "stamp.policy_version": "...", "stamp.obligations": []}}
 ```
 
-네 개의 네임스페이스 키는 항상 존재한다. `stamp.obligations`는 check 경로에서 **항상 비어 있다** — obligation은 결정과 함께 오며, 없는 것과 빈 것을 구별할 수 없게 만들지 않으려고 키 자체는 남긴다.
+The four namespaced keys are always present. `stamp.obligations` is **always empty on the check path** — obligations arrive with a decision, and the key itself stays so that absent and empty do not become indistinguishable.
 
-**평가 실패는 500이 아니라 deny다.** 요청 본문 상한은 1MiB이고, 감사 버퍼가 fail-closed 상태로 포화되면 본문을 읽기 전에 deny한다.
+**A failed evaluation is a deny, not a 500.** The request body is bounded at 1MiB, and when the audit buffer saturates while fail-closed the surface denies before it reads the body.
 
-**`subject.id`와 `resource.id`는 255바이트를 넘을 수 없다**(1.6.0). 넘으면 `400 invalid_request`이며 **평가는 일어나지 않는다** — 본문 상한과 달리 이것은 값 하나에 대한 상한이다. 상한이 필요한 이유는 decide 쪽에 있다: 주체 식별자는 주체별 속도 한도 표의 **키**이고 맵 키는 자기 바이트를 붙잡으므로, 상한이 없으면 8192개 항목이라는 표의 상한이 항목 **수**만 묶고 크기는 호출자가 고르는 것이 된다. 같은 값이 거부 감사 이벤트에도 그대로 들어간다. 그래도 판정은 check·decide 양쪽에서 같다 — 두 엔드포인트가 같은 본문을 받는다는 것이(KTD1) 한쪽만 받아주는 식별자가 있어선 안 된다는 뜻이기 때문이다. 255는 `Idempotency-Key`가 이미 지고 있는 상한이고, 실재하는 식별자는 계좌번호·uuid·`sub` 클레임이라 근처에도 오지 않는다.
+**`subject.id` and `resource.id` may not exceed 255 bytes** (1.6.0). Over that it is `400 invalid_request`, and **no evaluation happens** — unlike the body bound, this is a bound on a single value. The reason it is needed is on the decide side: a subject identifier is a **key** in the per-subject rate limit table, and a map key holds on to its own bytes, so without a bound the table's limit of 8192 entries bounds only the **number** of entries while the caller picks their size. The same value goes verbatim into the refusal's audit event. The judgment is still the same on check and on decide — the two endpoints taking the same body (KTD1) means there must be no identifier one of them accepts and the other does not. 255 is the bound `Idempotency-Key` already carries, and the identifiers that exist in practice — account numbers, uuids, `sub` claims — come nowhere near it.
 
-오류 응답은 `{"error": "...", "message": "..."}`다 — 코드 어휘는 아래 "`error` 코드 어휘"가 기술한다.
+An error response is `{"error": "...", "message": "..."}` — the code vocabulary is described under "The `error` code vocabulary" below.
 
-## 헤더
+## Headers
 
-| 헤더 | 뜻 |
+| Header | Meaning |
 |---|---|
-| `X-Stamp-Surface` | `/healthz`·`/readyz`가 어느 리스너에서 답했는지 |
-| `X-Stamp-Bootstrap-Token` | 잠금 전 거버넌스 요청이 일회용 부트스트랩 토큰을 싣는 자리 |
-| `X-Stamp-Signature` | 외부 challenge 콜백의 서명 |
-| `X-Stamp-Component` | 콘솔 서빙 응답의 표식 |
-| `Retry-After` | 속도 한도로 거부된 응답에만 붙는다. 값은 그 예산의 **재충전 간격**(초) |
-| `Idempotency-Key` | `POST /decisions`가 받는 **선택** 요청 헤더. 그 decide 시도의 이름이고, 1.7.0부터 그 이름은 자기가 가리키는 요청에 묶인다 (1.5.0, [#47](https://github.com/d0lim/stamp/issues/47)) |
+| `X-Stamp-Surface` | Which listener answered `/healthz` or `/readyz` |
+| `X-Stamp-Bootstrap-Token` | Where a pre-lock governance request carries the one-time bootstrap token |
+| `X-Stamp-Signature` | The signature on an external challenge callback |
+| `X-Stamp-Component` | The marker on a response the console served |
+| `Retry-After` | Attached only to a response refused by a rate limit. The value is that budget's **refill interval**, in seconds |
+| `Idempotency-Key` | An **optional** request header `POST /decisions` accepts. It is the name of that decide attempt, and since 1.7.0 that name is bound to the request it names (1.5.0, [#47](https://github.com/d0lim/stamp/issues/47)) |
 
-**`Retry-After`는 속도 한도 거부에만 붙고, 정책 deny에는 붙지 않는다.** 정책 deny는 판정이고 판정은 타이머로 만료되지 않는다 — 재시도하면 영원히 같은 답이다. 두 deny를 전송 수준에서 가르는 것이 이 헤더이므로 양쪽에 붙이면 아무 데도 안 붙인 것보다 나쁘다.
+**`Retry-After` is attached to a rate-limit refusal and not to a policy deny.** A policy deny is a judgment, and a judgment does not expire on a timer — retry it and the answer is the same forever. This header is what separates the two denies at the transport level, so attaching it to both is worse than attaching it to neither.
 
-값은 **버킷이 가득 차기까지**가 아니라 **토큰 하나가 다시 생기기까지**다. 거부된 호출자에게 필요한 것은 한 번 더 보낼 수 있는 시각이고, 그 위의 burst는 이미 쓴 여유다. 초 단위로 올림한다(하한 1초, 상한 3600초).
+The value is the time until **one token is back**, not until **the bucket is full**. What a refused caller needs is the moment it may send once more; the burst above that is headroom it has already spent. Rounded up to whole seconds (floor 1 second, ceiling 3600).
 
-`decide`에서 이 헤더는 **`200` 응답에 붙는다.** RFC 9110이 명시한 자리(429·503·3xx)가 아니라는 것을 알고 그렇게 한다 — 아래 "deny의 `reason`"이 말하듯 속도 한도 거부는 **결정 객체**이고 그 성질은 바꾸지 않는다. 승인 제출과 위임 취소의 거부는 `429`이고, 거기서는 헤더가 명세 그대로의 자리에 있다.
+On `decide` this header is attached to a **`200`** response. That is knowingly not where RFC 9110 puts it (429, 503, 3xx) — as "The `reason` on a deny" below says, a rate-limit refusal there is a **decision object**, and that is not being changed. Refusals of an approval submission and of a delay cancellation are `429`, and there the header sits exactly where the specification puts it.
 
-**그리고 그 자리에서 이 헤더는 사실상 참고값이다. 이 문단이 그 사실을 감추지 않으려고 있다.** 재시도를 자동으로 해 주는 클라이언트 구현들은 거의 예외 없이 **상태 코드로 먼저 분기한다** — Go의 `http.Client`, 파이썬의 urllib3 `Retry`, 자바의 `HttpClient`, axios의 재시도 계열 모두 `429`·`5xx`를 보고 나서야 헤더를 읽는다. decide의 셰딩 거부는 `200`이므로 **그 헤더를 읽을 계층에 도달하지 못한다.** 값을 존중받으려면 클라이언트가 `state: denied`와 `reason`을 읽고 스스로 대기하는 코드를 써야 하고, 그것은 이 헤더가 없어도 쓸 수 있는 코드다.
+**And in that position the header is effectively advisory. This paragraph is here so that fact is not hidden.** Client implementations that retry automatically almost without exception **branch on the status code first** — Go's `http.Client`, Python's urllib3 `Retry`, Java's `HttpClient` and the axios retry family all read the header only after seeing a `429` or a `5xx`. A shed refusal on decide is a `200`, so it **never reaches the layer that would read that header.** For the value to be honoured, the client has to read `state: denied` and `reason` and wait on its own — and that is code it could write with no header at all.
 
-그러면 무엇을 얻는가. **관측 가능성이다.** 메시 사이드카·로그 파이프라인·메트릭 익스포터는 본문을 해석하지 않고 헤더 표를 읽으므로, 이제 셰딩된 요청과 판정된 요청을 세어 가를 수 있다 — [#45](https://github.com/d0lim/stamp/issues/45)가 실제로 가져다준 것이 이것이고, "PEP가 이 헤더를 보고 물러난다"가 아니다. 반대로 **승인 제출과 위임 취소의 `429`에서는 명세 그대로 동작하고 클라이언트들도 실제로 지킨다.** 두 자리를 같은 문장으로 설명하면 하나는 과장이 된다.
+So what is gained. **Observability.** A mesh sidecar, a log pipeline and a metrics exporter read the header table without parsing the body, so shed requests can now be counted apart from judged ones — that is what [#45](https://github.com/d0lim/stamp/issues/45) actually delivered, not "the PEP sees this header and backs off". On the `429` of an approval submission and of a delay cancellation, by contrast, **it works exactly as specified, and clients do honour it.** Describe both positions in one sentence and one of them becomes an overstatement.
 
 ## decide
 
-`POST /decisions`가 결정을 만든다. 요청 본문은 **check와 같은 모양**(AuthZEN Access Evaluation 요청)에 선택 필드 `ttl`(기간 문자열, 상한 `DefaultMaxDecisionTTL` = 24h)이 더해진 것이다 — PEP가 두 호출을 같은 입력으로 부를 수 있어야 하기 때문이다. **응답은 AuthZEN이 아니다.** `decision.Result`이고 R2가 요구하는 넷을 싣는다: 상태, 요구 challenge와 수집 현황(`have`/`need`), 만료 시각, obligation.
+`POST /decisions` creates a decision. The request body is **the same shape as check's** (an AuthZEN Access Evaluation request) plus one optional field, `ttl` (a duration string, bounded by `DefaultMaxDecisionTTL` = 24h) — a PEP has to be able to call both with the same input. **The response is not AuthZEN.** It is a `decision.Result`, and it carries the four things R2 requires: the state, the challenges required and how far collection has got (`have`/`need`), the expiry, and the obligations.
 
-상태 코드가 **요청의 유효성이 아니라 결과**를 따른다:
+The status code follows **the outcome rather than the validity of the request**:
 
-| 결과 | 상태 | 본문 |
+| Outcome | Status | Body |
 |---|---|---|
-| 결정이 생성됨(pending 또는 allow) | `201` + `Location: /decisions/{id}` | `id` 있음 |
-| deny | `200` | `id` 없음 — deny는 결정 행을 만들지 않는다 |
+| A decision was created (pending or allow) | `201` + `Location: /decisions/{id}` | carries `id` |
+| deny | `200` | no `id` — a deny creates no decision row |
 
-그래서 **클라이언트는 상태 코드만으로 `id`의 존재를 판단할 수 없다.** 양쪽 모두 `state`와 `id`를 읽어야 한다.
+So **a client cannot tell from the status code alone whether there is an `id`.** Both cases have to be read out of `state` and `id`.
 
-`GET /decisions/{id}`는 **생성 호출자에게만** 열린다(R40). 대상 승인자를 위한 조회는 콘솔 표면의 `GET /audit/decisions/{id}`다 — 워크로드 자격과 사용자 토큰은 하나의 라우트가 함께 서빙할 수 없다. **권한 없는 조회와 존재하지 않는 결정은 응답 바이트까지 구분되지 않는다**: 결정의 존재 여부가 새면 안 된다. 1.4.0부터 이것은 콘솔 쪽 네 표면에서도 같다 — 아래 "`error` 코드 어휘"를 보라.
+`GET /decisions/{id}` is open **to the creating caller alone** (R40). The read for a targeted approver is `GET /audit/decisions/{id}` on the console surface — one route cannot serve both a workload credential and an end-user token. **A read without standing and a decision that does not exist are indistinguishable down to the response bytes**: whether a decision exists must not leak. Since 1.4.0 the same holds on the four console-side surfaces — see "The `error` code vocabulary" below.
 
-### `Idempotency-Key`: 재시도가 두 번째 결정을 만들지 않게 하는 법
+### `Idempotency-Key`: how a retry is kept from creating a second decision
 
-`POST /decisions`는 선택 요청 헤더 `Idempotency-Key`를 받는다. 값은 호출자가 만드는 불투명한 토큰이고 **그 시도의 이름**이다. 다만 **이름은 자기가 가리키는 요청에 묶인다**(1.7.0) — 서버는 결정을 만들 때 그 요청의 지문을 함께 얼려 두고, 같은 키가 다시 오면 지문을 대조한다.
+`POST /decisions` accepts the optional request header `Idempotency-Key`. The value is an opaque token the caller mints, and it is **the name of that attempt**. The name, though, **is bound to the request it names** (1.7.0) — when the server creates the decision it freezes a fingerprint of that request alongside it, and compares the fingerprint when the same key arrives again.
 
-| 규칙 | 내용 |
+| Rule | What it says |
 |---|---|
-| 범위 | **(호출자, 키)**. 다른 워크로드가 같은 키를 써도 다른 결정이다 — 키는 호출자가 자기 시도에 붙인 이름이지 공유 네임스페이스의 좌표가 아니고, 결정 식별자는 R40이 읽기를 허용하는 값이다 |
-| 모양 | 1–255바이트, 공백 없는 출력 가능 ASCII. 벗어나면 `400 invalid_request`이며 **평가는 일어나지 않는다** |
-| 없을 때 | 이 헤더 이전과 **완전히 같다**. 키 없는 두 번의 decide는 두 개의 결정이다 |
-| 같은 키 + **같은 요청** | 처음 만든 결정을 **그 시점의 상태로** 답한다. 새 행도, 새 challenge도, 새 IdP 호출도 없다 |
-| 같은 키 + **다른 요청** | `409 idempotency_key_reused` (1.7.0). 첫 결정은 **답으로 오지 않고**, 식별자도 실리지 않는다. 새 키를 쓰면 된다 |
-| 지문이 덮는 것 | `action`·`subject`·`resource`·`context` — 즉 평가에 들어간 요청 전부. 사실(fact) 스냅샷은 **덮지 않는다**: 사실은 엔진이 스스로 갱신하므로 지문에 넣으면 velocity 카운터가 하나 오를 때마다 정직한 재시도가 409가 된다 |
-| 응답 | 같은 요청의 반복은 처음과 같은 `201` + `Location`이다. 재시도가 다른 상태 코드를 받으면 그것을 분기해야 하고, 그러면 "타임아웃 뒤 그냥 다시 보낸다"는 성질이 사라진다 |
+| Scope | **(caller, key)**. Another workload using the same key gets a different decision — a key is the name a caller gave its own attempt rather than a coordinate in a shared namespace, and a decision identifier is a value R40 governs reads of |
+| Shape | 1–255 bytes, printable ASCII with no spaces. Outside that it is `400 invalid_request`, and **no evaluation happens** |
+| When absent | **Exactly as it was before this header.** Two decides with no key are two decisions |
+| Same key + **same request** | Answers the decision first created, **in the state it is in at that moment**. No new row, no new challenge, no new IdP call |
+| Same key + **different request** | `409 idempotency_key_reused` (1.7.0). The first decision **does not come back**, and no identifier is carried. Use a new key |
+| What the fingerprint covers | `action`, `subject`, `resource`, `context` — that is, the whole of the request that went into the evaluation. It does **not** cover the fact snapshot: facts are refreshed by the engine itself, so putting them in the fingerprint would turn an honest retry into a 409 every time a velocity counter ticks up |
+| Response | A repeat of the same request is the same `201` + `Location` as the first. A retry that got a different status code would have to be branched on, and then "after a timeout, just send it again" stops being true |
 
-**왜 대조가 필요한가.** 1.6.0까지 이 문서는 "서버는 키를 요청 본문과 대조하지 않는다"고만 적었고, 그 대가는 적지 않았다. 대가는 이것이다: 호출자가 `job-91`을 **다른 주체·자원·행위**에 다시 쓰면 첫 결정이 그대로 돌아왔다 — `201`에 `state: allowed`까지 — 그리고 PEP는 이 엔진이 판정한 적 없는 이체를 허가했다. `decision.Result`에는 subject·resource·action이 실리지 않으므로 **PEP 쪽에서 바꿔치기를 알아낼 필드조차 없었다.** 시도마다 새로 만드는 키라면 이것은 한 클라이언트 안의 버그지만, 업무가 이미 번호를 매기는 값(주문번호·작업 id)에서 키를 뽑는 순간 서로 다른 두 요청이 같은 이름을 갖게 만들 수 있는 누구에게나 닿는 경로가 된다.
+**Why the comparison is needed.** Through 1.6.0 this document only said "the server does not compare the key against the request body", and it did not write down the cost. The cost was this: a caller that reused `job-91` for **a different subject, resource or action** got the first decision back — `201`, `state: allowed` and all — and the PEP permitted a transfer this engine had never judged. A `decision.Result` carries no subject, resource or action, so **the PEP did not even have a field to detect the substitution with.** With a key minted per attempt this is a bug inside one client; the moment keys are drawn from a value the business already numbers — an order number, a job id — it becomes a path reachable by anyone who can make two different requests carry one name.
 
-**지문은 평가된 입력에서 계산되지 원문 바이트에서 계산되지 않는다.** 그래서 스키마가 선언하지 않은 property로는 지문을 움직일 수 없고(표면에서 이미 떨어진다), 선언된 `int` 속성에 `25000`·`25000.0`·`2.5e4`를 보내는 세 요청은 하나의 지문을 갖는다. 정책이 읽는 값이 같으면 같은 요청이라는 뜻이고, 지문이 평가기와 다른 판단을 하면 그쪽이 더 나쁜 고장이다.
+**The fingerprint is computed from the evaluated input, not from the raw bytes.** A property the schema does not declare cannot move it (the surface rejects such a request first), and three requests sending `25000`, `25000.0` and `2.5e4` for a declared `int` attribute have one fingerprint. Values the policy reads identically mean the same request, and a fingerprint that judged differently from the evaluator would be the worse failure of the two.
 
-**조회는 평가보다 앞에 선다.** decide는 결정 식별자를 만들고 **challenge를 모두 발급한 뒤에** 행을 쓴다 — IdP 푸시와 webhook 발신이 데이터베이스보다 먼저다. 그래서 키를 삽입 시점의 유니크 인덱스로만 두면 재시도마다 주체의 휴대폰이 한 번 더 울리고 그 다음에야 거부된다. 유니크 인덱스(`decisions_unique_idempotency_key`, 마이그레이션 9 — 컬럼·지문·제약은 8이고 인덱스만 따로 떼어 `CONCURRENTLY`로 만든다)는 **동시 요청에 대한 백스톱**일 뿐이다: 둘 다 조회에서 아무것도 못 찾은 경우 하나만 삽입에 성공하고, 진 쪽은 이긴 쪽의 결정을 읽어 돌려준다 — **이긴 쪽의 지문이 맞을 때만이다.** 지문이 다르면 그 경주는 재시도끼리의 경주가 아니라 조회가 볼 수 없는 창으로 들어온 바꿔치기이고, 답은 똑같이 `409`다.
+**The lookup comes before the evaluation.** decide mints the decision identifier and writes the row **after it has issued every challenge** — the IdP push and the webhook dispatch happen before the database does. So a key held only by a unique index at insert time would ring the subject's phone once more on every retry and refuse afterwards. The unique index (`decisions_unique_idempotency_key`, migration 9 — the column, the fingerprint and the constraint are migration 8, and only the index is split out so it can be built `CONCURRENTLY`) is **a backstop for concurrent requests** and nothing more: when both found nothing in the lookup, one insert succeeds, and the loser reads the winner's decision and returns it — **only when the winner's fingerprint matches.** If the fingerprints differ, that race is not two retries racing but a substitution that arrived through the window the lookup cannot see, and the answer is the same `409`.
 
-**deny는 행을 만들지 않으므로 키가 붙어도 다시 평가된다.** 그것이 안전한 이유는 deny가 남기는 것이 없기 때문이다 — 미결 슬롯도, 열린 challenge도, 사람에게 간 알림도 없다. 이 헤더가 막는 것은 고아가 된 **결정**이고, deny는 결정을 만들지 않는다.
+**A deny creates no row, so a request carrying a key is evaluated again.** That is safe because a deny leaves nothing behind — no outstanding slot, no open challenge, no notification that reached a person. What this header prevents is an orphaned **decision**, and a deny does not create a decision.
 
-**속도 예산은 재시도에도 청구된다.** 재시도인지 아닌지는 예산을 청구한 뒤에야 알 수 있고, 공짜로 보낼 수 있는 요청은 영원히 보낼 수 있는 요청이다.
+**The rate budget is charged for a retry too.** Whether a request is a retry is knowable only after the budget has been charged, and a request that can be sent for free is a request that can be sent forever.
 
-### challenge 뷰
+### The challenge view
 
-`challenges[]`의 각 항목은 challenge 하나의 진행 상황이다.
+Each entry in `challenges[]` is one challenge's progress.
 
-| 필드 | 뜻 | 언제 나타나는가 |
+| Field | Meaning | When it appears |
 |---|---|---|
-| `ordinal` | 결정 안에서의 challenge 번호 | 항상 |
-| `kind` | `quorum` · `mfa` · `delay` · `external` | 항상 |
-| `state` | `pending` · `satisfied` · `failed` · `cancelled` | 항상 |
-| `have` · `need` | 수집 현황 | 항상 |
-| `deadline` | 그 challenge의 타이머 | 타이머가 있을 때 |
-| `authorization_url` | **주체의 브라우저를 보낼 곳** | 브라우저로 완결되는 kind에서만 |
+| `ordinal` | The challenge's number within the decision | Always |
+| `kind` | `quorum` · `mfa` · `delay` · `external` | Always |
+| `state` | `pending` · `satisfied` · `failed` · `cancelled` | Always |
+| `have` · `need` | How far collection has got | Always |
+| `deadline` | That challenge's timer | When it has a timer |
+| `authorization_url` | **Where to send the subject's browser** | Only on kinds that complete in a browser |
 
-**`authorization_url`은 1.2.0에서 더해졌다**(응답 필드 추가 = minor). 위임 MFA가 step-up 리다이렉트로 완결되는데(D26) 그 주소가 challenge 행에만 있고 어떤 응답에도 실리지 않아, 호출자가 주체를 어디로 보낼지 알 수 없었다([#41](https://github.com/d0lim/stamp/issues/41)). quorum·delay·external은 이 필드를 갖지 않으며 이전과 **바이트까지 동일하게** 직렬화된다.
+**`authorization_url` was added in 1.2.0** (adding a response field = minor). Delegated MFA completes through a step-up redirect (D26), and that address lived only on the challenge row and appeared in no response, so a caller had no way to know where to send the subject ([#41](https://github.com/d0lim/stamp/issues/41)). quorum, delay and external do not carry this field, and serialize **byte for byte** as they did before.
 
-**뷰에 실리는 것은 challenge 핸들러가 이름으로 고른 것뿐이다.** challenge 행의 `detail`은 저장용이고 correlator·nonce·PKCE verifier를 담는다 — 그것들은 뷰로 가지 않으며, 갈 수 있는 통로 자체가 없다. 결정 레이어는 특정 challenge kind를 알지 못하므로(선택적 `challenge.Viewer` 인터페이스로만 묻는다) 저장된 값을 스스로 꺼내 실을 수 없다.
+**The view carries only what the challenge handler picked by name.** The challenge row's `detail` is for storage, and holds the correlator, the nonce and the PKCE verifier — none of which go to the view, and there is no channel through which they could. The decision layer does not know any particular challenge kind (it asks only through the optional `challenge.Viewer` interface), so it cannot reach into a stored value and carry it itself.
 
-**1.2.0의 "알려진 노출"은 닫혔다.** 그때는 step-up 인가 요청이 correlator를 `state`로 실었고, URL이 응답에 실리면서 correlator가 호출자와 브라우저에 도달했다. 1.3.0의 `state`는 challenge마다 새로 만드는 CSRF 토큰이다(KTD2) — correlator는 어떤 URL에도 나타나지 않고, PKCE verifier도 마찬가지다. challenge를 식별하는 것은 콜백 **경로**다.
+**1.2.0's "known exposure" is closed.** Back then the step-up authorization request carried the correlator as `state`, and putting the URL in the response put the correlator in reach of the caller and the browser. In 1.3.0 `state` is a CSRF token minted per challenge (KTD2) — the correlator appears in no URL, and neither does the PKCE verifier. What identifies a challenge is the callback **path**.
 
-### step-up 콜백
+### The step-up callback
 
-`GET /decisions/{id}/challenges/{ordinal}/mfa`는 IdP가 주체의 브라우저를 되돌려 보내는 곳이다. 기존 `POST`는 그대로 남는다 — CIBA 경로와 모의 OP 검증이 그것을 쓴다.
+`GET /decisions/{id}/challenges/{ordinal}/mfa` is where the IdP sends the subject's browser back. The existing `POST` stays as it was — the CIBA path and the mock OP verification use it.
 
-| 쿼리 파라미터 | 뜻 |
+| Query parameter | Meaning |
 |---|---|
-| `code` | 인가 코드. STAMP가 challenge 행의 verifier로 교환한다 |
-| `state` | 이 challenge가 발급한 CSRF 토큰. 다르면 토큰 교환 **이전에** 거절된다 |
-| `error` · `error_description` | IdP가 거절한 경우 |
+| `code` | The authorization code. STAMP redeems it with the verifier on the challenge row |
+| `state` | The CSRF token this challenge issued. A mismatch is refused **before** the token exchange |
+| `error` · `error_description` | Present when the IdP refused |
 
-**응답은 사람이 읽는 HTML이다.** 이 라우트에 도착하는 것은 방금 비밀번호를 입력한 사람이고, 다른 콜백처럼 JSON 403을 주면 무엇이 잘못됐는지 알 수 없다. 페이지는 스크립트·스타일·외부 참조를 하나도 갖지 않으며 `default-src 'none'` CSP와 `Referrer-Policy: no-referrer`를 함께 낸다 — URL의 쿼리에 인가 코드가 들어 있으므로 리퍼러 억제가 형식이 아니라 방어다.
+**The response is HTML a person reads.** What arrives on this route is somebody who has just entered a password, and a JSON 403 like the other callbacks' would leave them with no idea what went wrong. The page carries no script, no style and no external reference, and is served with a `default-src 'none'` CSP and `Referrer-Policy: no-referrer` — the authorization code is in the URL's query, so suppressing the referrer is a defence rather than a formality.
 
-상태 코드는 두 구간으로 나뉜다.
+The status codes fall into two ranges.
 
-| 구간 | 답 |
+| Range | Answer |
 |---|---|
-| `state`가 확인되기 **전**의 모든 실패 — 없는 결정, 없는 challenge, 틀린 `state`, 교환되지 않는 코드, 이미 닫힌 challenge | **`403` 하나, 같은 페이지 하나.** 상태 코드로 결정 식별자의 존재를 알아낼 수 없어야 한다(`POST /external`의 균일 403과 같은 이유) |
-| 교환에 성공한 **뒤**의 실패 — 약한 `acr`, 오래된 `auth_time`, 어긋난 `nonce`, 이미 소비된 correlator | 무엇을 할 수 있는지 말하는 페이지. 이 지점의 상대는 `state`를 쥔 주체이지 낯선 사람이 아니다 |
-| STAMP 쪽 장애 | `500`과 "아무것도 기록되지 않았다" |
+| Every failure **before** `state` is verified — no such decision, no such challenge, a wrong `state`, a code that does not redeem, a challenge already closed | **One `403`, one page.** A status code must not reveal whether a decision identifier exists (the same reason `POST /external` answers a uniform 403) |
+| A failure **after** the exchange succeeded — a weak `acr`, a stale `auth_time`, a mismatched `nonce`, a correlator already consumed | A page that says what can be done about it. Whoever is at this point holds the `state` and is the subject, not a stranger |
+| A failure on STAMP's side | `500`, and "nothing was recorded" |
 
-**충족되지 않은 `acr`는 이 경로에서도 거절된다.** S1이 확인했듯 IdP는 충족하지 못한 `acr` 요청을 오류가 아니라 침묵 강등으로 답하므로, 교환된 `id_token`의 `acr` 검증이 유일한 방어선이다. 판정은 challenge 핸들러 한 곳에서만 일어나고 콜백 표면은 아무것도 판정하지 않는다.
+**An unsatisfied `acr` is refused on this path too.** As S1 confirmed, an IdP answers an `acr` request it cannot satisfy with a silent downgrade rather than an error, so verifying the `acr` on the redeemed `id_token` is the only line of defence there is. The judgment happens in the challenge handler and nowhere else, and the callback surface judges nothing.
 
-**PKCE는 선택이 아니다.** 인가 요청은 `code_challenge`와 `code_challenge_method=S256`을 싣는다. 데모 realm의 `stamp-stepup`처럼 challenge method가 등록된 클라이언트에서 Keycloak은 그것을 **요구사항**으로 읽고, 없는 요청을 `error=invalid_request`로 거절한다(U2 실측). verifier는 challenge 행에 살며(KTD3) 어떤 응답에도 나가지 않는다.
+**PKCE is not optional.** The authorization request carries `code_challenge` and `code_challenge_method=S256`. On a client that registers a challenge method — the demo realm's `stamp-stepup` does — Keycloak reads it as a **requirement** and refuses a request without it with `error=invalid_request` (measured in U2). The verifier lives on the challenge row (KTD3) and leaves in no response.
 
-### deny의 `reason`
+### The `reason` on a deny
 
-`state: denied`는 최종 판정일 수도, 일시적 셰딩일 수도 있다. **구분자는 `reason` 하나뿐이다.**
+`state: denied` may be a final judgment or a momentary shed. **The only thing that separates them is `reason`.**
 
-| `reason` | 뜻 | 재시도 | `Retry-After` |
+| `reason` | Meaning | Retry | `Retry-After` |
 |---|---|---|---|
-| 정책이 낸 값(`policy_matched` 등) | 정책 판정 | 아니오 | 없음 |
-| `outstanding_cap` | 주체의 미결 결정 상한 초과 (R43) | 미결이 해소된 뒤 | 없음 — 기다릴 시간이 아니라 다른 결정이 닫히는 사건이 조건이다 |
-| `rate_limited` | 호출자 또는 주체별 속도 한도 초과 (R43) | 예 — 창이 지나면 | 있음 (1.4.0, [#45](https://github.com/d0lim/stamp/issues/45)) |
-| `challenge_failed` | challenge가 물어졌고 충족되지 않았다 — 거절, 시간 초과 | 아니오 | 없음 |
-| `challenge_rate_limited` | 필요한 challenge가 **열리지도 않았다**: challenge 발급 한도가 셰딩했다 (R43, [#40](https://github.com/d0lim/stamp/issues/40)) | 예 — 창이 지나면 | **decide에서는 있음** (1.7.0) |
+| A value the policy produced (`policy_matched`, and so on) | A policy judgment | No | None |
+| `outstanding_cap` | The subject is over their outstanding-decision cap (R43) | Once the outstanding ones clear | None — the condition is another decision closing, not a length of time to wait |
+| `rate_limited` | Over the per-caller or per-subject rate limit (R43) | Yes — once the window passes | Present (1.4.0, [#45](https://github.com/d0lim/stamp/issues/45)) |
+| `challenge_failed` | A challenge was asked and not satisfied — refused, or timed out | No | None |
+| `challenge_rate_limited` | The challenge that was needed **was never even opened**: the challenge issuance limit shed it (R43, [#40](https://github.com/d0lim/stamp/issues/40)) | Yes — once the window passes | **Present on decide** (1.7.0) |
 
-**`challenge_failed`와 `challenge_rate_limited`는 반드시 갈라져야 한다.** 앞은 사람이 아니라고 답한 것이고 뒤는 사람에게 아무것도 가지 않은 것이다 — IdP 푸시도, webhook도 없었다. 한 단어였을 때 운영자는 "주체가 거절했다"와 "우리가 묻지 않았다"를 구별할 수 없었고, 그 둘은 정반대의 대응을 부른다. 어느 challenge 종류가 셰딩했는지는 `reason`이 말하지 않는다 — 결정 레이어는 종류의 어휘를 알지 않으며(KTD1) 그 단어는 challenge 행에 있다.
+**`challenge_failed` and `challenge_rate_limited` have to be separate words.** The first is a person answering no; the second is nothing having reached a person at all — no IdP push, no webhook. While they were one word an operator could not tell "the subject refused" from "we never asked", and those two call for opposite responses. Which challenge kind shed is not something `reason` says — the decision layer does not know the vocabulary of kinds (KTD1), and that word is on the challenge row.
 
-**decide에서 셰딩된 발급은 결정을 만들지 않는다**(1.7.0). 1.6.0까지는 만들었다: 셰딩된 challenge가 `failed`로 저장되고, 라이프사이클이 그것을 최종 deny로 해소했으며, 그래서 **아무도 아무것도 묻지 않은 사람의 이력에 "거부됨"이 한 줄씩 쌓였다.** 남의 발급 예산을 비워 두는 것만으로 한 사람의 정당한 인가가 전부 거부되고 그 기록이 그 사람 앞으로 남던 것이다. 이제 답은 표면이 자기 예산으로 셰딩할 때 내는 답과 같은 모양이다 — `id` 없는 deny, 행 없음, 주체의 이력에 아무것도 없음, `Retry-After` 있음. 거부 자체는 R43대로 감사 항목으로 남지만, 그것은 사람에 대한 판정이 아니라 한도가 작동했다는 기록이다.
+**On decide, a shed issuance creates no decision** (1.7.0). Through 1.6.0 it did: the shed challenge was stored as `failed`, the lifecycle resolved that into a final deny, and so **"denied" accumulated a line at a time on the history of a person nobody had asked anything.** Holding somebody else's issuance budget empty was enough to have every legitimate authorization of theirs refused, with the record left in their name. The answer now has the same shape as the one the surface gives when it sheds on its own budget — a deny with no `id`, no row, nothing on the subject's history, and a `Retry-After`. The refusal itself is still audited as R43 requires, but as a record that a limit engaged rather than as a judgment about a person.
 
-**그래서 `challenge_rate_limited`에 `id`가 있을 수도, 없을 수도 있다.** decide가 낸 것에는 없다(위). 있는 것은 **재검증**(R31) 경로에서 나온다: 이미 존재하는 결정이 정책 개정으로 challenge를 다시 열다가 셰딩되면 그 결정은 이미 행을 갖고 있고, 그 행이 이 근거로 해소된다. 클라이언트가 갈라 볼 것은 `reason`이 아니라 언제나 `id`의 유무다("상태 코드만으로 `id`의 존재를 판단할 수 없다"와 같은 규칙이다).
+**So a `challenge_rate_limited` may or may not carry an `id`.** The one decide produces does not (above). The one that does comes from the **re-evaluation** path (R31): when a decision that already exists reopens a challenge after a policy revision and that issuance is shed, the decision already has a row, and that row is resolved on this ground. What a client branches on is never `reason` but always the presence of `id` — the same rule as "a client cannot tell from the status code alone whether there is an `id`".
 
-**`challenge_rate_limited`는 `rate_limited`가 아니다.** 두 값은 서로 다른 예산이 낸 거부다. `rate_limited`는 decide 표면 자신의 호출자별·주체별 예산이고, 이것은 challenge 핸들러가 IdP나 webhook을 향해 쓰는 발급 예산이다. 운영자가 손대야 하는 설정이 다르고(`STAMP_DECIDE_*` 대 `STAMP_CHALLENGE_ISSUE_*`), 하나를 올려도 다른 하나는 그대로다.
+**`challenge_rate_limited` is not `rate_limited`.** The two values are refusals from different budgets. `rate_limited` is the decide surface's own per-caller and per-subject budget; this one is the issuance budget a challenge handler spends towards an IdP or a webhook. They are different settings for an operator to reach for (`STAMP_DECIDE_*` against `STAMP_CHALLENGE_ISSUE_*`), and raising one leaves the other where it was.
 
-**속도 한도는 인스턴스별이다.** 레플리카 N개는 실효 한도가 설정값의 N배다. 절대 상한은 미결 상한이 DB 기반으로 클러스터 전역에 건다.
+**The rate limits are per instance.** N replicas have an effective limit of N times what is configured. The absolute bound is the outstanding-decision cap, which is counted in the database and binds across the whole cluster.
 
-## `error` 코드 어휘
+## The `error` code vocabulary
 
-오류 응답은 `{"error": "...", "message": "..."}`이고, **`error`는 기계가 읽는 코드, `message`는 사람이 읽는 문장**이다. 클라이언트는 `error`로 분기하고 `message`로는 분기하지 않는다 — 문장은 예고 없이 다듬어진다.
+An error response is `{"error": "...", "message": "..."}`, where **`error` is a code a machine reads and `message` is a sentence a person reads**. A client branches on `error` and never on `message` — the sentences are reworded without notice.
 
-**`error`와 `reason`은 다른 어휘다.** `reason`은 **결정이 존재할 때** 그 결정이 무엇을 근거로 났는지이고(엔진의 말), `error`는 **결정이 나지 않았을 때** 표면이 하는 말이다. 같은 문자열을 양쪽에서 쓰면 "답이 없다"와 "이 근거로 답했다"가 클라이언트에게 한 사건이 된다.
+**`error` and `reason` are different vocabularies.** `reason` says, **when a decision exists**, on what ground that decision was reached — the engine speaking. `error` is what the surface says **when no decision was reached**. Share a string between them and "there is no answer" and "this is the ground the answer was reached on" become one event to a client.
 
-**같은 서버 상태는 어느 표면에서도 같은 코드를 받는다.** 이것이 1.4.0이 고친 것이다.
+**The same server state gets the same code on every surface.** That is what 1.4.0 fixed.
 
-| `error` | 상태 | 뜻 |
+| `error` | Status | Meaning |
 |---|---|---|
-| `unauthenticated` | `401` | 이 엔드포인트가 요구하는 자격이 없다 |
-| `invalid_request` | `400` | 본문·경로·쿼리가 이 엔드포인트의 모양이 아니다 |
-| `invalid_property` · `invalid_submission` · `unsupported_verdict` | `400` | 값이 스키마나 challenge가 받는 모양이 아니다 |
-| `not_found` | `404` | **그 결정을 가질 수 없다.** 없거나, 권한이 없거나, 대상이 아니거나 — 셋이 한 답이다 |
-| `not_an_auditor` | `403` | 결정 **이력**을 읽을 자격이 없다. 특정 결정에 대해서는 아무것도 말하지 않는다 (R22) |
-| `expired` · `not_collecting` · `material_changed` | `409` | 결정·challenge의 현재 상태가 그 동작을 받지 않는다 |
-| `idempotency_key_reused` | `409` | 이 `Idempotency-Key`를 **다른 요청에** 이미 썼다. 요청이 잘못된 것이 아니라 이름이 이미 임자가 있는 것이므로, 고칠 것은 본문이 아니라 키다 (1.7.0) |
-| `rate_limited` | `429` | 승인 제출이 승인자별 예산을, 또는 위임 취소가 권한자별 예산을 넘었다 (R43, 1.8.0). decide의 속도 거부는 오류가 아니라 deny다 |
-| `not_installed` | `503` | 이 배포에 정책 집합·스키마·거버넌스가 아직 설치되지 않았다 |
-| `unsupported_challenge` | `501` | 정책이 요구하는 challenge kind를 이 빌드가 다루지 못한다 |
-| `internal_error` | `500` | 서버 쪽 실패. 원인은 서술되지 않으며 감사 체인에 있다 |
+| `unauthenticated` | `401` | The credential this endpoint requires is not there |
+| `invalid_request` | `400` | The body, the path or the query is not the shape this endpoint takes |
+| `invalid_property` · `invalid_submission` · `unsupported_verdict` | `400` | A value is not the shape the schema or the challenge accepts |
+| `not_found` | `404` | **You cannot have that decision.** It does not exist, or you have no standing, or you are not its target — three states, one answer |
+| `not_an_auditor` | `403` | No standing to read decision **history**. It says nothing about any particular decision (R22) |
+| `expired` · `not_collecting` · `material_changed` | `409` | The decision's or the challenge's current state does not take that operation |
+| `idempotency_key_reused` | `409` | This `Idempotency-Key` has already been used **for a different request**. The request is not wrong — the name is already taken, so what to fix is the key rather than the body (1.7.0) |
+| `rate_limited` | `429` | An approval submission went over the per-approver budget, or a delay cancellation over the per-authority one (R43, 1.8.0). A rate refusal on decide is a deny rather than an error |
+| `not_installed` | `503` | This deployment has no policy set, schema or governance installed yet |
+| `unsupported_challenge` | `501` | The policy requires a challenge kind this build cannot handle |
+| `internal_error` | `500` | A failure on the server's side. The cause is not described; it is in the audit chain |
 
-**`not_found`가 넓은 것이 의도다.** R40은 결정 조회를 생성 호출자 또는 대상 승인자로 제한하는데, 거부와 부재가 다른 답을 주면 식별자 하나로 "그 결정이 존재하는가"를 물을 수 있다. 그래서 decide 표면(`GET /decisions/{id}`)뿐 아니라 **승인 제출·승인 화면 조회·위임 취소·감사 상세 조회에서도 응답 바이트까지 같다.** 1.3.1까지 콘솔 쪽 네 곳은 `403 not_an_approver`·`403 not_readable`을 답했다([#38](https://github.com/d0lim/stamp/issues/38)).
+**`not_found` is broad on purpose.** R40 restricts reading a decision to the creating caller or a targeted approver, and if refusal and absence answered differently, one identifier would be enough to ask "does that decision exist". So the response is identical down to the bytes not only on the decide surface (`GET /decisions/{id}`) but on **approval submission, the approval view read, delay cancellation and the audit detail read.** Through 1.3.1 those four console-side places answered `403 not_an_approver` and `403 not_readable` ([#38](https://github.com/d0lim/stamp/issues/38)).
 
-**대가는 실재한다.** 승인자 집합이 개정으로 바뀌어 자격을 잃은 사람도 "없는 결정"이라는 답을 받는다. 그 사람에게 사실을 말하는 자리는 **승인함**(`GET /decisions/inbox`)이다 — 기다리는 것만 담긴 목록은 담기지 않은 것으로 아무것도 새게 하지 않는다.
+**The cost is real.** Somebody who lost standing because a revision changed the approver set also gets "no such decision". The place that tells that person the truth is **the inbox** (`GET /decisions/inbox`) — a list holding only what is waiting for them leaks nothing by what it leaves out.
 
-**불구분은 결정의 상태에 걸쳐서도 성립한다**(1.6.0). 자격 없는 호출자에게 **없는 결정·미결 결정·이미 난 결정·만료된 결정은 네 개가 아니라 하나의 응답**이다. 1.5.0까지는 아니었다. 표는 맞았지만 순서가 틀렸다 — 승인 제출과 위임 취소는 "아직 수집 중인가"를 "이 사람에게 자격이 있는가"보다 먼저 물었고, 자격 신호는 그 뒤에 오는 challenge 핸들러에서만 나왔다. 그래서 대상이 아닌 사람이 식별자 하나를 폴링하면 미결일 때 `404`, 결정되거나 만료되는 순간 `409`를 읽었다: 결정의 존재와 **닫힌 시각**까지 새는 오라클이고, 위임 취소 경로에는 속도 한도가 없어 공짜였다(그 예산은 1.8.0이 붙였다 — 순서를 고친 것이 자격 없는 호출자의 감사 append 범위를 넓혔기 때문이다). 승인 화면 조회도 만료 판정을 대상 판정보다 먼저 했다.
+**The indistinguishability holds across the decision's states as well** (1.6.0). To a caller with no standing, **a decision that does not exist, one still pending, one already decided and one expired are one response rather than four.** Through 1.5.0 they were not. The table was right and the order was wrong — approval submission and delay cancellation asked "is this still collecting" before "does this person have standing", and the standing signal came only from the challenge handler after it. So somebody who was not a target, polling one identifier, read `404` while it was pending and `409` the moment it was decided or expired: an oracle leaking the decision's existence and **the moment it closed**, and a free one, because the delay-cancellation path had no rate limit (1.8.0 added that budget — fixing the order widened the range of the audit appends a caller with no standing can reach). The approval view read, too, judged expiry before it judged targeting.
 
-**`idempotency_key_reused`는 이 통합의 예외가 아니라 다른 종류의 답이다.** 위의 `404` 통합은 "그 **결정**을 가질 수 있는가"에 대한 답을 하나로 만드는 규칙이고, 이 `409`는 결정에 대해 아무것도 말하지 않는다 — 조회가 **호출자 자신의 키**로만 범위가 잡히므로, 호출자가 알게 되는 것은 "내가 쓴 이 키는 이미 임자가 있다"뿐이다. 남의 키에 대해서도, 어떤 결정 식별자에 대해서도, 그 키가 가리키는 요청을 그대로 다시 보내면 알 수 있는 것 이상은 아무것도 새지 않는다. 그래서 오라클이 아니고, 응답에 결정 식별자도 `Location`도 싣지 않는다.
+**`idempotency_key_reused` is not an exception to that collapsing; it is a different kind of answer.** The `404` collapsing above is a rule that makes one answer out of "can you have that **decision**", and this `409` says nothing about a decision — the lookup is scoped to **the caller's own keys**, so what the caller learns is only "this key of mine is already taken". Nothing leaks about anybody else's key, about any decision identifier, or beyond what resending the request the key names would already tell them. So it is not an oracle, and the response carries neither a decision identifier nor a `Location`.
 
-**409는 접히지 않았다. 자격 있는 호출자에게만 간다.** `expired`와 `not_collecting`은 자기를 기다리는 승인자가 "늦었다"와 "여기엔 아무것도 없다"를 가르는 유일한 신호다. 낯선 사람을 막자고 그것을 404로 접으면 이 엔드포인트가 존재하는 이유인 사람의 경험을 깎게 되고, 낯선 사람은 어차피 이제 한 가지 답만 받는다. 그래서 바뀐 것은 답이 아니라 **순서**다: 자격을 먼저 판정하고, 그다음에 상태를 판정한다. MFA 콜백 표면은 이 통합에서 제외된 채 그대로다 — 대상이 아닌 완결은 여전히 `403 not_the_subject`이고, 판정하는 자리만 핸들러에서 라이프사이클로 옮겼다.
+**The 409s were not collapsed. They go to callers with standing.** `expired` and `not_collecting` are the only signal by which an approver a decision is waiting on can tell "you are late" from "there is nothing here". Collapsing them into 404 to shut out a stranger would cut into the human experience this endpoint exists for, and the stranger now gets one answer regardless. So what changed is not the answer but **the order**: standing is judged first, state second. The MFA callback surface stays outside this collapsing — a completion by somebody who is not the target is still `403 not_the_subject`, and only the place that judges it moved from the handler to the lifecycle.
 
-**MFA 콜백의 403은 이 통합에서 제외된다.** 그 표면은 `acr_not_allowed`·`acr_unsatisfied`·`amr_mismatch`·`stale_authentication`·`correlator_mismatch`·`credential_mismatch`·`nonce_mismatch`를 각각 다른 코드로 답한다. 독자가 공격자가 아니라 **운영자**이고, IdP 오설정과 정책 요구를 구분하지 못하면 아무도 완결시킬 수 없는 step-up 앞에서 원인을 알 수 없기 때문이다. 결정의 존재 여부는 그 코드들 이전에 이미 균일한 `403` 한 장이 가린다(위 "step-up 콜백" 참조).
+**The MFA callback's 403 is excluded from this collapsing.** That surface answers `acr_not_allowed`, `acr_unsatisfied`, `amr_mismatch`, `stale_authentication`, `correlator_mismatch`, `credential_mismatch` and `nonce_mismatch` as separate codes. The reader there is an **operator** rather than an attacker, and somebody who cannot tell an IdP misconfiguration from a policy requirement cannot find the cause of a step-up nobody is able to complete. Whether the decision exists is already hidden ahead of those codes by the one uniform `403` (see "The step-up callback" above).
 
-### 1.4.0이 바꾼 것과 등급
+### What 1.4.0 changed, and its level
 
-- `Retry-After`가 속도 한도 거부에 붙는다 — **응답 필드 추가 = minor.**
-- decide의 정책 집합 부재가 `policy_set_stale` 대신 `not_installed`을 답한다.
-- 콘솔의 네 표면에서 "권한 없음"이 "없음"과 응답 바이트까지 같아진다.
+- `Retry-After` is attached to a rate-limit refusal — **adding a response field = minor.**
+- A missing policy set on decide answers `not_installed` instead of `policy_set_stale`.
+- On the console's four surfaces, "no standing" becomes identical to "does not exist" down to the response bytes.
 
-뒤의 둘은 **와이어에서 보이는 답을 바꾼다.** major로 올리지 않는 근거는 하나다: **이 문서가 그 둘을 약속한 적이 없다.** `error` 어휘는 1.3.1까지 문서화되지 않았고(그 사실이 "아직 말하지 않는 것"에 적혀 있었다), 콘솔 표면의 상태 코드도 표에 없었다. 반대로 **불구분 규칙은 1.1.0부터 이 문서에 적혀 있었고** 코드가 그것을 지키지 않았다. 그래서 이것은 계약을 깨는 변경이 아니라 계약에 코드를 맞춘 변경이다.
+The last two **change what is visible on the wire.** There is one ground for not raising the major: **this document never promised either of them.** The `error` vocabulary was undocumented through 1.3.1 (a fact that was written down under "What this contract does not say yet"), and the console surfaces' status codes were in no table. The indistinguishability rule, by contrast, **had been written in this document since 1.1.0** and the code was not keeping it. So this is not a change that breaks the contract but one that brings the code to it.
 
-그래도 **`403 not_an_approver`나 `policy_set_stale`을 와이어에서 하드코딩한 클라이언트는 깨진다.** 이 문단이 그 사실을 숨기지 않으려고 있다.
+Even so, **a client that hard-coded `403 not_an_approver` or `policy_set_stale` off the wire breaks.** This paragraph is here so that fact is not hidden.
 
-### 1.5.0이 바꾼 것과 등급
+### What 1.5.0 changed, and its level
 
-- `POST /decisions`가 선택 요청 헤더 `Idempotency-Key`를 받는다 — **선택 요청 필드 추가 = minor.** 보내지 않는 클라이언트는 바이트까지 이전과 같은 답을 받는다.
-- challenge 발급이 셰딩되어 난 deny가 `challenge_failed` 대신 `challenge_rate_limited`를 싣는다.
+- `POST /decisions` accepts the optional request header `Idempotency-Key` — **adding an optional request field = minor.** A client that does not send it gets the same answer as before, byte for byte.
+- A deny produced by a shed challenge issuance carries `challenge_rate_limited` instead of `challenge_failed`.
 
-두 번째는 **와이어에서 보이는 값을 바꾼다.** major로 올리지 않는 근거는 1.4.0의 그것과 같다: 이 문서의 `reason` 표는 그 값을 약속한 적이 없고, 오히려 **"`state: denied`의 구분자는 `reason` 하나뿐"이라는 규칙이 1.1.0부터 적혀 있었는데** 셰딩된 발급이 최종 판정과 같은 단어를 실어 그 규칙을 깨고 있었다. 계약을 깨는 변경이 아니라 계약에 코드를 맞춘 변경이다. 그래도 **`challenge_failed`를 "주체가 거절했다"로 하드코딩한 클라이언트는 이제 셰딩 사례를 보지 못한다** — 그 사례가 다른 단어로 갔기 때문이며, 그것이 의도다.
+The second **changes a value visible on the wire.** The ground for not raising the major is 1.4.0's: this document's `reason` table never promised that value, and on the contrary **the rule that "the only thing that separates a `state: denied` is `reason`" had been written since 1.1.0** while a shed issuance was carrying the same word as a final judgment and breaking it. Not a change that breaks the contract but one that brings the code to it. Even so, **a client that hard-coded `challenge_failed` as "the subject refused" now stops seeing the shed case** — that case went to another word, and that is the intent.
 
-엔드포인트는 하나도 더해지거나 사라지지 않았고, 응답 **모양**도 그대로다.
+Not one endpoint was added or removed, and the **shape** of the responses is unchanged.
 
-### 1.6.0이 바꾼 것과 등급
+### What 1.6.0 changed, and its level
 
-- 자격 없는 호출자가 **승인 제출·승인 화면 조회·위임 취소**에서 받던 `409 expired`·`409 not_collecting`이 `404 not_found`가 된다. 자격 있는 호출자의 409는 **그대로다.**
-- `subject.id`·`resource.id`가 255바이트를 넘으면 `400 invalid_request`다 — check와 decide 양쪽에서.
+- The `409 expired` and `409 not_collecting` that a caller with no standing used to get from **approval submission, the approval view read and delay cancellation** become `404 not_found`. The 409s a caller with standing gets are **unchanged.**
+- A `subject.id` or `resource.id` over 255 bytes is `400 invalid_request` — on check and on decide alike.
 
-**첫 번째는 와이어에서 보이는 답을 바꾼다.** major로 올리지 않는 근거는 1.4.0의 그것과 같고, 이번에는 더 좁다: 이 문서는 자격 없는 호출자에게 그 409들을 약속한 적이 **없고**, 반대로 불구분 규칙은 1.1.0부터 적혀 있었으며 1.4.0이 그것을 "**응답 바이트까지**"로 좁혀 적었다. 코드는 그것을 상태 코드 한 칸 아래에서 지키지 않고 있었다 — 1.4.0이 고친 것은 오류 표였고, 표는 자격 없는 호출자가 그 표에 **도달하기는 하는지**에 대해 아무것도 말하지 못한다. 계약을 깨는 변경이 아니라 계약에 코드를 맞춘 변경이다.
+**The first changes an answer visible on the wire.** The ground for not raising the major is 1.4.0's, and it is narrower here: this document **never** promised those 409s to a caller with no standing, while the indistinguishability rule had been written since 1.1.0 and 1.4.0 tightened it to "**down to the response bytes**". The code was failing to keep it one level below the status code — what 1.4.0 fixed was the error table, and a table can say nothing about whether a caller with no standing **reaches** it at all. Not a change that breaks the contract but one that brings the code to it.
 
-**두 번째는 지금까지 받아주던 요청을 거부한다.** 등급을 minor로 두는 근거는 이것이 새 필수 필드가 아니라 **기존 필수 필드의 상한**이고, 이 문서가 그 값에 상한이 없다고 말한 적이 없다는 것이다. 그래도 255바이트를 넘는 식별자를 보내던 배포는 이제 거부당한다 — 그런 배포가 있다면 식별자를 안정된 키로 줄이고 긴 형태는 property로 실어야 한다. 그 값은 감사 행에서 운영자가 읽는 값이기도 하다.
+**The second refuses requests that were accepted until now.** The ground for leaving it at minor is that this is not a new required field but **a bound on an existing one**, and that this document never said the value was unbounded. Even so, a deployment that was sending identifiers over 255 bytes is now refused — such a deployment has to shorten the identifier to a stable key and carry the long form as a property. That value is also what an operator reads on the audit row.
 
-그래도 **`409`를 "그 결정은 실재한다"로 읽던 클라이언트는 이제 자격이 있을 때만 그렇게 읽을 수 있다.** 이 문단이 그 사실을 숨기지 않으려고 있다.
+Even so, **a client that read a `409` as "that decision is real" can now read it that way only when it has standing.** This paragraph is here so that fact is not hidden.
 
-### 1.7.0이 바꾼 것과 등급
+### What 1.7.0 changed, and its level
 
-- `Idempotency-Key`가 **자기가 가리키는 요청에 묶인다.** 같은 키로 다른 요청을 보내면 `409 idempotency_key_reused`이고, 첫 결정은 답으로 오지 않는다 — **오류 코드 추가 = minor.**
-- decide에서 **셰딩된 challenge 발급이 결정을 만들지 않는다.** `id` 없는 deny에 `Retry-After`가 붙고, 주체의 이력에 아무것도 남지 않는다.
-- 표면별 challenge 발급 예산이 **(호출자, 주체)로 나뉘고 그 위에 주체별 상한**이 생긴다. 설정은 `STAMP_CHALLENGE_ISSUE_RATE_*`와 `STAMP_CHALLENGE_ISSUE_SUBJECT_CEILING_*` 둘이다. 와이어에 보이는 것은 없다.
+- `Idempotency-Key` is **bound to the request it names.** A different request under the same key is `409 idempotency_key_reused`, and the first decision does not come back — **adding an error code = minor.**
+- On decide, **a shed challenge issuance creates no decision.** The deny with no `id` carries a `Retry-After`, and nothing is left on the subject's history.
+- Each surface's challenge issuance budget is **split per (caller, subject), with a per-subject ceiling above it.** The settings are `STAMP_CHALLENGE_ISSUE_RATE_*` and `STAMP_CHALLENGE_ISSUE_SUBJECT_CEILING_*`. Nothing of it is visible on the wire.
 
-**첫 번째는 지금까지 답하던 것을 답하지 않는다.** 등급을 minor로 두는 근거는 1.4.0의 그것과 같고 이번에는 더 좁다. 이 문서가 약속한 것은 "**같은 키의 반복**은 처음 만든 결정을 답한다"였고, 다른 요청을 같은 키로 보내는 것은 그 문장이 말하는 반복이 아니다. 반대로 이 문서는 1.5.0에서 "서버는 키를 요청 본문과 대조하지 않는다"고 적었는데 — 그 문장은 사실이었고, **그 사실이 무슨 뜻인지는 적지 않았다.** 뜻은 이랬다: 같은 키를 다른 주체·자원·행위에 재사용한 호출자가 첫 결정을 `201 state: allowed`로 돌려받고, PEP가 이 엔진이 판정한 적 없는 이체를 허가했으며, 응답에 subject·resource·action이 없으므로 PEP가 그것을 알아낼 방법이 없었다. 계약을 깨는 변경이 아니라 계약이 약속한 적 없는 동작을 막는 변경이다. 그래도 **하나의 키를 여러 요청에 돌려 쓰던 클라이언트는 이제 409를 받는다** — 그런 클라이언트는 시도마다 새 키를 만들어야 한다.
+**The first stops answering something it used to answer.** The ground for leaving it at minor is 1.4.0's, and narrower again. What this document promised was that **a repeat of the same key** answers the decision first created, and sending a different request under the same key is not the repeat that sentence describes. What this document did say, in 1.5.0, was "the server does not compare the key against the request body" — the sentence was true, and **what it meant was not written down.** It meant this: a caller that reused one key for a different subject, resource or action got the first decision back as `201 state: allowed`, the PEP permitted a transfer this engine had never judged, and since the response carries no subject, resource or action the PEP had no way of finding that out. Not a change that breaks the contract but one that stops behaviour the contract never promised. Even so, **a client that recycled one key across several requests now gets a 409** — such a client has to mint a new key per attempt.
 
-**두 번째는 와이어에서 보이는 답을 바꾼다.** 셰딩된 발급이 `201` + `Location` + `id`였다가 `200` + `id` 없음이 된다. major로 올리지 않는 근거는 이 문서가 **`challenge_rate_limited`에 `id`가 있다고 적어 두었던 그 한 줄뿐**이고(1.5.0), 그 줄이 지금 정정된 줄이라는 것이다. 그리고 정정하지 않았을 때의 대가는 계약 문구가 아니라 사람이었다: 주체 식별자는 비밀이 아니므로 그것을 아는 아무 워크로드나 한 사람의 발급 예산을 20초에 하나꼴로 비워 둘 수 있었고, 그동안 그 사람의 **정당한 인가가 전부 최종 deny로 그 사람 이력에 적혔다.** 한도가 사람에 대한 판정을 쓰고 있었던 것이고, 그것을 멈추는 데에 응답 모양 하나가 든다. 상태 코드로 `id`의 존재를 판단하지 말라는 규칙은 1.1.0부터 이 표 바로 위에 있고, 그 규칙을 지킨 클라이언트는 이 변경을 느끼지 않는다.
+**The second changes an answer visible on the wire.** A shed issuance was `201` + `Location` + `id` and becomes `200` with no `id`. The ground for not raising the major is that the only thing this document had said about it was **the one line stating that `challenge_rate_limited` carries an `id`** (1.5.0), and that line is the one now corrected. And the cost of not correcting it fell on people rather than on contract wording: a subject identifier is not a secret, so any workload that knew one could hold that person's issuance budget empty at one request every twenty seconds, and while it did, **every legitimate authorization of theirs was written into their history as a final deny.** A limit was writing judgments about a person, and stopping that costs one response shape. The rule that the presence of an `id` is not to be read off the status code has sat directly above that table since 1.1.0, and a client that kept it does not feel this change.
 
-**세 번째는 운영자만 본다.** 기존 `STAMP_CHALLENGE_ISSUE_RATE_*`는 이제 (호출자, 주체)당 예산이고, 값을 바꾸지 않은 배포는 호출자마다 그만큼을 갖는다 — 한 사람에게 가는 총량은 새 상한(기본 시간당 20, burst 10)이 묶는다. 상한의 burst는 호출자별 burst보다 **커야** 하며, 그렇지 않은 설정은 부팅에서 거부된다: 상한이 한 호출자가 한 번에 비울 수 있는 크기면 그것은 다시 아무나 비울 수 있는 공용 버킷이다.
+**The third is visible only to operators.** The existing `STAMP_CHALLENGE_ISSUE_RATE_*` is now a budget per (caller, subject), so a deployment that changed no values has that much per caller — what bounds the total reaching one person is the new ceiling (20 an hour by default, bursting to 10). The ceiling's burst **must be larger** than a single caller's, and a configuration where it is not is refused at boot: a ceiling one caller can empty in an instant is the shared bucket again.
 
-**남는 것도 적어 둔다.** 상한은 여전히 호출자들이 나눠 쓰는 하나의 버킷이므로, 작정한 호출자는 시간당 20건으로 남의 step-up을 계속 셰딩할 수 있다. 비울 수 없는 상한은 상한이 아니다. 달라진 것은 값이 아니라 **대가**다 — 분당 3건이 시간당 20건이 되었고, 무엇보다 셰딩이 그 사람의 기록에 남는 판정이 아니라 `Retry-After`를 든 재시도 가능한 거부가 되었다.
+**What remains is written down too.** The ceiling is still one bucket the callers share, so a determined caller can keep shedding somebody else's step-up at twenty an hour. A ceiling that cannot be emptied is not a ceiling. What changed is not the value but **the cost** — three a minute became twenty an hour, and above all a shed became a retryable refusal carrying a `Retry-After` rather than a judgment left on that person's record.
 
-### 1.8.0이 바꾼 것과 등급
+### What 1.8.0 changed, and its level
 
-- **위임 취소에 권한자별 속도 예산이 생긴다.** 넘으면 `429 rate_limited`에 `Retry-After`가 붙는다 — 승인 제출의 거부와 **같은 상태·같은 코드·같은 헤더**다. 설정은 `STAMP_CANCELLATION_RATE_PER_SECOND`·`STAMP_CANCELLATION_RATE_BURST`이고, 기본값은 초당 1건에 burst 5로 승인 제출(초당 2건, burst 20)보다 타이트하다.
-- 거부는 감사에 `cancellation_rate_limited`로 남는다. 이것은 `error` 어휘도 `reason` 어휘도 아닌 **감사 근거**이고, 승인 제출의 `approval_rate_limited`·decide의 `rate_limited`와 구분되는 자기 단어다 — 운영자가 다섯 쓰기 표면 중 어디가 흘렸는지 알아야 하기 때문이다.
+- **Delay cancellation gets a per-authority rate budget.** Over it, `429 rate_limited` with a `Retry-After` — **the same status, the same code and the same header** as an approval submission's refusal. The settings are `STAMP_CANCELLATION_RATE_PER_SECOND` and `STAMP_CANCELLATION_RATE_BURST`, defaulting to 1 a second bursting to 5, which is tighter than approval submission's (2 a second, bursting to 20).
+- The refusal is audited as `cancellation_rate_limited`. That is neither the `error` vocabulary nor the `reason` one but **an audit ground**, and it is its own word, distinct from approval submission's `approval_rate_limited` and decide's `rate_limited` — an operator has to be able to tell which of the five write surfaces shed.
 
-**등급을 minor로 두는 근거.** 이 문서가 이 엔드포인트에 대해 약속한 것은 자격·상태별 답이고, "무제한으로 호출할 수 있다"는 약속은 어디에도 없다. `429`는 이미 이 문서의 `error` 표에 있던 코드이며 새 코드가 아니고, 붙는 자리가 하나 늘었다(오류 코드가 답하는 상황 추가 = minor, 1.7.0의 근거와 같은 형태). 경로·메서드·인증 요건은 그대로다.
+**The ground for leaving it at minor.** What this document promised about this endpoint is which answer follows from standing and from state; a promise that it may be called without limit is nowhere in it. `429` was already in this document's `error` table rather than being a new code, and it gained one more place to appear (adding a situation an error code answers = minor, the same shape as 1.7.0's ground). The path, the method and the authentication requirement are unchanged.
 
-**왜 지금인가.** R43은 네 쓰기 표면에 예산을 요구했고 위임 취소는 다섯 번째였다. 성공한 취소가 비싸서가 아니다 — 취소는 결정을 해소하고 나면 두 번째 시도가 라이프사이클에서 거부된다. 비싼 것은 **거부된 취소**다: 자격 없는 호출자가 **존재하는** 결정을 겨냥하면 라이프사이클이 동기 감사 체인 append를 쓰고, 1.6.0이 자격 판정을 상태 판정 앞으로 옮기면서 그 append가 미결일 때만이 아니라 **결정의 생애 전체**에서 도달 가능해졌다. 즉 인증된 콘솔 사용자가 결정 식별자 하나로 직렬화된 쓰기 경로에 무제한으로 붙을 수 있었다. 1.6.0이 오라클을 닫으면서 그 대가를 키웠고, 이 버전이 그 대가에 예산을 붙인다.
+**Why now.** R43 required a budget on four write surfaces, and delay cancellation was the fifth. Not because a cancellation that succeeds is expensive — a cancellation resolves the decision, after which a second attempt is refused by the lifecycle. What is expensive is **a cancellation that is refused**: when a caller with no standing aims at a decision that **exists**, the lifecycle writes a synchronous audit-chain append, and 1.6.0's moving the standing judgment ahead of the state judgment made that append reachable across **the decision's whole life** rather than only while it was pending. That is, an authenticated console user could attach to a serialized write path without limit, holding one decision identifier. Closing the oracle in 1.6.0 raised that cost, and this version puts a budget on it.
 
-**와이어에서 달라지는 것.** 한 사람이 초당 1건보다 빠르게 취소를 시도하면 이제 `404`나 `200` 대신 `429`를 받는다. 사람이 콘솔에서 하는 취소는 이 한도에 닿지 않는다 — 닿는다면 그것은 사람이 아니라 반복문이다.
+**What changes on the wire.** Somebody attempting cancellations faster than one a second now gets a `429` instead of a `404` or a `200`. A cancellation a person makes in the console does not reach this limit — anything that does is a loop rather than a person.
 
-## 콘솔이 부르지 않는 표면
+## Surfaces the console does not call
 
-이 계약의 콘솔 부분집합은 엔드포인트 17개다(`console/contract/public-endpoints.json`). **그중 다섯은 콘솔의 어떤 화면도 부르지 않는다.** 계약은 서버가 서빙하는 것을 말하고 콘솔은 그 부분집합의 부분집합을 부르므로, 그 차이는 결함이 아니라 사실이다 — 다만 **적히지 않은 사실은 아무도 모르는 사실**이고, 그래서 여기에 적는다.
+The console subset of this contract is 17 endpoints (`console/contract/public-endpoints.json`). **Five of them are called by no console screen.** The contract states what the server serves and the console calls a subset of that subset, so the difference is a fact rather than a defect — but **a fact nobody wrote down is a fact nobody knows**, so it is written down here.
 
-| 엔드포인트 | 콘솔에 없는 이유 |
+| Endpoint | Why it is not in the console |
 |---|---|
-| `delay-cancel` | R2의 위임 취소. **서버 쪽은 완결돼 있다** — 엔드포인트, 권한자별 예산, `Retry-After`를 든 `429`, `cancellation_rate_limited` 감사 근거까지(1.8.0). **그 어느 것도 렌더될 자리가 없다.** |
-| `governance-lock` | 정족수 거버넌스를 켜는 일회성 부트스트랩 행위. 그 표면의 거부 코드가 이유를 말한다: `403 bootstrap_token_required`. 그 토큰은 콘솔 세션이 아니라 배포를 운영하는 사람이 들고, 클릭 하나를 아끼려고 그것을 브라우저에 실어 나르는 것은 거버넌스를 설치하는 자격을 가장 넓은 공격면에 두는 일이다. |
-| `policy-apply` · `policy-export` | 파일 기반 저작 경로. 콘솔의 빌더는 개정 제안(`revision-preview`·`revision-submit`·`revision-withdraw`)으로 정책을 바꾼다 — 제안은 정족수가 승인할 수 있는 것이고 파일 적용은 아니다. 이 둘의 호출자는 저장소와 배포를 맞추는 CLI·CI다. |
-| `schema-read` | 시행 중인 스키마. 빌더는 모든 초안을 빈 스키마에서 시작해 선언을 써 넣으므로 이미 설치된 것을 읽지 않는다 — **즉 작성자에게 자신이 무엇을 대체하려는지 보여주지 못한다.** 이것은 판단이 아니라 구멍이고, 여기 이름을 적는 것이 그것이 보이지 않게 되는 것을 막는 방법이다. |
+| `delay-cancel` | R2's delay cancellation. **The server side is complete** — the endpoint, the per-authority budget, the `429` with a `Retry-After`, the `cancellation_rate_limited` audit ground (1.8.0). **None of it has anywhere to be rendered.** |
+| `governance-lock` | The one-time bootstrap act that switches quorum governance on. That surface's refusal code says why: `403 bootstrap_token_required`. The token is held by whoever operates the deployment rather than by a console session, and carrying it into a browser to save one click puts the standing to install governance on the widest attack surface there is. |
+| `policy-apply` · `policy-export` | The file-based authoring path. The console's builder changes policy through revision proposals (`revision-preview`, `revision-submit`, `revision-withdraw`) — a proposal is something a quorum can approve and a file apply is not. The callers of these two are the CLI and the CI that keep a repository and a deployment in step. |
+| `schema-read` | The schema in force. The builder starts every draft from an empty schema and writes declarations into it, so it never reads what is already installed — **which is to say it cannot show an author what they are about to replace.** That is a hole rather than a judgment, and naming it here is how it is kept from becoming invisible. |
 
-**세 선택지 중 문서화를 고른 근거.** 계약에서 빼는 것은 다른 클라이언트가 이미 도달할 수 있는 표면을 와이어에서 없애는 일이라 major이고, 이 표면들은 없애야 할 것이 아니다. 화면을 만드는 것은 새 기능이다. 남는 것은 **비구현을 사실로 적는 것**이고, 그것은 다음 라운드의 입력이 된다.
+**Why documentation was chosen out of the three options.** Taking them out of the contract removes from the wire a surface other clients can already reach, which is a major, and these surfaces are not ones to remove. Building the screens is a new feature. What is left is **writing the non-implementation down as a fact**, and that becomes an input to the next round.
 
-**이 표는 손으로 쓴 목록이 아니다.** 같은 다섯이 `console/contract/error-code-exemptions.json`의 `endpoints`에 이유와 함께 적혀 있고, `console/scripts/check-contract.mjs`가 양방향으로 대조한다 — 아무 화면도 부르지 않는데 목록에 없는 엔드포인트도, 목록에 있는데 화면이 부르는 엔드포인트도 실패다. `internal/release`가 이 표와 그 파일이 같은 집합인지 본다. 손으로 쓴 목록은 자기가 설명하려는 것과 함께 틀린다.
+**This table is not a hand-written list.** The same five are listed with their reasons under `endpoints` in `console/contract/error-code-exemptions.json`, and `console/scripts/check-contract.mjs` compares the two directions — an endpoint no screen calls that is missing from the list is a failure, and so is one the list names that a screen calls. `internal/release` checks that this table and that file are the same set. A hand-written list goes wrong along with the thing it is describing.
 
-### 1.8.1이 바꾼 것과 등급
+### What 1.8.1 changed, and its level
 
-- 위 절이 더해졌다. **와이어에서 달라지는 것은 없다** — 엔드포인트도, 상태 코드도, 응답 모양도, `error` 어휘도 그대로다. 문서가 이미 참이던 것을 적었을 뿐이므로 **의미를 바꾸지 않는 수정 = patch.**
+- The section above was added. **Nothing changes on the wire** — not an endpoint, not a status code, not a response shape, not the `error` vocabulary. The document only wrote down what was already true, so: **a correction that does not change meaning = patch.**
 
-**왜 지금인가.** 이 라운드가 서버가 낼 수 있는 `error` 코드를 기계가 읽는 아티팩트(`console/contract/error-codes.json`)로 만들고 콘솔이 분기하는 코드와 양방향으로 대조하게 했다. 그 대조는 "콘솔이 닿지 않는 표면"이라는 개념에 의존한다 — 콜백 리스너의 거부 코드까지 콘솔이 처리할 이유는 없기 때문이다. 그 개념을 쓰기 시작한 이상, **콘솔이 닿지 않는 표면이 무엇인지가 한 곳에 적혀 있어야 한다.** 그렇지 않으면 면제의 근거가 아무도 검사하지 않는 믿음이 된다.
+**Why now.** This round turned the `error` codes the server can produce into a machine-readable artifact (`console/contract/error-codes.json`) and had it compared in both directions against the codes the console branches on. That comparison depends on the notion of "a surface the console does not reach" — there is no reason for the console to handle a callback listener's refusal codes. Once that notion is in use, **what the surfaces the console does not reach are has to be written down in one place.** Otherwise the ground for an exemption becomes a belief nobody checks.
 
-## 이 계약이 아직 말하지 않는 것
+## What this contract does not say yet
 
-`Retry-After`는 **이 인스턴스의** 예산을 말한다. 레플리카가 여럿이면 다음 요청이 다른 인스턴스로 가고, 그쪽 버킷은 다른 상태다 — 헤더는 "여기서는 이만큼"이지 "클러스터가 이만큼"이 아니다.
+`Retry-After` speaks for **this instance's** budget. With several replicas the next request goes to another instance whose bucket is in another state — the header says "this much here", not "this much across the cluster".
 
-콘솔이 부르는 부분집합의 문서 형식(`console/contract/public-endpoints.json`)에는 자체 버전 필드가 있으며, 그것은 **문서의 모양**을 세는 번호이지 이 계약의 버전이 아니다.
+The document format of the console subset (`console/contract/public-endpoints.json`) has a version field of its own, and that field numbers **the document's shape** rather than being this contract's version.

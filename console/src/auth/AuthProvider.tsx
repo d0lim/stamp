@@ -137,6 +137,6 @@ export function AuthProvider({
 
 export function useAuth(): AuthContextValue {
   const value = useContext(AuthContext)
-  if (!value) throw new Error('useAuth는 AuthProvider 안에서만 사용할 수 있습니다.')
+  if (!value) throw new Error('useAuth is only usable inside AuthProvider.')
   return value
 }

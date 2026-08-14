@@ -164,7 +164,7 @@ export function labelFor(pointer: string): string {
     if (/^\d+$/.test(token)) out += `[${token}]`
     else out += out === '' ? token : `.${token}`
   }
-  return out === '' ? '(문서)' : out
+  return out === '' ? '(document)' : out
 }
 
 /** Strips the quoting the console's own serializer applies to every key. */

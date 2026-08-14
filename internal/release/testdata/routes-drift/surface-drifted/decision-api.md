@@ -11,9 +11,9 @@ not a path prefix here — a caller that believed this row would point a workloa
 at the console listener and get a 404 from a router that never heard of the
 route.
 
-## 엔드포인트
+## Endpoints
 
-| 메서드·경로 | 표면 | 인증 | 역할 |
+| Method and path | Surface | Auth | Roles |
 |---|---|---|---|
 | `POST /decisions` | console | user | `decide` |
 | `GET /decisions/inbox` | console | user | `decide` |

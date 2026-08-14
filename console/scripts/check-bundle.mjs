@@ -31,19 +31,19 @@ for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
   const attributes = match[1] ?? ''
   const body = (match[2] ?? '').trim()
   if (!/\bsrc=/.test(attributes) && body !== '') {
-    problems.push(`index.html에 인라인 <script>가 있습니다 (CSP script-src 'self'가 차단합니다): ${body.slice(0, 80)}`)
+    problems.push(`index.html has an inline <script>, which the CSP's script-src 'self' blocks: ${body.slice(0, 80)}`)
   }
 }
 for (const match of html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) {
   if ((match[1] ?? '').trim() !== '') {
-    problems.push("index.html에 인라인 <style>이 있습니다 (CSP style-src 'self'가 차단합니다).")
+    problems.push("index.html has an inline <style>, which the CSP's style-src 'self' blocks.")
   }
 }
 if (/\sstyle=/.test(html)) {
-  problems.push('index.html에 style 속성이 있습니다 — 인라인 스타일도 CSP가 차단합니다.')
+  problems.push('index.html has a style attribute — the CSP blocks inline styles too.')
 }
 for (const match of html.matchAll(/(?:src|href)=["'](https?:\/\/[^"']+)["']/gi)) {
-  problems.push(`index.html이 외부 오리진 ${match[1]}을(를) 참조합니다 — 번들은 자기 완결이어야 합니다.`)
+  problems.push(`index.html references the external origin ${match[1]} — the bundle has to be self-contained.`)
 }
 
 // Every asset index.html points at has to be in the bundle: a dangling
@@ -53,7 +53,7 @@ for (const match of html.matchAll(/(?:src|href)=["']\/console\/([^"']+)["']/gi))
   try {
     statSync(join(DIST, asset))
   } catch {
-    problems.push(`index.html이 참조하는 ${asset}이(가) dist에 없습니다.`)
+    problems.push(`index.html references ${asset}, which is not in dist.`)
   }
 }
 
@@ -69,12 +69,12 @@ const files = []
 // The placeholder has to survive `emptyOutDir`, or a checkout that has not run
 // this build stops compiling.
 if (!files.includes('.gitkeep')) {
-  problems.push('dist/.gitkeep이 없습니다 — go:embed 지시자가 빈 디렉터리를 만나면 컴파일이 깨집니다.')
+  problems.push('dist/.gitkeep is missing — a go:embed directive that meets an empty directory breaks the compile.')
 }
 
 if (problems.length > 0) {
-  console.error(`번들 검사 실패: ${problems.length}건`)
+  console.error(`bundle check failed: ${problems.length} problem(s)`)
   for (const problem of problems) console.error(`  ${problem}`)
   process.exit(1)
 }
-console.log(`번들 검사 통과 (${files.length}개 파일, 인라인 스크립트·스타일 없음).`)
+console.log(`bundle check passed (${files.length} files, no inline scripts or styles).`)

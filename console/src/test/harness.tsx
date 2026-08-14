@@ -37,9 +37,10 @@ export function testConfig(overrides: Record<string, unknown> = {}): ConsoleRunt
 
 /** A token shaped like one an IdP would return, unsigned — nothing here verifies. */
 export function testToken(claims: Record<string, unknown>): string {
-  // btoa is Latin-1 only, and a real deployment's `name` claim is Korean. The
-  // console decodes UTF-8 on the way out (auth/claims.ts), so the harness has
-  // to encode it on the way in or the tests would only ever exercise ASCII.
+  // btoa is Latin-1 only, and a real deployment's `name` claim carries whatever
+  // the IdP holds — routinely characters outside Latin-1. The console decodes
+  // UTF-8 on the way out (auth/claims.ts), so the harness has to encode it on
+  // the way in or the tests would only ever exercise ASCII.
   const encode = (value: unknown) => {
     const utf8 = new TextEncoder().encode(JSON.stringify(value))
     let binary = ''
@@ -56,6 +57,10 @@ export interface HarnessOptions {
   readonly config?: ConsoleRuntimeConfig
   readonly fetchImpl?: typeof fetch
   readonly navigateAway?: (url: string) => void
+  /**
+   * The `name` claim the fake token carries. Its default is non-ASCII on
+   * purpose — see `renderShell` below.
+   */
   readonly name?: string
   /**
    * Stands in for a feature screen: it is handed the same API client every
@@ -82,7 +87,13 @@ export function renderShell(options: HarnessOptions = {}): RenderResult {
     config = testConfig(),
     fetchImpl,
     navigateAway = () => undefined,
-    name = '테스트 사용자',
+    // Non-ASCII on purpose, and outside Latin-1 on purpose: this is what
+    // drives the UTF-8 encode/decode path through `testToken` above and
+    // `decodeClaims` in auth/claims.ts. Nothing asserts on this string, so this
+    // comment is the only thing holding that coverage — simplifying it to
+    // `Test User` would delete the path from every test in the suite and leave
+    // them all green. Do not.
+    name = 'Łukasz Wróblewski',
     probe,
   } = options
 

@@ -25,29 +25,29 @@ function check(fixture) {
   return checkConsole({ scanDir: `${FIXTURES}/${fixture}` })
 }
 
-describe('콘솔 계약 경계 검사', () => {
-  it('공개 계약 안의 호출만 있는 코드는 통과한다', () => {
+describe('the console contract boundary check', () => {
+  it('code whose calls are all inside the public contract passes', () => {
     expect(check('compliant')).toEqual([])
   })
 
-  it('실제 콘솔 소스에 위반이 없다', () => {
+  it('the real console source has no violations', () => {
     const violations = checkConsole({ scanDir: 'src' })
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([])
   })
 
-  it('계약에 없는 엔드포인트를 부르면 실패한다', () => {
+  it('calling an endpoint that is not in the contract fails', () => {
     const violations = check('violating-undeclared-endpoint')
     expect(violations).toHaveLength(1)
     expect(violations[0].rule).toBe('contract')
     expect(violations[0].message).toContain('console-inbox-summary')
   })
 
-  it('클라이언트 밖의 raw fetch는 실패한다', () => {
+  it('a raw fetch outside the client fails', () => {
     const violations = check('violating-raw-fetch')
     expect(violations.map((v) => v.rule)).toContain('seam')
   })
 
-  it('localStorage나 질의 문자열에서 기준 주소를 읽으면 실패한다', () => {
+  it('reading the base address from localStorage or the query string fails', () => {
     const violations = check('violating-config-source')
     const rules = violations.map((v) => v.rule)
     expect(rules).toContain('origin')
@@ -57,21 +57,21 @@ describe('콘솔 계약 경계 검사', () => {
     expect(violations.some((v) => v.message.includes('location.search'))).toBe(true)
   })
 
-  it('소스에 박힌 절대 주소는 실패한다', () => {
+  it('an absolute address hard-coded in the source fails', () => {
     const violations = check('violating-absolute-url')
     expect(violations).toHaveLength(1)
     expect(violations[0].rule).toBe('contract')
     expect(violations[0].message).toContain('telemetry.example.net')
   })
 
-  it('런타임에 계산한 엔드포인트 이름은 실패한다', () => {
+  it('an endpoint name computed at runtime fails', () => {
     const violations = check('violating-computed-endpoint')
     expect(violations).toHaveLength(1)
     expect(violations[0].rule).toBe('contract')
-    expect(violations[0].message).toContain('문자열 리터럴')
+    expect(violations[0].message).toContain('string literal')
   })
 
-  it('응답 본문의 error 코드를 다른 모듈에서 읽으면 실패한다', () => {
+  it('reading the response body error code from another module fails', () => {
     const violations = check('violating-error-code-read')
     const codes = violations.filter((v) => v.rule === 'codes')
     // Three ways out of the one module, and all three are caught: the inline
@@ -81,7 +81,7 @@ describe('콘솔 계약 경계 검사', () => {
     expect(codes.every((v) => v.message.includes('error-codes.ts'))).toBe(true)
   })
 
-  it('계약 문서는 Go가 생성한 것과 같은 버전을 쓴다', () => {
+  it('the contract document states the same version Go generated', () => {
     const contract = loadContract()
     expect(contract.version).toBe(1)
     // The names the console addresses endpoints by are the Go route names.
@@ -106,7 +106,7 @@ describe('콘솔 계약 경계 검사', () => {
  * altogether, everything below would still pass and only that one would notice
  * nothing had changed.
  */
-describe('error 코드 어휘 대조', () => {
+describe('the error code vocabulary comparison', () => {
   const served = new Map([
     ['expired', { statuses: [409], surfaces: ['console'] }],
     ['not_found', { statuses: [404], surfaces: ['console', 'pep'] }],
@@ -121,80 +121,80 @@ describe('error 코드 어휘 대조', () => {
       exemptions: exemptions(entries),
     })
 
-  const covering = [{ reason: '상태 코드가 답이다.', codes: ['rejected', 'unauthenticated'] }]
+  const covering = [{ reason: 'the status is the answer.', codes: ['rejected', 'unauthenticated'] }]
 
-  it('현행 트리는 양방향으로 일치한다', () => {
+  it('the current tree agrees in both directions', () => {
     const violations = checkErrorVocabulary()
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([])
   })
 
-  it('두 쪽 다 아무 문제 없는 입력은 통과한다', () => {
+  it('input with nothing wrong on either side passes', () => {
     expect(compare(['expired', 'not_found'], covering)).toEqual([])
   })
 
-  it('콘솔에만 있는 코드는 실패하고 그 코드를 이름한다', () => {
+  it('a code the console alone has fails, and is named', () => {
     const violations = compare(['expired', 'not_found', 'not_an_approver'], covering)
     expect(violations).toHaveLength(1)
     expect(violations[0].message).toContain('not_an_approver')
-    expect(violations[0].message).toContain('죽은 분기')
+    expect(violations[0].message).toContain('dead branch')
   })
 
-  it('콘솔이 부르지 않는 리스너의 코드를 분기하면 실패한다', () => {
+  it('branching on a code from a listener the console never calls fails', () => {
     const violations = compare(['expired', 'not_found', 'rejected'], [
-      { reason: '상태 코드가 답이다.', codes: ['unauthenticated'] },
+      { reason: 'the status is the answer.', codes: ['unauthenticated'] },
     ])
     expect(violations).toHaveLength(1)
     expect(violations[0].message).toContain('rejected')
     expect(violations[0].message).toContain('callback')
   })
 
-  it('서버에만 있는 코드는 면제되지 않으면 실패한다', () => {
+  it('a code the server alone has fails unless it is exempted', () => {
     const violations = compare(['expired', 'not_found'], [
-      { reason: '상태 코드가 답이다.', codes: ['unauthenticated'] },
+      { reason: 'the status is the answer.', codes: ['unauthenticated'] },
     ])
     expect(violations).toHaveLength(1)
     expect(violations[0].message).toContain('rejected')
-    expect(violations[0].message).toContain('콘솔에 처리가 없습니다')
+    expect(violations[0].message).toContain('the console does not handle it')
   })
 
-  it('면제 목록의 코드는 실패시키지 않는다', () => {
+  it('a code on the exemption list does not fail', () => {
     expect(compare(['expired', 'not_found'], covering)).toEqual([])
   })
 
-  it('서버가 더 이상 내지 않는 코드의 면제는 실패한다', () => {
+  it('an exemption for a code the server no longer emits fails', () => {
     const violations = compare(['expired', 'not_found'], [
-      { reason: '상태 코드가 답이다.', codes: ['rejected', 'unauthenticated', 'not_an_approver'] },
+      { reason: 'the status is the answer.', codes: ['rejected', 'unauthenticated', 'not_an_approver'] },
     ])
     expect(violations).toHaveLength(1)
     expect(violations[0].message).toContain('not_an_approver')
-    expect(violations[0].message).toContain('오래 살았습니다')
+    expect(violations[0].message).toContain('outlived')
   })
 
-  it('콘솔이 처리하는 코드의 면제는 실패한다', () => {
+  it('an exemption for a code the console handles fails', () => {
     const violations = compare(['expired', 'not_found'], [
-      { reason: '상태 코드가 답이다.', codes: ['rejected', 'unauthenticated', 'expired'] },
+      { reason: 'the status is the answer.', codes: ['rejected', 'unauthenticated', 'expired'] },
     ])
     expect(violations).toHaveLength(1)
     expect(violations[0].message).toContain('expired')
-    expect(violations[0].message).toContain('둘 중 하나는 거짓')
+    expect(violations[0].message).toContain('one of the two is false')
   })
 
-  it('이유 없는 면제는 실패한다', () => {
+  it('an exemption with no reason fails', () => {
     const violations = compare(['expired', 'not_found'], [
       { reason: '   ', codes: ['rejected', 'unauthenticated'] },
     ])
-    expect(violations.some((v) => v.message.includes('이유가 없습니다'))).toBe(true)
+    expect(violations.some((v) => v.message.includes('states no reason'))).toBe(true)
   })
 
-  it('한 코드가 두 묶음에 면제로 적히면 실패한다', () => {
+  it('one code exempted in two groups fails', () => {
     const violations = compare(['expired', 'not_found'], [
-      { reason: '첫째 이유.', codes: ['rejected', 'unauthenticated'] },
-      { reason: '둘째 이유.', codes: ['rejected'] },
+      { reason: 'the first reason.', codes: ['rejected', 'unauthenticated'] },
+      { reason: 'the second reason.', codes: ['rejected'] },
     ])
-    expect(violations.some((v) => v.message.includes('두 묶음에'))).toBe(true)
+    expect(violations.some((v) => v.message.includes('in two groups'))).toBe(true)
   })
 
-  it('콘솔의 어휘는 선언 모듈에서 정적으로 읽힌다', () => {
+  it("the console's vocabulary is read statically from the declaring module", () => {
     const consumed = loadConsumedErrorCodes()
     expect(consumed.has('not_found')).toBe(true)
     expect(consumed.has('rate_limited')).toBe(true)
@@ -207,13 +207,13 @@ describe('error 코드 어휘 대조', () => {
     expect(consumed.size).toBe(6)
   })
 
-  it('정적으로 읽을 수 없는 어휘 선언은 거절된다', () => {
+  it('a vocabulary declaration that cannot be read statically is refused', () => {
     expect(() =>
       loadConsumedErrorCodes(undefined, 'scripts/__fixtures__/error-codes-computed/error-codes.ts'),
-    ).toThrow(/배열 리터럴/)
+    ).toThrow(/array literal/)
   })
 
-  it('서버 문서와 면제 목록은 디스크에서 읽힌다', () => {
+  it('the server document and the exemption list are read from disk', () => {
     const document = loadServedErrorCodes()
     expect(document.size).toBeGreaterThan(0)
     expect(document.get('not_found').surfaces).toContain('console')
@@ -233,7 +233,7 @@ describe('error 코드 어휘 대조', () => {
  * bidirectional because a one-way check would let the written list be wrong in
  * the same direction as the thing it describes.
  */
-describe('콘솔이 부르지 않는 표면', () => {
+describe('surfaces the console does not call', () => {
   const declared = { names: new Set(['policy-list', 'delay-cancel', 'schema-read']) }
   const compare = (called, entries) =>
     checkEndpointCoverage({
@@ -242,56 +242,56 @@ describe('콘솔이 부르지 않는 표면', () => {
       unimplemented: new Map(entries),
     })
 
-  it('현행 트리에서 계약과 화면이 일치한다', () => {
+  it('in the current tree the contract and the screens agree', () => {
     const violations = checkEndpointCoverage()
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([])
   })
 
-  it('부르는 것과 적힌 것이 계약을 덮으면 통과한다', () => {
+  it('what is called plus what is written down covering the contract passes', () => {
     expect(
       compare(['policy-list'], [
-        ['delay-cancel', '화면이 없다.'],
-        ['schema-read', '빌더는 빈 스키마에서 시작한다.'],
+        ['delay-cancel', 'there is no screen.'],
+        ['schema-read', 'the builder starts from an empty schema.'],
       ]),
     ).toEqual([])
   })
 
-  it('아무도 부르지 않고 적히지도 않은 엔드포인트는 실패한다', () => {
-    const violations = compare(['policy-list'], [['delay-cancel', '화면이 없다.']])
+  it('an endpoint nobody calls and nobody wrote down fails', () => {
+    const violations = compare(['policy-list'], [['delay-cancel', 'there is no screen.']])
     expect(violations).toHaveLength(1)
     expect(violations[0].rule).toBe('coverage')
     expect(violations[0].message).toContain('schema-read')
   })
 
-  it('콘솔이 실제로 부르는데 미구현으로 적힌 엔드포인트는 실패한다', () => {
+  it('an endpoint the console actually calls but is written down as unimplemented fails', () => {
     const violations = compare(['policy-list', 'schema-read'], [
-      ['delay-cancel', '화면이 없다.'],
-      ['schema-read', '빌더는 빈 스키마에서 시작한다.'],
+      ['delay-cancel', 'there is no screen.'],
+      ['schema-read', 'the builder starts from an empty schema.'],
     ])
     expect(violations).toHaveLength(1)
-    expect(violations[0].message).toContain('실제로 부르는데')
+    expect(violations[0].message).toContain('actually calls')
   })
 
-  it('계약에 없는 이름이 미구현 목록에 있으면 실패한다', () => {
+  it('a name that is not in the contract sitting on the unimplemented list fails', () => {
     const violations = compare(['policy-list'], [
-      ['delay-cancel', '화면이 없다.'],
-      ['schema-read', '빌더는 빈 스키마에서 시작한다.'],
-      ['console-config', '이것은 서빙 문서이지 API 엔드포인트가 아니다.'],
+      ['delay-cancel', 'there is no screen.'],
+      ['schema-read', 'the builder starts from an empty schema.'],
+      ['console-config', 'this is a serving document, not an API endpoint.'],
     ])
     expect(violations).toHaveLength(1)
     expect(violations[0].message).toContain('console-config')
   })
 
-  it('이유 없는 미구현 항목은 실패한다', () => {
+  it('an unimplemented entry with no reason fails', () => {
     const { problems } = parseErrorCodeExemptions({
       version: 1,
       codes: [],
       endpoints: [{ name: 'delay-cancel', reason: '  ' }],
     })
-    expect(problems.some((p) => p.message.includes('이유 없이'))).toBe(true)
+    expect(problems.some((p) => p.message.includes('with no reason'))).toBe(true)
   })
 
-  it('실제로 부르는 엔드포인트는 소스에서 정적으로 읽힌다', () => {
+  it('the endpoints actually called are read statically from the source', () => {
     const called = calledEndpoints()
     expect(called.has('policy-list')).toBe(true)
     expect(called.has('approval-submit')).toBe(true)

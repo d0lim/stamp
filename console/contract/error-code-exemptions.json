@@ -62,7 +62,7 @@
   "endpoints": [
     {
       "name": "delay-cancel",
-      "reason": "R2's delegated cancellation of a delay. The server side is finished — the endpoint, the per-authority budget, the 429 with Retry-After and the cancellation_rate_limited audit reason (decision-api 1.8.0) — and no console screen calls it, so none of that renders anywhere. Building the screen is a new feature; deleting the endpoint is a wire change on a surface other clients can already reach. Documented under `## 콘솔이 부르지 않는 표면` in docs/contracts/decision-api.md, which internal/release compares against this list."
+      "reason": "R2's delegated cancellation of a delay. The server side is finished — the endpoint, the per-authority budget, the 429 with Retry-After and the cancellation_rate_limited audit reason (decision-api 1.8.0) — and no console screen calls it, so none of that renders anywhere. Building the screen is a new feature; deleting the endpoint is a wire change on a surface other clients can already reach. Documented under `## Surfaces the console does not call` in docs/contracts/decision-api.md, which internal/release compares against this list."
     },
     {
       "name": "governance-lock",
